@@ -574,6 +574,125 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical architecture and c
 
 ---
 
+## CLI (`bw-cli`)
+
+A standalone command-line interface ships alongside the MCP server. It calls the exact same tool implementations as the MCP server, but lets you trigger them directly from a shell — useful for debugging authentication issues (403s, CSRF, session problems), validating credentials against a new system, or scripting one-off operations without an MCP client.
+
+### Installation
+
+After `npm run build` (or `npm install -g bw-modeling-mcp`), the `bw-cli` binary is available alongside `bw-modeling-mcp`.
+
+### Quick start
+
+```bash
+# Test the connection — fetches CSRF token + loads media types
+bw-cli ping
+
+# Run any MCP tool as a subcommand
+bw-cli bw_get_adso --adso_name ZADSO_DEMO
+bw-cli bw_search --search_term 'Z*' --object_type ADSO
+
+# Verbose HTTP logging on stderr — one line per request
+bw-cli bw_get_adso --adso_name ZADSO_DEMO -v
+
+# Full request + response headers and bodies
+bw-cli bw_get_adso --adso_name ZADSO_DEMO -vv
+
+# List all available tool names
+bw-cli list-tools
+```
+
+### Configuration
+
+Sources, applied in this priority (most specific wins): **CLI flags > shell env > `.env` file > JSON config file**.
+
+| Flag | Env var | Config key | Required |
+|---|---|---|---|
+| `--url <url>` | `BW_URL` | `url` | yes |
+| `--user <user>` | `BW_USER` | `user` | yes |
+| `--password <pw>` | `BW_PASSWORD` | `password` | yes |
+| `--client <n>` | `BW_CLIENT` | `client` | no (default `001`) |
+| `--language <code>` | `BW_LANGUAGE` | `language` | no |
+| `--config <path>` | — | — | no |
+
+### `.env` file support
+
+If a `.env` (or `.env.local`) file exists in the current directory, the `BW_*` variables defined there are loaded into the environment automatically — no `export` needed. Existing shell variables are never overwritten by the file.
+
+```env
+# .env
+BW_URL=https://your-bw-host:50001
+BW_USER=YOUR_USER
+BW_PASSWORD="password with spaces"
+BW_CLIENT=001
+BW_LANGUAGE=EN
+```
+
+Override the auto-discovered path with `--env-file <path>`. The same `.env` file is also picked up by the MCP server (`bw-modeling-mcp`) when started directly without an MCP client.
+
+> ⚠️ Add `.env` to `.gitignore` — it's already in this repo's `.gitignore` by default.
+
+### Config file auto-discovery
+
+If `--config` is omitted, the first existing file from this list is loaded automatically:
+
+1. `./.bwc.json` (project-local, recommended — add to `.gitignore`)
+2. `./bw-cli.json` (project-local, longer name)
+3. `~/.config/bw-cli.json`
+4. `~/.bwc.json`
+5. `~/.bw-cli.json`
+
+Example `./.bwc.json`:
+
+```json
+{
+  "url": "https://your-bw-host:50001",
+  "user": "YOUR_USER",
+  "password": "YOUR_PASSWORD",
+  "client": "001",
+  "language": "EN"
+}
+```
+
+> ⚠️ **Never commit a config file with real credentials.** Add `.bwc.json` and `bw-cli.json` to your `.gitignore`.
+
+### Passing tool arguments
+
+For flat arguments, use `--key value` (strings, numbers, and `true`/`false` are parsed automatically):
+
+```bash
+bw-cli bw_get_adso --adso_name ZADSO --format raw
+bw-cli bw_preview_datasource --datasource_name ZDS_X --source_system LSYS_X --records 50
+```
+
+For tools with nested arguments (e.g. `bw_query_data`, `bw_update_adso`), pass the full args object as JSON:
+
+```bash
+bw-cli bw_query_data --args-json '{
+  "comp_id": "ADSO_X",
+  "is_provider": true,
+  "state": { "infoObjects": [{ "name": "0CALMONTH", "id": "...", "axis": "ROWS" }] }
+}' -v
+```
+
+### Debugging 403 / auth errors
+
+The compact verbose mode (`-v`) is purpose-built for this:
+
+- One line per HTTP request: `→ METHOD URL STATUS (duration)`.
+- On any `4xx`/`5xx` the response body is automatically printed — that's where SAP puts the actual error reason (CSRF validation failed, missing authorization, expired session, …).
+- Use `-vv` if you also need to see the request headers (e.g. to confirm which CSRF token / session cookie was actually sent).
+
+```bash
+bw-cli bw_get_adso --adso_name ZADSO -v
+# → GET https://host:50001/sap/bw/modeling/repo/is/systeminfo 200 (143ms)
+# → GET https://host:50001/sap/bw/modeling/discovery 200 (89ms)
+# → GET https://host:50001/sap/bw/modeling/adso/zadso/m 403 (45ms)
+# <error>...full SAP error message here...</error>
+```
+
+---
+
 ## Roadmap
 
 - **CompositeProvider** — Read: `bw_get_composite_provider` ✅, global components (`bw_get_ckf` / `bw_get_rkf` / `bw_get_structure`) ✅ — Create and modify: planned

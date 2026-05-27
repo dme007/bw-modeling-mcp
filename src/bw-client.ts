@@ -2,6 +2,7 @@ import axios, { AxiosInstance, AxiosResponse } from 'axios';
 import https from 'https';
 import { randomUUID } from 'crypto';
 import * as fs from 'fs';
+import type { HttpLogger } from './logger.js';
 
 const ECLIPSE_USER_AGENT =
   'Eclipse/4.38.0.v20251201-0920 (win32; x86_64; Java 21.0.9) ADT/3.56.0 (devedition)';
@@ -46,6 +47,7 @@ export class BwClient {
   // causes SAP to create a new stateless session, invalidating the lock handle.
   private readonly basicAuth: string | null;
   private readonly frozenCookies: Set<string> = new Set();
+  private readonly logger?: HttpLogger;
 
   constructor(
     url: string,
@@ -53,6 +55,7 @@ export class BwClient {
     password: string | null,
     client: string,
     language?: string,
+    logger?: HttpLogger,
     initialCookies?: Record<string, string>
   ) {
     this.basicAuth = (user && password)
@@ -87,6 +90,9 @@ export class BwClient {
         this.frozenCookies.add(name);
       }
     }
+
+    this.logger = logger;
+    logger?.attach(this.http);
   }
 
   // ── Session info (debug) ──────────────────────────────────────────────────
@@ -585,6 +591,7 @@ export class BwClient {
       validateStatus: () => true,
       headers: { common: {}, get: {}, post: {}, put: {}, patch: {}, delete: {}, head: {} } as any,
     });
+    this.logger?.attach(freshHttp);
 
     const cookieHdr = this.cookieHeader();
     const response = await freshHttp.put(url, body, {
@@ -620,6 +627,7 @@ export class BwClient {
       validateStatus: () => true,
       headers: { common: {}, get: {}, post: {}, put: {}, patch: {}, delete: {}, head: {} } as any,
     });
+    this.logger?.attach(freshHttp);
     const cookieHdr = this.cookieHeader();
     const response = await freshHttp.delete(url, {
       headers: {
@@ -846,7 +854,15 @@ export class BwClient {
   }
 }
 
-export function createClientFromEnv(): BwClient {
+export interface BwConfig {
+  url: string;
+  user: string;
+  password: string;
+  client?: string;
+  language?: string;
+}
+
+export function createClientFromEnv(logger?: HttpLogger): BwClient {
   const url = process.env.BW_URL;
   const client = process.env.BW_CLIENT ?? '001';
   const language = process.env.BW_LANGUAGE;
@@ -890,7 +906,7 @@ export function createClientFromEnv(): BwClient {
     }
     const userOpt = process.env.BW_USER ?? null;
     const passwordOpt = process.env.BW_PASSWORD ?? null;
-    return new BwClient(url, userOpt, passwordOpt, client, language, cookies);
+    return new BwClient(url, userOpt, passwordOpt, client, language, logger, cookies);
   }
 
   // Basic Auth mode: classic on-premise BW/4HANA — unchanged from previous behavior.
@@ -901,5 +917,16 @@ export function createClientFromEnv(): BwClient {
       'Required environment variables missing: BW_URL, BW_USER, BW_PASSWORD'
     );
   }
-  return new BwClient(url, user, password, client, language);
+  return new BwClient(url, user, password, client, language, logger);
+}
+
+export function createClientFromConfig(config: BwConfig, logger?: HttpLogger): BwClient {
+  return new BwClient(
+    config.url,
+    config.user,
+    config.password,
+    config.client ?? '001',
+    config.language,
+    logger,
+  );
 }
