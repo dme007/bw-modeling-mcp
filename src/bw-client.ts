@@ -1,6 +1,7 @@
 import axios, { AxiosInstance, AxiosResponse } from 'axios';
 import https from 'https';
 import { randomUUID } from 'crypto';
+import * as fs from 'fs';
 
 const ECLIPSE_USER_AGENT =
   'Eclipse/4.38.0.v20251201-0920 (win32; x86_64; Java 21.0.9) ADT/3.56.0 (devedition)';
@@ -14,6 +15,7 @@ export const MEDIA_TYPES: Record<string, string> = {
   dtpa: 'application/vnd.sap.bw.modeling.dtpa-v1_0_0+xml',
   area: 'application/vnd.sap.bw.modeling.area-v1_1_0+xml',
   trcs: 'application/vnd.sap.bw.modeling.trcs-v1_0_0+xml',
+  rsds: 'application/vnd.sap.bw.modeling.rsds-v1_1_0+xml',
 };
 
 // DTPs do not need an unlock request after activation
@@ -42,24 +44,49 @@ export class BwClient {
   // Basic Auth is only sent during the initial CSRF fetch to establish the session.
   // All subsequent requests use the session cookie only — sending Basic Auth on PUT
   // causes SAP to create a new stateless session, invalidating the lock handle.
-  private readonly basicAuth: string;
+  private readonly basicAuth: string | null;
+  private readonly frozenCookies: Set<string> = new Set();
 
-  constructor(url: string, user: string, password: string, client: string, language?: string) {
-    this.basicAuth = 'Basic ' + Buffer.from(`${user}:${password}`).toString('base64');
+  constructor(
+    url: string,
+    user: string | null,
+    password: string | null,
+    client: string,
+    language?: string,
+    initialCookies?: Record<string, string>
+  ) {
+    this.basicAuth = (user && password)
+      ? 'Basic ' + Buffer.from(`${user}:${password}`).toString('base64')
+      : null;
+
+    // In cookie mode (e.g. BW Bridge): do not send sap-client and X-sap-adt-sessiontype
+    // as global defaults. BW Bridge rejects stateful requests with 401 when no
+    // pre-established backend session exists on the app instance pointed to by __VCAP_ID__.
+    const isCookieMode = initialCookies !== undefined;
     this.http = axios.create({
       baseURL: url,
       headers: {
-        'sap-client': client,
-        'X-sap-adt-sessiontype': 'stateful',
+        ...(isCookieMode ? {} : {
+          'sap-client': client,
+          'X-sap-adt-sessiontype': 'stateful',
+        }),
         ...(language ? { 'sap-language': language } : {}),
       },
       httpsAgent: new https.Agent({ rejectUnauthorized: false }),
-      // Accept all HTTP status codes — we check them manually
       validateStatus: () => true,
     });
     delete this.http.defaults.headers.post['Content-Type'];
     delete (this.http.defaults.headers as any).common['Content-Type'];
 
+    // Cookie mode: pre-populate cookie store from caller. Used for SAML/OAuth-fronted
+    // systems where Basic Auth is not available and cookies are exported from a browser.
+    if (initialCookies) {
+      for (const [name, value] of Object.entries(initialCookies)) {
+        this.cookies.set(name, value);
+        // Names from the cookie file are frozen — set-cookie responses must not overwrite them.
+        this.frozenCookies.add(name);
+      }
+    }
   }
 
   // ── Session info (debug) ──────────────────────────────────────────────────
@@ -82,8 +109,10 @@ export class BwClient {
       const part = c.split(';')[0];
       const eqIdx = part.indexOf('=');
       if (eqIdx > 0) {
+        const name = part.substring(0, eqIdx).trim();
+        if (this.frozenCookies.has(name)) continue;
         this.cookies.set(
-          part.substring(0, eqIdx).trim(),
+          name,
           part.substring(eqIdx + 1).trim()
         );
       }
@@ -97,7 +126,7 @@ export class BwClient {
       headers: {
         'X-CSRF-Token': 'Fetch',
         Accept: 'application/xml',
-        Authorization: this.basicAuth,
+        ...(this.basicAuth ? { Authorization: this.basicAuth } : {}),
         ...this.cookieHeaders(),
       },
       responseType: 'text',
@@ -105,9 +134,16 @@ export class BwClient {
     this.updateCookies(response);
     const token = response.headers['x-csrf-token'] as string | undefined;
     if (!token || token.toLowerCase() === 'fetch') {
-      throw new Error(
-        `Failed to fetch CSRF token (HTTP ${response.status}). Check BW_URL, BW_USER, BW_PASSWORD, BW_CLIENT.`
-      );
+      if (this.basicAuth) {
+        throw new Error(
+          `Failed to fetch CSRF token (HTTP ${response.status}). Check BW_URL, BW_USER, BW_PASSWORD, BW_CLIENT.`
+        );
+      } else {
+        throw new Error(
+          `Failed to fetch CSRF token (HTTP ${response.status}). ` +
+          `Cookie mode in use — refresh cookies in BW_COOKIE_FILE and restart the MCP server.`
+        );
+      }
     }
     this.csrfToken = token;
     this.csrfTokenFetchedAt = Date.now();
@@ -353,17 +389,22 @@ export class BwClient {
    * Pattern: POST /sap/bw/modeling/activation
    * lockHandle is empty string for DTP activation.
    */
-  async activate(type: string, name: string, lockHandle: string, corrNr?: string): Promise<string> {
+  async activate(type: string, name: string, lockHandle: string, corrNr?: string, sourceSystem?: string): Promise<string> {
     await this.ensureCsrf();
     const mediaType = resolveMediaType(type);
-    const nameLower = name.toLowerCase();
+    const typeLower = type.toLowerCase();
+    // RSDS (DataSource) has a compound key (DataSource + source system) and uses an
+    // uppercase two-segment URI. All other types use the single-segment lowercase URI.
+    const href = typeLower === 'rsds'
+      ? `/sap/bw/modeling/rsds/${name.toUpperCase()}/${(sourceSystem ?? '').toUpperCase()}/m`
+      : `/sap/bw/modeling/${typeLower}/${name.toLowerCase()}/m`;
     const body = `<?xml version="1.0" encoding="UTF-8"?>
 <atom:feed xmlns:atom="http://www.w3.org/2005/Atom" xmlns:bwModel="http://www.sap.com/bw/modeling">
   <atom:entry>
     <atom:content type="${mediaType}">
       <bwModel:checkProperties version="inactive" modelContent="" lockHandle="${lockHandle}"/>
     </atom:content>
-    <atom:link href="/sap/bw/modeling/${type.toLowerCase()}/${nameLower}/m" type="application/*" rel="self"/>
+    <atom:link href="${href}" type="application/*" rel="self"/>
   </atom:entry>
 </atom:feed>`;
     const corrNrParam = corrNr ? `?corrNr=${corrNr}` : '';
@@ -484,7 +525,7 @@ export class BwClient {
     const cookieHdr = this.cookieHeader();
     const response = await freshHttp.post(url, body, {
       headers: {
-        Authorization: this.basicAuth,
+        ...(this.basicAuth ? { Authorization: this.basicAuth } : {}),
         ...(cookieHdr ? { Cookie: cookieHdr } : {}),
         ...headers,
       },
@@ -548,7 +589,7 @@ export class BwClient {
     const cookieHdr = this.cookieHeader();
     const response = await freshHttp.put(url, body, {
       headers: {
-        Authorization: this.basicAuth,
+        ...(this.basicAuth ? { Authorization: this.basicAuth } : {}),
         ...(cookieHdr ? { Cookie: cookieHdr } : {}),
         ...headers,
       },
@@ -582,7 +623,7 @@ export class BwClient {
     const cookieHdr = this.cookieHeader();
     const response = await freshHttp.delete(url, {
       headers: {
-        Authorization: this.basicAuth,
+        ...(this.basicAuth ? { Authorization: this.basicAuth } : {}),
         ...(cookieHdr ? { Cookie: cookieHdr } : {}),
         'x-csrf-token': csrfToken,
         ...headers,
@@ -609,7 +650,7 @@ export class BwClient {
     const response = await this.http.get('/sap/bw/modeling/discovery', {
       headers: {
         Accept: 'application/atomsvc+xml',
-        Authorization: this.basicAuth,
+        ...(this.basicAuth ? { Authorization: this.basicAuth } : {}),
         ...this.cookieHeaders(),
       },
       responseType: 'text',
@@ -619,25 +660,33 @@ export class BwClient {
       throw new Error(`Discovery GET → HTTP ${response.status}\n${response.data}`);
     }
     const xml: string = response.data as string;
-    // Match <app:collection href="..."> ... <app:accept>...</app:accept> pairs.
-    // Each collection block may span multiple lines, so we use [\s\S]*? for lazy matching.
-    const collectionRe = /<app:collection\s+href="([^"]+)"[\s\S]*?<app:accept>([^<]+)<\/app:accept>/g;
-    let match: RegExpExecArray | null;
-    while ((match = collectionRe.exec(xml)) !== null) {
-      const href = match[1];
-      const mediaType = match[2].trim();
+    // A single <app:collection> publishes one OR MORE <app:accept> media types,
+    // mixing +xml/+json and bw/bw4 namespaces. Split on collection start tags so
+    // every accept is attributed to its own collection: the previous single-regex
+    // approach captured only the first accept per collection, which silently
+    // skipped the +xml variant whenever a +json entry was listed first (e.g. iobj).
+    const extractVersion = (mt: string): number => {
+      const m = mt.match(/-v(\d+)_(\d+)_(\d+)\+xml$/);
+      return m ? parseInt(m[1]) * 10000 + parseInt(m[2]) * 100 + parseInt(m[3]) : 0;
+    };
+    const segments = xml.split(/(?=<app:collection\s)/);
+    for (const segment of segments) {
+      const hrefMatch = segment.match(/^<app:collection\b[^>]*?\shref="([^"]+)"/);
+      if (!hrefMatch) continue;
       // Extract last URL segment as the key (e.g. ".../adso" → "adso")
-      const key = href.split('/').pop()?.toLowerCase();
-      if (key && mediaType && mediaType.endsWith('+xml')) {
-        // Only update if discovered version is >= hardcoded version (never downgrade)
-        const extractVersion = (mt: string) => {
-          const m = mt.match(/-v(\d+)_(\d+)_(\d+)\+xml$/);
-          return m ? parseInt(m[1]) * 10000 + parseInt(m[2]) * 100 + parseInt(m[3]) : 0;
-        };
-        const existing = MEDIA_TYPES[key];
-        if (!existing || extractVersion(mediaType) >= extractVersion(existing)) {
-          MEDIA_TYPES[key] = mediaType;
-        }
+      const key = hrefMatch[1].split('/').pop()?.toLowerCase();
+      if (!key) continue;
+      // Consider only versioned XML modeling media types ("...-vX_Y_Z+xml").
+      // Sub-resource accepts (e.g. "jobs.job+xml") and +json variants score 0.
+      const versioned = [...segment.matchAll(/<app:accept>([^<]+)<\/app:accept>/g)]
+        .map((a) => a[1].trim())
+        .filter((mt) => extractVersion(mt) > 0);
+      if (versioned.length === 0) continue;
+      const best = versioned.reduce((a, b) => (extractVersion(b) >= extractVersion(a) ? b : a));
+      const existing = MEDIA_TYPES[key];
+      // Only update if the discovered version is >= the existing one (never downgrade).
+      if (!existing || extractVersion(best) >= extractVersion(existing)) {
+        MEDIA_TYPES[key] = best;
       }
     }
     process.stderr.write(`[bw-modeling-mcp] Loaded media types from discovery: ${JSON.stringify(MEDIA_TYPES)}\n`);
@@ -799,11 +848,55 @@ export class BwClient {
 
 export function createClientFromEnv(): BwClient {
   const url = process.env.BW_URL;
-  const user = process.env.BW_USER;
-  const password = process.env.BW_PASSWORD;
   const client = process.env.BW_CLIENT ?? '001';
   const language = process.env.BW_LANGUAGE;
-  if (!url || !user || !password) {
+  const cookieFile = process.env.BW_COOKIE_FILE;
+
+  if (!url) {
+    throw new Error('Required environment variable missing: BW_URL');
+  }
+
+  // Cookie mode: BW Bridge or other SAML/OAuth-fronted BW systems where Basic Auth
+  // is not available. Cookies are exported from an authenticated browser session.
+  // File format (vsp-compatible): Netscape (7 tab-separated fields) or simple
+  // "name=value" lines. Lines starting with # are comments.
+  if (cookieFile) {
+    let raw: string;
+    try {
+      raw = fs.readFileSync(cookieFile, 'utf-8');
+    } catch (err) {
+      throw new Error(
+        `Failed to read BW_COOKIE_FILE at ${cookieFile}: ${(err as Error).message}`
+      );
+    }
+    const cookies: Record<string, string> = {};
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const parts = trimmed.split('\t');
+      if (parts.length >= 7) {
+        cookies[parts[5]] = parts[6];
+      } else {
+        const eq = trimmed.indexOf('=');
+        if (eq > 0) {
+          cookies[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim();
+        }
+      }
+    }
+    if (Object.keys(cookies).length === 0) {
+      throw new Error(
+        `BW_COOKIE_FILE at ${cookieFile} contains no parseable cookies (expected Netscape or name=value format).`
+      );
+    }
+    const userOpt = process.env.BW_USER ?? null;
+    const passwordOpt = process.env.BW_PASSWORD ?? null;
+    return new BwClient(url, userOpt, passwordOpt, client, language, cookies);
+  }
+
+  // Basic Auth mode: classic on-premise BW/4HANA — unchanged from previous behavior.
+  const user = process.env.BW_USER;
+  const password = process.env.BW_PASSWORD;
+  if (!user || !password) {
     throw new Error(
       'Required environment variables missing: BW_URL, BW_USER, BW_PASSWORD'
     );

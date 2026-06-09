@@ -13,7 +13,7 @@ import { bwGetAdso, bwCreateAdso, FieldDef, bwUpdateAdso, bwUpdateAdsoAddPureFie
 import { bwGetInfoObject, bwCreateInfoObject, bwUpdateInfoObject, AttributeDef } from './tools/infoobject.js';
 import { bwGetTransformation, bwUpdateTransformation, bwCreateTransformation, bwSetTransformationRuntime, bwSetTransformationRoutine, bwDeleteTransformationRoutine } from './tools/transformation.js';
 import { bwActivate } from './tools/activation.js';
-import { bwGetDtps, bwGetDtp, bwCreateDtp, bwUpdateDtp, bwSetDtpFilterRoutine } from './tools/dtp.js';
+import { bwGetDtps, bwGetDtp, bwCreateDtp, bwRunDtp, bwUpdateDtp, bwSetDtpFilterRoutine } from './tools/dtp.js';
 import { bwSearch, bwXref } from './tools/search.js';
 import { bwDelete } from './tools/delete.js';
 import { bwCreateInfoArea, bwMoveObject, bwGetInfoarea } from './tools/infoarea.js';
@@ -29,6 +29,7 @@ import { bwQueryData, bwGetFilterValues, InfoObjectState, VariableInput, DrillOp
 import { bwGetRoles, bwGetQueryRoles, bwSetQueryRoles, bwGetRoleQueries } from './tools/roles.js';
 import { bwGetProcessChain } from './tools/processchain.js';
 import { bwGetProcessVariant } from './tools/processvariant.js';
+import { bwListRequests, bwGetRequest, bwActivateRequest } from './tools/request_monitor.js';
 
 // Single shared client instance (CSRF token + session cookies are reused)
 const client = createClientFromEnv();
@@ -114,7 +115,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: 'bw_create_adso',
       description:
         'Create a new aDSO shell. ' +
-        'action "from_template" (default): copies fields/keys/settings from an existing aDSO — pass template_name. Without template_name creates an empty standard shell. ' +
+        'action "from_template" (default): proposes fields/keys/settings from a template object — pass template_name. Without template_name creates an empty standard shell. ' +
+        'The template can be an existing aDSO (template_type "ADSO", default) or a DataSource (template_type "RSDS"); for RSDS, source_system is required and the server proposes the DataSource fields. ' +
         'action "empty": creates a minimal empty aDSO with the given adso_type preset (no fields). ' +
         'After creation the aDSO is inactive — add fields with bw_update_adso, then call bw_activate.',
       inputSchema: {
@@ -139,7 +141,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           template_name: {
             type: 'string',
-            description: 'Existing aDSO to copy from (action "from_template" only).',
+            description: 'Template object to propose fields from (action "from_template" only). An aDSO name when template_type is "ADSO", or a DataSource name when template_type is "RSDS".',
+          },
+          template_type: {
+            type: 'string',
+            enum: ['ADSO', 'RSDS'],
+            description: 'Type of the template object for action "from_template": "ADSO" (default) to copy from an existing aDSO, or "RSDS" to propose fields from a DataSource. When "RSDS", source_system is required.',
+          },
+          source_system: {
+            type: 'string',
+            description: 'Source system name of the DataSource. Required when template_type is "RSDS".',
           },
           adso_type: {
             type: 'string',
@@ -696,28 +707,33 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'bw_activate',
       description:
-        'Activate one BW object (aDSO, Transformation, or DTP). ' +
+        'Activate one BW object (aDSO, Transformation, DTP, InfoObject, InfoSource, or DataSource). ' +
         'Pass the lock_handle from bw_update_adso or bw_update_transformation. ' +
-        'For DTP activation use lock_handle="" (no lock needed for DTPs). ' +
-        'Unlock is sent automatically after activation (not for DTPs). ' +
+        'For DTP and DataSource (rsds) activation use lock_handle="" (no lock needed — standalone activation). ' +
+        'For object_type "rsds" also pass source_system (a DataSource is identified by DataSource name plus source system). ' +
+        'Unlock is sent automatically after activation (not for DTPs or DataSources). ' +
         'The response lists any DTPs deactivated by impact analysis — these must be re-activated.',
       inputSchema: {
         type: 'object',
         properties: {
           object_type: {
             type: 'string',
-            enum: ['adso', 'trfn', 'dtpa', 'iobj', 'trcs'],
-            description: 'Object type: adso, trfn, dtpa, iobj, or trcs.',
+            enum: ['adso', 'trfn', 'dtpa', 'iobj', 'trcs', 'rsds'],
+            description: 'Object type: adso, trfn, dtpa, iobj, trcs, or rsds (DataSource).',
           },
           object_name: {
             type: 'string',
-            description: 'Object name (e.g. "OBJECT_NAME" or "DTP_...").',
+            description: 'Object name (e.g. "OBJECT_NAME" or "DTP_..."). For rsds, the DataSource name.',
           },
           lock_handle: {
             type: 'string',
             description:
               'Lock handle from bw_update_adso or bw_update_transformation. ' +
-              'Use empty string "" for DTP activation.',
+              'Use empty string "" for DTP and DataSource (rsds) activation.',
+          },
+          source_system: {
+            type: 'string',
+            description: 'Source system name. Required when object_type is "rsds" (e.g. "LSYS_NAME").',
           },
           transport: {
             type: 'string',
@@ -994,6 +1010,107 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'bw_list_requests',
+      description:
+        'List the recent load requests of an InfoProvider from the runtime request monitor, ' +
+        'with decoded request status, record counts and timestamps. ' +
+        'Returns one entry per request including the internal request TSN, which is the ' +
+        'input for bw_get_request. Read-only. ' +
+        'Use bw_search to find the target technical name first. ' +
+        'Performance: listing cost scales with the number of returned rows because each row ' +
+        'is enriched on the backend (a per-row cross-reference read). top bounds the result set; ' +
+        'created_from and status only help by returning fewer rows, not by making a row cheaper. ' +
+        'For providers with long load histories, use a narrow created_from window or a small top.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          target: {
+            type: 'string',
+            description: 'Target InfoProvider technical name (e.g. "OBJECT_NAME"). Case-insensitive.',
+          },
+          target_type: {
+            type: 'string',
+            description: 'Target object type (default "ADSO").',
+          },
+          storage: {
+            type: 'string',
+            description: 'Comma-separated storage area codes (default "AQ,AX,AT").',
+          },
+          status: {
+            type: 'string',
+            description: 'Comma-separated request status codes to include (default "N,GG,GR,YG,RR,YR,RG,U,Y,X").',
+          },
+          created_from: {
+            type: 'string',
+            description:
+              'Optional server-side lower time bound, ISO 8601 with milliseconds and Z ' +
+              '(24 chars, e.g. "YYYY-MM-DDTHH:MM:SS.000Z"). Returns only requests created at or ' +
+              'after this time (open upper bound = now). Narrows the result set, which reduces ' +
+              'per-row backend enrichment cost. Recommended for providers with long load histories.',
+          },
+          top: {
+            type: 'number',
+            description:
+              'Upper cap on the number of requests to return (default 3). Each returned row triggers ' +
+              'an expensive per-row backend read, so keep this small; raise it only when needed.',
+          },
+        },
+        required: ['target'],
+      },
+    },
+    {
+      name: 'bw_get_request',
+      description:
+        'Full status analysis of one load request in a single call, bundling the request ' +
+        'header, DTP information (including start, finish and duration), the process step ' +
+        'chain and the message log. Read-only. ' +
+        'The request TSN comes from bw_list_requests output.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          request_tsn: {
+            type: 'string',
+            description: 'Internal request TSN from bw_list_requests output.',
+          },
+          storage: {
+            type: 'string',
+            description: 'Storage area code (default "AQ").',
+          },
+          format: {
+            type: 'string',
+            enum: ['text', 'raw'],
+            description: 'Output format. "text" (default): readable summary. "raw": full parsed JSON of all four payloads.',
+          },
+        },
+        required: ['request_tsn'],
+      },
+    },
+    {
+      name: 'bw_activate_request',
+      description:
+        'Activate loaded data (DSO request activation): move a finished load from the Inbound ' +
+        'Table into the active data table and change log. This is the runtime request activation, ' +
+        'NOT the modeling-object activation done by bw_activate. ' +
+        'Only applies to aDSOs that have an activation step (not inbound-only staging aDSOs). ' +
+        'Activates all previous loads up to the given request. ' +
+        'Asynchronous: a successful call starts activation; monitor completion via ' +
+        'bw_list_requests / bw_get_request.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          request_tsn: {
+            type: 'string',
+            description: 'Load request TSN to activate (from bw_list_requests / bw_run_dtp output).',
+          },
+          storage: {
+            type: 'string',
+            description: 'Storage area code the request lives in (default "AQ").',
+          },
+        },
+        required: ['request_tsn'],
+      },
+    },
+    {
       name: 'bw_create_dtp',
       description:
         'Create a new DTP (Data Transfer Process) for an existing Transformation and activate it. ' +
@@ -1005,7 +1122,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         'Two-step chain (e.g. ADSO->TRCS->ADSO): use trfn_name for the first transformation and trfn_name_2 for the second; ' +
         'source_name/source_type = the start object, target_name/target_type = the end object. ' +
         'Omitting trfn_name_2 in a two-step chain causes a persistent HTTP 500 error. ' +
-        'Use bw_get_transformation or bw_xref to determine the chain before creating the DTP.',
+        'Use bw_get_transformation or bw_xref to determine the chain before creating the DTP. ' +
+        'DataSource source: set source_type "RSDS" and pass source_system (the DataSource source system). ' +
+        'source_name is then the plain DataSource name; the tool builds the RSDS compound source key internally.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1023,7 +1142,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           source_type: {
             type: 'string',
-            description: 'Source object type (e.g. "ADSO", "TRCS", "RSDS").',
+            description: 'Source object type (e.g. "ADSO", "TRCS", "RSDS"). Use "RSDS" for a DataSource source — source_system is then required.',
+          },
+          source_system: {
+            type: 'string',
+            description: 'Source system name of the DataSource. Required when source_type is "RSDS".',
           },
           target_name: {
             type: 'string',
@@ -1058,6 +1181,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'bw_run_dtp',
+      description:
+        'Start (execute) a run of an existing, active DTP. ' +
+        'Triggers the load with a single request and returns the new run request id. ' +
+        'The returned request_id is the RSPM request TSN: pass it straight into ' +
+        'bw_get_request (as request_tsn) to monitor load status — no bw_list_requests lookup needed.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          dtp_name: {
+            type: 'string',
+            description: 'Technical name of the DTP to run (e.g. "DTP_...").',
+          },
+        },
+        required: ['dtp_name'],
+      },
+    },
+    {
       name: 'bw_set_dtp_filter_routine',
       description:
         'Set an ABAP filter routine on a DTP filter field. Use this only when custom ABAP code is needed for the filter logic, not for simple value filters.',
@@ -1087,7 +1228,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'bw_update_dtp',
       description:
-        'Update DTP properties: description and/or simple value filter (e.g. field = value). Use this for setting filter values on existing filter fields.',
+        'Update DTP properties: description, simple value filter (e.g. field = value), and/or extraction mode (Full vs Delta). Use this for setting filter values on existing filter fields. ' +
+        'Note: switching extraction mode between Delta and Full (and back) has BW delta-init implications — a later delta load may require re-initialization of the delta on the source.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1118,6 +1260,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           filter_clear_fields: {
             type: 'string',
             description: 'Comma-separated list of field names whose filter selections should be removed entirely.',
+          },
+          extraction_mode: {
+            type: 'string',
+            enum: ['full', 'delta'],
+            description: 'Switch the DTP extraction mode. "full" sets extractionMode="F"; "delta" sets extractionMode="D" (only valid for delta-capable sources). Switching modes has delta-init implications — see the tool note.',
           },
           transport: {
             type: 'string',
@@ -1801,6 +1948,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           args?.info_area as string,
           (args?.action as 'from_template' | 'empty') ?? 'from_template',
           args?.template_name as string | undefined,
+          (args?.template_type as 'ADSO' | 'RSDS') ?? 'ADSO',
+          args?.source_system as string | undefined,
           (args?.adso_type as string) ?? 'standard',
           (args?.package as string) ?? '$TMP',
           (args?.write_interface as boolean) ?? false
@@ -2003,7 +2152,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           args?.object_type as string,
           args?.object_name as string,
           args?.lock_handle as string,
-          args?.transport as string | undefined
+          args?.transport as string | undefined,
+          args?.source_system as string | undefined
         );
         break;
 
@@ -2096,12 +2246,41 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
         break;
 
+      case 'bw_list_requests':
+        text = await bwListRequests(
+          client,
+          args?.target as string,
+          args?.target_type as string | undefined ?? 'ADSO',
+          args?.storage as string | undefined ?? 'AQ,AX,AT',
+          args?.status as string | undefined ?? 'N,GG,GR,YG,RR,YR,RG,U,Y,X',
+          args?.top as number | undefined ?? 3,
+          args?.created_from as string | undefined,
+        );
+        break;
+
+      case 'bw_get_request':
+        text = await bwGetRequest(
+          client,
+          args?.request_tsn as string,
+          args?.storage as string | undefined ?? 'AQ',
+          args?.format as 'text' | 'raw' | undefined ?? 'text',
+        );
+        break;
+
+      case 'bw_activate_request':
+        text = await bwActivateRequest(
+          args?.request_tsn as string,
+          args?.storage as string | undefined ?? 'AQ',
+        );
+        break;
+
       case 'bw_create_dtp':
         text = await bwCreateDtp(client, {
           trfn_name: args?.trfn_name as string,
           trfn_name_2: args?.trfn_name_2 as string | undefined,
           source_name: args?.source_name as string,
           source_type: args?.source_type as string,
+          source_system: args?.source_system as string | undefined,
           target_name: args?.target_name as string,
           target_type: args?.target_type as string,
           description: args?.description as string | undefined,
@@ -2110,6 +2289,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           filter_dta_name: args?.filter_dta_name as string | undefined,
           filter_value: args?.filter_value as string | undefined,
         });
+        break;
+
+      case 'bw_run_dtp':
+        text = await bwRunDtp(args?.dtp_name as string);
         break;
 
       case 'bw_set_dtp_filter_routine':
@@ -2130,6 +2313,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           filter_value: args?.filter_value as string | undefined,
           filter_excluding: args?.filter_excluding as boolean | undefined,
           filter_clear_fields: args?.filter_clear_fields as string | undefined,
+          extraction_mode: args?.extraction_mode as 'full' | 'delta' | undefined,
           transport: args?.transport as string | undefined,
           transport_lock_holder: args?.transport_lock_holder as string | undefined,
         });

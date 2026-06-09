@@ -469,39 +469,51 @@ function findRuleForTarget(
   xml: string,
   targetInfoObject: string
 ): { ruleId: string; groupId: string; oldRuleXml: string; stepType: StepType } | null {
-  const groupMatch = xml.match(/<group\s+id="(\d+)"[^>]*>([\s\S]*?)<\/group>/);
-  if (!groupMatch) return null;
-  const groupId = groupMatch[1];
-  const groupContent = groupMatch[0];
-
   const target = targetInfoObject.toUpperCase();
-  const ruleRegex = /<rule(\s[^>]*)>([\s\S]*?)<\/rule>/g;
-  let match: RegExpExecArray | null;
 
-  while ((match = ruleRegex.exec(groupContent)) !== null) {
-    const attrStr = match[1];
-    const body = match[2];
-    const ruleIdMatch = attrStr.match(/id="(\d+)"/);
+  // Search ALL groups, not just the first. A transformation with a start/end routine has the
+  // global routine group (type="G") FIRST; its single rule (routinetype="START"/"END") references
+  // every target field and would otherwise shadow the field's own rule, which lives in the
+  // standard group (type="S"). Skip those global routine rules so the field's own rule is selected.
+  const groupRegex = /<group\s+id="(\d+)"[^>]*>([\s\S]*?)<\/group>/g;
+  let groupMatch: RegExpExecArray | null;
 
-    const targetsIObj = body.includes(`/target/segment1/${target}</elementRef>`);
-    if (!targetsIObj) continue;
+  while ((groupMatch = groupRegex.exec(xml)) !== null) {
+    const groupId = groupMatch[1];
+    const groupContent = groupMatch[0];
 
-    let stepType: StepType | null = null;
-    if (body.includes('StepNoUpdate') || body.includes('type="NO_UPDATE"')) stepType = 'NO_UPDATE';
-    else if (body.includes('StepInitial') || body.includes('type="INITIAL"')) stepType = 'INITIAL';
-    else if (body.includes('StepDirect') || body.includes('type="DIRECT"')) stepType = 'DIRECT';
-    else if (body.includes('StepRoutine') || body.includes('type="ROUTINE"')) stepType = 'ROUTINE';
-    else if (body.includes('StepFormula') || body.includes('type="FORMULA"')) stepType = 'FORMULA';
-    else if (body.includes('StepConstant') || body.includes('type="CONSTANT"')) stepType = 'CONSTANT';
-    else if (body.includes('StepRead') || body.includes('type="READ"')) stepType = 'READ';
+    const ruleRegex = /<rule(\s[^>]*)>([\s\S]*?)<\/rule>/g;
+    let match: RegExpExecArray | null;
 
-    if (stepType) {
-      return {
-        ruleId: ruleIdMatch?.[1] ?? '',
-        groupId,
-        oldRuleXml: match[0],
-        stepType,
-      };
+    while ((match = ruleRegex.exec(groupContent)) !== null) {
+      const attrStr = match[1];
+      const body = match[2];
+
+      // Skip global start/end routine rules — they reference all target fields.
+      if (/\broutinetype="(?:START|END)"/.test(attrStr)) continue;
+
+      const targetsIObj = body.includes(`/target/segment1/${target}</elementRef>`);
+      if (!targetsIObj) continue;
+
+      const ruleIdMatch = attrStr.match(/id="(\d+)"/);
+
+      let stepType: StepType | null = null;
+      if (body.includes('StepNoUpdate') || body.includes('type="NO_UPDATE"')) stepType = 'NO_UPDATE';
+      else if (body.includes('StepInitial') || body.includes('type="INITIAL"')) stepType = 'INITIAL';
+      else if (body.includes('StepDirect') || body.includes('type="DIRECT"')) stepType = 'DIRECT';
+      else if (body.includes('StepRoutine') || body.includes('type="ROUTINE"')) stepType = 'ROUTINE';
+      else if (body.includes('StepFormula') || body.includes('type="FORMULA"')) stepType = 'FORMULA';
+      else if (body.includes('StepConstant') || body.includes('type="CONSTANT"')) stepType = 'CONSTANT';
+      else if (body.includes('StepRead') || body.includes('type="READ"')) stepType = 'READ';
+
+      if (stepType) {
+        return {
+          ruleId: ruleIdMatch?.[1] ?? '',
+          groupId,
+          oldRuleXml: match[0],
+          stepType,
+        };
+      }
     }
   }
   return null;
@@ -628,6 +640,20 @@ function buildNoUpdateToFormulaRule(
  */
 function convertRuleToConstant(ruleXml: string, constantValue: string): string {
   let r = ruleXml;
+
+  // For a DATS (date) target field BW expects the constant in the EXTERNAL date display format,
+  // not the internal YYYYMMDD. The target element's <inlineType> sits inside the step's <output>
+  // block (the source element, if any, lives in an <input> block), so detect the type there.
+  // The external date format is the user/system date display setting; DD.MM.YYYY is assumed for
+  // this DE system (BW_LANGUAGE=DE). TIMS (time) is not handled here — only DATS is confirmed.
+  const stepOutput = ruleXml.match(/<output\b[^>]*\bid="[^"]*"[\s\S]*?<\/output>/)?.[0] ?? '';
+  const targetIsDats = /<inlineType\b[^>]*\bname="DATS"/.test(stepOutput);
+  let value = constantValue;
+  if (targetIsDats && /^\d{8}$/.test(value)) {
+    // Internal YYYYMMDD → external DD.MM.YYYY. Values already containing separators pass through.
+    value = `${value.slice(6, 8)}.${value.slice(4, 6)}.${value.slice(0, 4)}`;
+  }
+
   // 1. Remove <source ...>...</source> element from the rule (not needed for constants)
   r = r.replace(/<source\b[^>]*>[\s\S]*?<\/source>/, '');
   // 2. Update step1 → step2 in all #/// references
@@ -654,7 +680,7 @@ function convertRuleToConstant(ruleXml: string, constantValue: string): string {
   // 7. Change type → CONSTANT and append constant attribute
   r = r.replace(
     /(<step\b[^>]*\s)type="(?:DIRECT|INITIAL|NO_UPDATE)"/,
-    `$1type="CONSTANT" constant="${escapeXmlAttr(constantValue)}"`,
+    `$1type="CONSTANT" constant="${escapeXmlAttr(value)}"`,
   );
   return r;
 }
@@ -1051,6 +1077,8 @@ export async function bwUpdateTransformation(
     if (updatedXml === originalXml) {
       throw new Error('Constant rule replacement failed — XML unchanged.');
     }
+    // Report the value actually written (after any DATS external-date conversion), not the raw input.
+    const writtenValue = newRule.match(/<step\b[^>]*\bconstant="([^"]*)"/)?.[1] ?? constantValue;
 
     const lockHandle = await client.lock('trfn', transformationName);
     try {
@@ -1064,8 +1092,8 @@ export async function bwUpdateTransformation(
       success: true,
       message:
         `InfoObject ${tgtUpper} in transformation ${transformationName.toUpperCase()} ` +
-        `converted to StepConstant with value "${constantValue}". Call bw_activate to activate.`,
-      constant_value: constantValue,
+        `converted to StepConstant with value "${writtenValue}". Call bw_activate to activate.`,
+      constant_value: writtenValue,
       lock_handle: lockHandle,
       transformation_name: transformationName.toUpperCase(),
       object_type: 'trfn',

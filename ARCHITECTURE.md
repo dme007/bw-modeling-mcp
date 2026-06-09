@@ -29,6 +29,8 @@ Headers: X-CSRF-Token: Fetch
 
 The token is fetched once at startup and reused for all subsequent write operations (PUT, POST). Session cookies are maintained across requests via `axios` cookie jar.
 
+**Cookie mode (BW Bridge / SAML- or OAuth-fronted systems):** When `BW_COOKIE_FILE` is set, the client authenticates with cookies exported from an authenticated browser session instead of Basic Auth (`BW_USER` / `BW_PASSWORD` become optional). The cookie file is read in Netscape format (7 tab-separated fields) or as simple `name=value` lines. In this mode the stateful headers (`sap-client`, `X-sap-adt-sessiontype: stateful`) are not sent as defaults — BW Bridge rejects stateful requests with HTTP 401 when no backend session exists on the targeted app instance. Cookies loaded from the file are "frozen" and never overwritten by `Set-Cookie` responses. When the session expires, refresh the cookies in `BW_COOKIE_FILE` and restart the server.
+
 **Important:** Lock and write operations on the same object must use separate `BwClient` instances (separate `sap-contextid` session cookies). SAP's internal buffer caches object state per session — reusing the same session for both Lock and PUT causes null pointer crashes in the ABAP backend (`CL_RSTRAN_TRFN=>GET_PROGID`). This is not documented in the API — discovered via ABAP debugging.
 
 ---
@@ -116,7 +118,7 @@ src/
     ├── processchain.ts   # bw_get_process_chain — reads RSPC via bw4 API; auto-fetches variant details per step
     ├── processvariant.ts # bw_get_process_variant — generic variant detail reader for all 93 process types
     ├── delete.ts         # bw_delete
-    ├── dtp.ts            # bw_get_dtp, bw_get_dtps, bw_create_dtp, bw_update_dtp, bw_set_dtp_filter_routine
+    ├── dtp.ts            # bw_get_dtp, bw_get_dtps, bw_create_dtp, bw_run_dtp, bw_update_dtp, bw_set_dtp_filter_routine
     ├── infoarea.ts       # bw_get_infoarea, bw_create_infoarea, bw_move_object
     ├── infoobject.ts     # bw_get_infoobject, bw_create_infoobject, bw_update_infoobject
     ├── infosource.ts     # bw_get_infosource, bw_create_infosource, bw_update_infosource
@@ -124,6 +126,7 @@ src/
     ├── query.ts          # bw_get_query — full query definition parser (variables, layout, CKFs, RKFs, exceptions)
     ├── reporting.ts      # bw_query_data, bw_get_filter_values — BICS reporting endpoint (/sap/bw/modeling/comp/reporting)
     ├── repository.ts     # bw_list_contents
+    ├── request_monitor.ts # bw_list_requests, bw_get_request, bw_activate_request — RSPM request monitor / data activation via the bw4 manage API
     ├── roles.ts          # bw_get_roles, bw_get_role_queries, bw_get_query_roles, bw_set_query_roles
     ├── search.ts         # bw_search, bw_xref
     └── transformation.ts # bw_get_transformation, bw_create_transformation,
@@ -217,6 +220,19 @@ Full endpoint list from BW/4HANA discovery — **47 workspaces, 130+ endpoints**
 | BW Utils | `/sap/bw/modeling/utils` |
 | Bucket services | `/sap/bw/modeling/bucket` |
 | Query replication | `/sap/bw/modeling/compreplication` |
+
+### Runtime / Request Monitor Endpoints
+
+| Purpose | Endpoint |
+|---|---|
+| Run (execute) a DTP | `POST /sap/bw/modeling/dtpa/executerun` |
+| List load requests | `GET /sap/bc/http/sap/bw4/v1/manage/requests` |
+| Request header | `GET /sap/bc/http/sap/bw4/v1/manage/requests/{tsn}/{storage}` |
+| Request DTP information | `GET /sap/bc/http/sap/bw4/v1/manage/requests/{tsn}/{storage}/datatransferprocessinformation` |
+| Request process steps | `GET /sap/bc/http/sap/bw4/v1/manage/processes?request={tsn}&storage={storage}` |
+| Request message log | `GET /sap/bc/http/sap/bw4/v1/manage/processes/{tsn}/logs` |
+| Activate loaded data (DSO request activation) | `POST /sap/bc/http/sap/bw4/v1/manage/requests/{tsn}/{storage}/activate` |
+| Status domain texts | `GET /sap/bc/http/sap/bw4/v1/system/domains/{domain}/texts` |
 
 ### Repository & Search Endpoints
 

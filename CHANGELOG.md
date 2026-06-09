@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.8.0] — 2026-06-09
+
+### Added
+
+- `bw_run_dtp` — starts (executes) a DTP load via `POST /sap/bw/modeling/dtpa/executerun`; returns the new run request id from the `Location` header (an RSPM TSN usable directly with `bw_get_request`); runs in a fresh session to avoid stale-buffer and concurrency issues
+- `bw_list_requests` — lists load requests for a target InfoProvider via the BW/4HANA `/sap/bc/http/sap/bw4/v1/manage/requests` API; shows status, last process status/action, record count, timestamp, user, and TSN
+- `bw_get_request` — full status analysis of one load request in a single call: header, DTP information (start/finish/duration), process step chain, and message log; `format="raw"` returns the parsed JSON of all four payloads
+- `bw_activate_request` — activates loaded data (DSO request activation): moves a finished load from the inbound table into the active data table + change log via `POST .../manage/requests/{tsn}/{storage}/activate`; runtime activation distinct from `bw_activate`; asynchronous
+- Cookie-based authentication for SAML- or OAuth-fronted BW systems (e.g. BW Bridge on the SAP BTP ABAP stack): set `BW_COOKIE_FILE` to a browser-exported cookie file (Netscape or `name=value` format); `BW_USER` / `BW_PASSWORD` become optional; login and session handling analogous to vibing-steampunk
+- `bw_create_adso` — new `template_type` (`ADSO` default / `RSDS`) and `source_system` parameters: propose aDSO fields from a DataSource, not only from another aDSO
+- `bw_create_dtp` — new `source_system` parameter: use a DataSource as the DTP source (`source_type="RSDS"`)
+- `bw_update_dtp` — new `extraction_mode` parameter (`full` / `delta`) to switch an existing DTP between Full (`extractionMode="F"`, `deltaSettingStatus="0"`) and Delta (`extractionMode="D"`, `deltaSettingStatus="2"`); switching modes has BW delta-init implications (a later delta load may require re-initialization)
+- `bw_activate` — new object type `rsds` (with `source_system`) to activate a DataSource
+
+### Improved
+
+- `bw_get_request` / `bw_list_requests` — surface the last process status and last action alongside the request status, so a finished green load is no longer reported as "in process"
+- Media-type handling is now fully discovery-driven: the discovery parser reads every `<app:accept>` per collection (previously only the first, so workspaces listing a `+json` variant first fell back to hardcoded media types) and selects the highest-versioned `+xml` type; the query read path leads with the discovered media type
+
+### Fixed
+
+- Query reads negotiate the backend content-type version correctly instead of failing with HTTP 415 when the backend returns a version outside the previously hardcoded Accept range (#11)
+- DTP activation no longer fails with a false "transformation inactive" error — the pre-activation priming GET and the activation POST now share one fresh session
+- Adding fields to staging / inbound aDSOs (which have no key elements) no longer produces an invalid element position that was rejected on activation
+- Date (DATS) constants in transformation rules are written in the external date format so they survive activation
+- Transformation rule editing selects the field's own rule (not the global start/end routine rule) on transformations that have a start/end routine
+
+### Notes
+
+- The runtime tools (`bw_run_dtp`, `bw_list_requests`, `bw_get_request`, `bw_activate_request`) use the BW/4HANA `/sap/bc/http/sap/bw4/v1/manage` API — the same API the BW/4HANA Cockpit uses — rather than the `/sap/bw/modeling` tool API
+- `bw_activate_request` only applies to aDSOs that have an activation step (not inbound-only staging aDSOs)
+
+---
+
 ## [0.7.0] — 2026-05-21
 
 ### Added

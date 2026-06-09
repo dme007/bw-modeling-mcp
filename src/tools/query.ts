@@ -1,11 +1,25 @@
 import { XMLParser } from 'fast-xml-parser';
-import { createClientFromEnv } from '../bw-client.js';
+import { createClientFromEnv, MEDIA_TYPES } from '../bw-client.js';
 
+// Fallback version range used when the discovery document does not advertise a
+// query media type. The exact query version depends on the BW backend SP level,
+// so the version actually accepted by the system is read from discovery at
+// startup (MEDIA_TYPES['query']) and preferred over this static list.
 const QUERY_ACCEPT =
   'application/vnd.sap.bw.modeling.query-v1_8_0+xml, ' +
   'application/vnd.sap.bw.modeling.query-v1_9_0+xml, ' +
   'application/vnd.sap.bw.modeling.query-v1_10_0+xml, ' +
   'application/vnd.sap.bw.modeling.query-v1_11_0+xml';
+
+/**
+ * Accept header for query GETs: the discovery-advertised media type first (so
+ * systems on a higher or lower SP level negotiate correctly), with the static
+ * version range kept as a fallback.
+ */
+function queryAccept(): string {
+  const discovered = MEDIA_TYPES['query'];
+  return discovered ? `${discovered}, ${QUERY_ACCEPT}` : QUERY_ACCEPT;
+}
 
 function ensureArray(val: unknown): unknown[] {
   if (val === undefined || val === null) return [];
@@ -344,13 +358,14 @@ export async function bwGetQuery(queryName: string, format: 'text' | 'raw' = 'te
   let xmlBody: string;
   let versionNote: string | undefined;
 
+  const accept = queryAccept();
   try {
-    const result = await client.get(`${basePath}/a`, QUERY_ACCEPT);
+    const result = await client.get(`${basePath}/a`, accept);
     xmlBody = result.body;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes('HTTP 404')) {
-      const result = await client.get(`${basePath}/m`, QUERY_ACCEPT);
+      const result = await client.get(`${basePath}/m`, accept);
       xmlBody = result.body;
       versionNote = 'inactive version returned';
     } else {

@@ -13,11 +13,12 @@ const typePresets: Record<string, Record<string, boolean>> = {
     writeChangelog: true,
   },
   staging_inbound_only: {
-    activateData: true,
+    activateData: false,
     cubeDeltaOnly: false,
     directUpdate: false,
     isReportingObject: false,
     noAqDeletion: false,
+    writeChangelog: false,
   },
   staging_compress: {
     activateData: true,
@@ -407,16 +408,20 @@ function removeElement(adsoXml: string, iObjName: string): string {
 }
 
 /**
- * Insert the new element into the aDSO XML before the first <keyElement> tag.
- * Falls back to insertion before </adso:dataStore> if no keyElement exists.
+ * Insert the new element directly after the last existing <element>.
+ *
+ * Reporting aDSOs anchor this with <keyElement>; staging / inbound aDSOs have no
+ * <keyElement> tags and instead start their <dimension> blocks right after the elements.
+ * Anchor on whichever of <keyElement or <dimension appears first so the new <element>
+ * always lands before the dimensions (and before the keyElements when present).
+ * Falls back to insertion before </adso:dataStore> only when neither anchor exists.
  */
 function injectElement(adsoXml: string, elementXml: string): string {
-  // Check if InfoObject is already present
-  // (elements after injection should remain valid)
-
-  const insertBefore = '<keyElement';
-  const idx = adsoXml.indexOf(insertBefore);
-  if (idx !== -1) {
+  const keyIdx = adsoXml.indexOf('<keyElement');
+  const dimIdx = adsoXml.indexOf('<dimension');
+  const candidates = [keyIdx, dimIdx].filter((i) => i !== -1);
+  if (candidates.length > 0) {
+    const idx = Math.min(...candidates);
     return adsoXml.substring(0, idx) + elementXml + '\n  ' + adsoXml.substring(idx);
   }
   // Fallback: before closing root tag
@@ -748,7 +753,11 @@ function buildPureFieldElement(field: FieldDef): string {
 /**
  * bw_create_adso — create a new aDSO shell.
  *
- * action "from_template": copies fields/keys/settings from an existing aDSO (pass templateName).
+ * action "from_template": proposes fields/keys/settings from a template object (pass templateName).
+ *   templateType "ADSO" (default): copies from an existing aDSO.
+ *   templateType "RSDS": proposes fields from a DataSource — sourceSystem is then required.
+ *     This is a pure template mechanism over the same create endpoint; the only difference is the
+ *     <template> element, which carries tlogo="RSDS" and the RSDS compound objectName.
  * action "empty": creates a minimal empty aDSO with the given adsoType preset.
  *
  * Workflow: Lock (CREA) → POST minimal XML → Unlock
@@ -761,6 +770,8 @@ export async function bwCreateAdso(
   infoArea: string,
   action: 'from_template' | 'empty' = 'from_template',
   templateName?: string,
+  templateType: 'ADSO' | 'RSDS' = 'ADSO',
+  sourceSystem?: string,
   adsoType: string = 'standard',
   pkg: string = '$TMP',
   writeInterface: boolean = false
@@ -768,6 +779,15 @@ export async function bwCreateAdso(
   const nameUpper = adsoName.toUpperCase();
   const infoAreaUpper = infoArea.toUpperCase();
   const language = process.env.BW_LANGUAGE ?? 'DE';
+
+  // RSDS template requires the source system to build the compound objectName.
+  // Validate before locking so we fail fast without leaving a dangling lock.
+  if (action === 'from_template' && templateType === 'RSDS' && templateName && !sourceSystem) {
+    throw new Error(
+      'template_type "RSDS" requires source_system (the DataSource source system name) ' +
+      'to build the RSDS compound objectName.'
+    );
+  }
 
   const lockHandle = await client.lock('adso', adsoName, {
     'activity_context': 'CREA',
@@ -795,9 +815,19 @@ export async function bwCreateAdso(
       `  </dimension>\n` +
       `</adso:dataStore>`;
   } else {
-    const templateElement = templateName
-      ? `\n  <template objectName="${templateName.toUpperCase()}" tlogo="ADSO"/>`
-      : '';
+    let templateElement = '';
+    if (templateName) {
+      if (templateType === 'RSDS') {
+        // RSDS compound key: DataSource name + Source System name, each left-justified
+        // in a fixed 30-char field (total length 60).
+        const compoundKey =
+          templateName.toUpperCase().padEnd(30, ' ') +
+          (sourceSystem ?? '').toUpperCase().padEnd(30, ' ');
+        templateElement = `\n  <template objectName="${compoundKey}" tlogo="RSDS"/>`;
+      } else {
+        templateElement = `\n  <template objectName="${templateName.toUpperCase()}" tlogo="ADSO"/>`;
+      }
+    }
     body =
       `<?xml version="1.0" encoding="UTF-8"?>\n` +
       `<adso:dataStore xmlns:adso="http://www.sap.com/bw/modeling/adso.ecore"` +

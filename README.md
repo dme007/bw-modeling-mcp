@@ -16,7 +16,23 @@ Read the blog (DE + EN): https://www.nextlytics.com/blog/agentic-ai-meets-sap-bw
 
 ---
 
-## 🆕 What's New — v0.7.0
+## 🆕 What's New — v0.8.0
+
+**Runtime tools & request monitoring** — the first tools driven by the BW/4HANA `/sap/bc/.../bw4` manage API (the same operations you'd otherwise perform in the BW/4HANA Cockpit), not the `/sap/bw/modeling` tool API:
+
+- `bw_run_dtp` — start (execute) a DTP load; returns the run request id (RSPM TSN) usable directly with `bw_get_request`
+- `bw_list_requests` / `bw_get_request` — monitor load requests: status, records, DTP info, process steps, message log
+- `bw_activate_request` — activate loaded data (move a finished load from the inbound table into the active data table + change log)
+
+**BW Bridge connectivity** — authenticate against BW systems running on the SAP BTP ABAP stack (BW Bridge) via a browser-exported cookie file (`BW_COOKIE_FILE`), in addition to Basic Auth; login/session approach analogous to [vibing-steampunk](https://github.com/oisee/vibing-steampunk).
+
+**DataSource (RSDS) across the modeling lifecycle** — create an aDSO from a DataSource template (`bw_create_adso`), use a DataSource as DTP source (`bw_create_dtp`), and activate a DataSource (`bw_activate`).
+
+**Fixes** — query reads negotiate the backend content-type version via discovery (fixes HTTP 415 on higher SP levels, #11); DTP activation no longer reports a false "transformation inactive"; field-add works on staging/inbound aDSOs without key elements; DATS date constants survive activation; transformation rule editing picks the correct rule when a start/end routine exists.
+
+---
+
+## What's New — v0.7.0
 
 Process Chain support and DataSource data preview:
 
@@ -77,7 +93,7 @@ CompositeProvider read support and BW repository navigation:
 
 ### aDSO
 - Read aDSO structure (fields, settings, version state)
-- Create a new aDSO — from template or empty, field-based or InfoObject-based
+- Create a new aDSO — from an aDSO template, from a DataSource (RSDS) template, or empty
 - Add InfoObject-backed fields or pure (field-based) fields
 - Remove fields
 - Manage key fields
@@ -111,8 +127,10 @@ CompositeProvider read support and BW repository navigation:
 
 ### DTP (Data Transfer Process)
 - Read DTP structure and settings
-- Create DTPs
+- Create DTPs — including DataSource (RSDS) sources
+- Run (execute) a DTP load — returns the run request id for monitoring
 - Update DTP settings and description
+- Switch extraction mode between Full and Delta
 - Set value filters on fields
 - Set routine filters (ABAP code)
 
@@ -177,9 +195,15 @@ CompositeProvider read support and BW repository navigation:
 - Field names resolved automatically from the DataSource structure; configurable record count (default 20)
 - Rendered as a padded plain-text table with column alignment
 
+### Request Monitor & Runtime
+- List load requests for a target InfoProvider — status, last process status/action, record count, timestamp, user, TSN
+- Full status analysis of a single load request — header, DTP information (start/finish/duration), process step chain, and message log in one call
+- Activate loaded data (DSO request activation) — move a finished load from the inbound table into the active data table + change log
+- Uses the BW/4HANA `/sap/bc/.../bw4` manage API (the same operations as the BW/4HANA Cockpit)
+
 ### General
 - Search & Where-Used (xref)
-- Activate BW objects (aDSO, InfoObject, Transformation, DTP)
+- Activate BW objects (aDSO, InfoObject, Transformation, DTP, DataSource)
 - Release locks without activating (discard changes)
 - Delete BW objects
 - Transport request assignment
@@ -199,6 +223,7 @@ The BW MCP server handles the BW modeling structure — creating the Transformat
 | System | Support |
 |---|---|
 | SAP BW/4HANA (all versions) | ✅ Full support |
+| SAP BW Bridge (SAP BTP ABAP stack) | ✅ Via cookie authentication (`BW_COOKIE_FILE`) |
 
 <p><em><sub>SAP BW on HANA (7.5) is not supported. While individual tools may work, most HTTP communications cannot reliably pass through the server-side version negotiation in BW 7.5, causing most tools to fail with HTTP 406 errors.</sub></em></p>
 
@@ -234,10 +259,13 @@ The server is configured via environment variables:
 | Variable | Description | Required |
 |---|---|---|
 | `BW_URL` | BW system URL (e.g. `https://myhost:50001`) | yes |
-| `BW_USER` | SAP user name | yes |
-| `BW_PASSWORD` | SAP password | yes |
+| `BW_USER` | SAP user name | yes (or `BW_COOKIE_FILE`) |
+| `BW_PASSWORD` | SAP password | yes (or `BW_COOKIE_FILE`) |
 | `BW_CLIENT` | SAP client (e.g. `001`) | yes |
 | `BW_LANGUAGE` | Language for object texts (e.g. `EN`, `DE`). Default: `DE` | no |
+| `BW_COOKIE_FILE` | Path to a browser-exported cookie file for SAML-/OAuth-fronted systems (e.g. BW Bridge). Netscape or `name=value` format. When set, `BW_USER` / `BW_PASSWORD` are optional. | no |
+
+**Cookie authentication (BW Bridge / SAP BTP):** For BW systems that sit behind a SAML or OAuth login (such as BW Bridge on the SAP BTP ABAP stack), Basic Auth is not available. Export the authenticated session cookies from your browser into a file and point `BW_COOKIE_FILE` at it. The login/session approach is analogous to [vibing-steampunk](https://github.com/oisee/vibing-steampunk). When the session expires, refresh the cookie file and restart the server.
 
 ### Claude Desktop
 
@@ -368,10 +396,13 @@ Read the full definition of a single DTP — source, target, transformation refe
 List all DTPs that depend on a given BW object or Transformation.
 
 ### `bw_create_dtp`
-Create a new DTP on a Transformation. Source and target are derived from the Transformation automatically.
+Create a new DTP on a Transformation. Source and target are derived from the Transformation automatically. For a DataSource source, set `source_type="RSDS"` and pass `source_system`.
+
+### `bw_run_dtp`
+Start (execute) a run of an existing, active DTP. Returns the new run request id (an RSPM TSN) that can be passed directly to `bw_get_request` for monitoring.
 
 ### `bw_update_dtp`
-Update a DTP — description and value filters on fields.
+Update a DTP — description, value filters on fields, and extraction mode (`extraction_mode` = `full` / `delta`). Note: switching between Delta and Full has BW delta-init implications — a later delta load may require re-initialization.
 
 ### `bw_set_dtp_filter_routine`
 Set an ABAP routine filter on a DTP field.
@@ -446,8 +477,17 @@ Read the complete structure of a DataSource (RSDS): metadata (status, delta type
 ### `bw_get_dataflow` _(Read only)_
 Read the complete structural data flow of a BW object — all connected sources and targets resolved recursively through Transformations, DTPs, InfoSources, aDSOs, DataSources, CompositeProviders, and InfoObjects. Mirrors the Eclipse BWMT Transient Data Flow view. Supports direction (`upwards` / `downwards` / `both`) and configurable depth. Note: routine-based lookups (ABAP/SQLScript) are not reflected — only structural BW dependencies.
 
+### `bw_list_requests` _(Read only)_
+List load requests for a target InfoProvider via the BW/4HANA manage API — status, last process status and last action, record count, timestamp, user, and TSN. The TSN feeds `bw_get_request`.
+
+### `bw_get_request` _(Read only)_
+Full status analysis of one load request in a single call — request header, DTP information (start/finish/duration), process step chain, and message log. Output format: `text` (default) or `raw` (parsed JSON of all four payloads).
+
+### `bw_activate_request`
+Activate loaded data (DSO request activation) — move a finished load from the inbound table into the active data table and change log. This is the runtime request activation (BW/4HANA manage API), distinct from the modeling-object activation done by `bw_activate`; it applies only to aDSOs that have an activation step and runs asynchronously.
+
 ### `bw_activate`
-Activate one or more BW objects. Handles impact analysis and automatically deactivated DTPs. Supports: `adso`, `iobj`, `trfn`, `dtp`.
+Activate one or more BW objects. Handles impact analysis and automatically deactivated DTPs. Supports: `adso`, `iobj`, `trfn`, `dtp`, `rsds` (DataSource).
 
 ### `bw_unlock`
 Release a lock on a BW object without activating (discard changes).
@@ -540,7 +580,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical architecture and c
 - **BW Queries** — Read: `bw_get_query` ✅ — Create and modify: planned
 - **Process Chains** — build and manage Process Chains
 - **Open ODS View** — create Open ODS Views
-- **Further BW/4HANA objects** — BW/4HANA Cockpit functions and additional modeling objects
+- **BW/4HANA Cockpit functions** — runtime request monitor and data activation ✅ (`bw_run_dtp`, `bw_list_requests`, `bw_get_request`, `bw_activate_request`) — further runtime operations planned
+- **Further BW/4HANA objects** — additional modeling objects
 
 ---
 

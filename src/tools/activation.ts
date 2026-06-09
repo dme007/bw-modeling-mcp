@@ -49,41 +49,56 @@ export async function bwActivate(
   objectType: string,
   objectName: string,
   lockHandle: string,
-  corrNr?: string
+  corrNr?: string,
+  sourceSystem?: string
 ): Promise<string> {
   const typeLower = objectType.toLowerCase();
 
   // Validate object type
-  if (!['adso', 'trfn', 'dtpa', 'iobj', 'trcs'].includes(typeLower)) {
+  if (!['adso', 'trfn', 'dtpa', 'iobj', 'trcs', 'rsds'].includes(typeLower)) {
     return JSON.stringify({
       success: false,
-      message: `Unknown object type: ${objectType}. Supported: adso, trfn, dtpa, iobj, trcs`,
+      message: `Unknown object type: ${objectType}. Supported: adso, trfn, dtpa, iobj, trcs, rsds`,
     });
   }
 
-  // Step 1: For trfn/dtpa, GET the object in a fresh session to trigger SAP's internal
-  // HANA cache refresh. This mirrors Eclipse's behavior where GET and activation POST
-  // run in different sessions (Eclipse always GETs before activating).
+  // RSDS (DataSource) has a compound key — the source system is mandatory.
+  if (typeLower === 'rsds' && !sourceSystem) {
+    return JSON.stringify({
+      success: false,
+      message: `object_type "rsds" requires source_system (a DataSource is identified by DataSource name plus source system).`,
+    });
+  }
+
+  // Step 2: Activate
+  // trfn and dtpa activate in a fresh SAP session. The shared module-level client carries a
+  // stale session buffer that still sees the transformation as inactive (the state from DTP
+  // creation time); a fresh session reads the current DB state and avoids the false
+  // "transformation inactive" rejection, as well as cross-call session/CSRF collisions.
+  const activationClient = (typeLower === 'trfn' || typeLower === 'dtpa')
+    ? createClientFromEnv()
+    : client;
+
+  // Step 1: For trfn/dtpa, GET the object first to prime SAP's internal HANA cache refresh.
+  // This mirrors Eclipse's behavior of GETting before activating. For dtpa the priming GET must
+  // run in the SAME fresh session as the activation POST, otherwise the buffer it refreshes is
+  // not the one performing the activation. trfn keeps its historical throwaway-GET behavior.
   if (typeLower === 'trfn' || typeLower === 'dtpa') {
-    const freshClient = createClientFromEnv();
     const mediaKey = typeLower as keyof typeof MEDIA_TYPES;
-    await freshClient.get(
+    const primingClient = typeLower === 'dtpa' ? activationClient : createClientFromEnv();
+    await primingClient.get(
       `/sap/bw/modeling/${typeLower}/${objectName.toLowerCase()}/m`,
       MEDIA_TYPES[mediaKey]
     );
   }
 
-  // Step 2: Activate
-  // For trfn, use a fresh SAP session for the activation POST to avoid state
-  // pollution from previous requests in the same session.
-  const activationClient = typeLower === 'trfn' ? createClientFromEnv() : client;
-  const activationXml = await activationClient.activate(typeLower, objectName, lockHandle, corrNr);
+  const activationXml = await activationClient.activate(typeLower, objectName, lockHandle, corrNr, sourceSystem);
 
-  // Step 3: Unlock (skipped for dtpa)
+  // Step 3: Unlock (skipped for dtpa and rsds — both are standalone activations with no lock)
   // Always use the original client session — BW locks are session-bound and can only
   // be released by the session that acquired them. activationClient is a fresh session
   // for trfn and would silently fail to release the lock.
-  if (lockHandle && typeLower !== 'dtpa') {
+  if (lockHandle && typeLower !== 'dtpa' && typeLower !== 'rsds') {
     await client.unlock(typeLower, objectName);
   }
 

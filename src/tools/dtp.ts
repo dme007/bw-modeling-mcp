@@ -296,6 +296,7 @@ export interface CreateDtpArgs {
   trfn_name_2?: string;
   source_name: string;
   source_type: string;
+  source_system?: string;
   target_name: string;
   target_type: string;
   description?: string;
@@ -327,6 +328,30 @@ export async function bwCreateDtp(
   const tgtType    = args.target_type.toUpperCase();
   const desc       = args.description ?? '';
   const pkg        = args.package ?? '$TMP';
+
+  // Source element attributes. For ADSO/TRCS sources tlogo and type coincide and the name is
+  // passed through. For a DataSource source (source_type "RSDS") tlogo and type differ
+  // (tlogo "RSDS", type "DTASRC") and the name is the RSDS compound key.
+  let sourceTlogo: string;
+  let sourceTypeAttr: string;
+  let sourceNameAttr: string;
+  if (srcType === 'RSDS') {
+    if (!args.source_system) {
+      throw new Error(
+        'source_type "RSDS" (DataSource source) requires source_system to build the ' +
+        'RSDS compound source name.'
+      );
+    }
+    sourceTlogo = 'RSDS';
+    sourceTypeAttr = 'DTASRC';
+    // RSDS compound key: DataSource name left-justified in a 30-char field, then the
+    // source system name appended with no trailing padding (total length 40).
+    sourceNameAttr = srcName.padEnd(30, ' ') + args.source_system.toUpperCase();
+  } else {
+    sourceTlogo = srcType;
+    sourceTypeAttr = srcType;
+    sourceNameAttr = srcName;
+  }
 
   const language     = process.env.BW_LANGUAGE ?? 'DE';
   const masterSystem = new URL(process.env.BW_URL ?? 'http://localhost').hostname.split('.')[0].toUpperCase();
@@ -386,7 +411,7 @@ export async function bwCreateDtp(
   <overview>
     <object xsi:type="Dtpa:DTPObject" name="${trfnName}" tlogo="TRFN"/>${args.trfn_name_2 ? `\n    <object xsi:type="Dtpa:DTPObject" name="${args.trfn_name_2.toUpperCase()}" tlogo="TRFN"/>` : ''}
   </overview>
-  <source name="${srcName}" tlogo="${srcType}" type="${srcType}"/>
+  <source name="${sourceNameAttr}" tlogo="${sourceTlogo}" type="${sourceTypeAttr}"/>
   <target name="${tgtName}" tlogo="${tgtType}" type="${tgtType}"/>
 </Dtpa:dataTransferProcess>`;
 
@@ -485,6 +510,58 @@ export async function bwCreateDtp(
   });
 }
 
+// ── bwRunDtp ──────────────────────────────────────────────────────────────────
+
+/**
+ * bw_run_dtp — start (execute) a DTP run.
+ *
+ * Single POST to /sap/bw/modeling/dtpa/executerun with a minimal <executeRun> body naming the
+ * DTP. The server responds 201 Created with a Location header whose last path segment is the new
+ * request id.
+ *
+ * Runs in a fresh session (createClientFromEnv()) — like the DTP-activation path — because the
+ * executerun touches the DTP and its transformation and the shared module-level client can hold a
+ * stale session buffer; a fresh session also avoids concurrency collisions across runs.
+ *
+ * The returned request id is a timestamp-based executerun id. It is returned for information only:
+ * it is not verified to match the request TSN used by bw_get_request, so load status is monitored
+ * via bw_list_requests (by target InfoProvider) and bw_get_request.
+ */
+export async function bwRunDtp(dtpName: string): Promise<string> {
+  const dtpUpper = dtpName.toUpperCase();
+
+  const runClient = createClientFromEnv();
+  const csrfToken = await runClient.getCsrfToken();
+
+  const body = `<?xml version="1.0" encoding="UTF-8"?><executeRun dataTransferProcess="${dtpUpper}"></executeRun>`;
+  const response = await runClient.rawPost(
+    '/sap/bw/modeling/dtpa/executerun',
+    body,
+    {
+      'Accept': MEDIA_TYPES['dtpa'],
+      'Content-Type': MEDIA_TYPES['dtpa'],
+      'x-csrf-token': csrfToken,
+    }
+  );
+
+  const location = response.headers['location'] ?? response.headers['Location'] ?? '';
+  if (!location) {
+    throw new Error(
+      `executerun returned no Location header. Response headers: ${JSON.stringify(response.headers)}`
+    );
+  }
+  const requestId = location.split('/').filter(Boolean).pop() ?? '';
+
+  return JSON.stringify({
+    success: true,
+    dtp_name: dtpUpper,
+    request_id: requestId,
+    message:
+      `DTP run started for ${dtpUpper} (request id ${requestId}). ` +
+      `Monitor load status via bw_list_requests (by target InfoProvider) and bw_get_request.`,
+  });
+}
+
 // ── bwUpdateDtp ───────────────────────────────────────────────────────────────
 
 export interface UpdateDtpArgs {
@@ -495,6 +572,7 @@ export interface UpdateDtpArgs {
   filter_value?: string;
   filter_excluding?: boolean;
   filter_clear_fields?: string;
+  extraction_mode?: 'full' | 'delta';
   transport?: string;
   transport_lock_holder?: string;
 }
@@ -578,6 +656,20 @@ export async function bwUpdateDtp(
         }
       );
     }
+  }
+
+  // Extraction mode: rewrite only extractionMode + deltaSettingStatus on the <extractionSettings>
+  // element (Full = F/0, Delta = D/2). allowedExtractionModes, packageSize and parallelExtraction
+  // are left unchanged; attributes may appear in any order.
+  if (args.extraction_mode !== undefined) {
+    const extractionMode = args.extraction_mode === 'full' ? 'F' : 'D';
+    const deltaSettingStatus = args.extraction_mode === 'full' ? '0' : '2';
+    putXml = putXml.replace(
+      /<extractionSettings\b[^>]*\/>/,
+      (tag) => tag
+        .replace(/\bextractionMode="[^"]*"/, `extractionMode="${extractionMode}"`)
+        .replace(/\bdeltaSettingStatus="[^"]*"/, `deltaSettingStatus="${deltaSettingStatus}"`)
+    );
   }
 
   // PUT on a fresh stateless client — Eclipse uses a separate stateless session for PUT
