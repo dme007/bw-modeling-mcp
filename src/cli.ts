@@ -4,6 +4,7 @@ import { resolveConfig, CliFlags } from './config.js';
 import { createLogger, LogLevel } from './logger.js';
 import { dispatchTool, TOOL_NAMES, UnknownToolError } from './dispatch.js';
 import { loadDotenv } from './dotenv.js';
+import { runTests, loadPlan, planSkeleton, buildAutoPlan, writePlan, findPlanPath } from './test-run.js';
 
 interface ParsedArgs {
   command: string | null;
@@ -15,6 +16,8 @@ const KNOWN_GLOBAL_FLAGS = new Set([
   'url', 'user', 'password', 'client', 'language',
   'config', 'env-file', 'verbose', 'v', 'vv', 'help', 'h',
   'args-json',
+  // test-run-specific
+  'plan', 'include', 'exclude', 'fail-fast', 'generate-plan', 'auto',
 ]);
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -65,6 +68,8 @@ Usage:
   bw-cli <tool-name> [--key value]... [--args-json '<json>']
   bw-cli ping
   bw-cli list-tools
+  bw-cli test-run [--plan <path>] [--include t1,t2] [--exclude t1,t2] [--fail-fast]
+  bw-cli test-run --generate-plan [--plan <path>] [--auto]
   bw-cli --help
 
 Configuration (priority: CLI flags > env > config file):
@@ -90,6 +95,13 @@ Tool arguments:
   --key value            Set a tool argument (string/number/boolean parsed automatically).
                          Nested values: use --args-json instead.
   --args-json '<json>'   Pass the full args object as JSON. Overrides individual --key flags.
+
+test-run:
+  bw-cli test-run                              run the read-only smoke suite
+  bw-cli test-run --plan ./.bwc.test.json -vv  with full per-tool output
+  bw-cli test-run --generate-plan              write a skeleton plan to ./.bwc.test.json
+  bw-cli test-run --generate-plan --auto       fill the plan with one example per type
+                                               (calls bw_search per object type)
 
 Examples:
   bw-cli ping
@@ -151,6 +163,62 @@ async function runPing(client: ReturnType<typeof createClientFromConfig>): Promi
   process.stderr.write(`Session cookies: ${JSON.stringify(Object.keys(client.sessionInfo()))}\n`);
 }
 
+function parseCsvFlag(value: unknown): Set<string> | undefined {
+  if (typeof value !== 'string' || value.length === 0) return undefined;
+  return new Set(value.split(',').map((s) => s.trim()).filter((s) => s.length > 0));
+}
+
+async function runTestRunCommand(
+  client: ReturnType<typeof createClientFromConfig>,
+  flags: Record<string, string | boolean>,
+): Promise<number> {
+  const planPath = typeof flags.plan === 'string' ? flags.plan : undefined;
+  const generate = flags['generate-plan'] === true;
+  const auto = flags.auto === true;
+
+  if (generate) {
+    const target = planPath ?? './.bwc.test.json';
+    let plan;
+    if (auto) {
+      process.stderr.write('Connecting to BW and discovering example objects…\n');
+      await client.loadMediaTypes().catch(() => undefined);
+      plan = await buildAutoPlan(client);
+    } else {
+      plan = planSkeleton();
+    }
+    writePlan(plan, target);
+    process.stderr.write(`Wrote plan to ${target}\n`);
+    return 0;
+  }
+
+  // Normal run
+  await client.loadMediaTypes().catch((err) => {
+    process.stderr.write(`[warn] discovery failed: ${err}\n`);
+  });
+
+  const { plan, source } = loadPlan(planPath);
+  if (planPath && !source) {
+    process.stderr.write(`Plan file not found: ${planPath}\n`);
+    return 2;
+  }
+  if (source) {
+    process.stderr.write(`[test-run] plan: ${source}\n`);
+  } else {
+    process.stderr.write(`[test-run] no plan file found (tried ./.bwc.test.json, ~/.config/bw-cli-test.json, ~/.bwc.test.json) — only checks without required arguments will run.\n`);
+  }
+
+  const { exitCode } = await runTests({
+    client,
+    plan,
+    include: parseCsvFlag(flags.include),
+    exclude: parseCsvFlag(flags.exclude),
+    failFast: flags['fail-fast'] === true,
+    veryVerbose: flags.vv === true,
+  });
+
+  return exitCode;
+}
+
 async function main(): Promise<number> {
   const argv = process.argv.slice(2);
   const { command, flags } = parseArgs(argv);
@@ -162,6 +230,14 @@ async function main(): Promise<number> {
 
   if (command === 'list-tools') {
     printToolList();
+    return 0;
+  }
+
+  // `test-run --generate-plan` without --auto writes a skeleton; no BW needed.
+  if (command === 'test-run' && flags['generate-plan'] === true && flags.auto !== true) {
+    const target = typeof flags.plan === 'string' ? flags.plan : './.bwc.test.json';
+    writePlan(planSkeleton(), target);
+    process.stderr.write(`Wrote plan skeleton to ${target}\n`);
     return 0;
   }
 
@@ -203,6 +279,10 @@ async function main(): Promise<number> {
     if (command === 'ping') {
       await runPing(client);
       return 0;
+    }
+
+    if (command === 'test-run') {
+      return await runTestRunCommand(client, flags);
     }
 
     if (!TOOL_NAMES.includes(command as typeof TOOL_NAMES[number])) {
