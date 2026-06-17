@@ -263,6 +263,17 @@ async function main(): Promise<number> {
   try {
     config = resolveConfig(cliFlags);
   } catch (err) {
+    // `--auto` fills the plan with live examples queried from the system, so it
+    // needs a connection — unlike the plain skeleton path above. Guide the user
+    // to the no-config alternative instead of a generic config error.
+    if (command === 'test-run' && flags['generate-plan'] === true && flags.auto === true) {
+      process.stderr.write(
+        `Error: --auto needs a configured BW connection to fetch live examples.\n` +
+        `Set BW_URL / BW_USER / BW_PASSWORD (or pass --url/--user/--password), ` +
+        `or omit --auto to write a placeholder skeleton without a connection.\n`
+      );
+      return 2;
+    }
     process.stderr.write(`Configuration error: ${(err as Error).message}\n`);
     return 2;
   }
