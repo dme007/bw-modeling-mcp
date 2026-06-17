@@ -4,7 +4,7 @@ import { resolveConfig, CliFlags } from './config.js';
 import { createLogger, LogLevel } from './logger.js';
 import { dispatchTool, TOOL_NAMES, UnknownToolError } from './dispatch.js';
 import { loadDotenv } from './dotenv.js';
-import { runTests, loadPlan, planSkeleton, buildAutoPlan, writePlan, findPlanPath } from './test-run.js';
+import { runTests, loadPlan, planSkeleton, buildAutoPlan, writePlan } from './test-run.js';
 
 interface ParsedArgs {
   command: string | null;
