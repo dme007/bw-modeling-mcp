@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.1] — 2026-06-27
+
+### Fixed
+
+- `bw_search` / `bw_get_process_chain` — corrected the TLOGO codes in the tool and `object_type` descriptions: InfoSource is `TRCS` (not `ISFS`) and Process Chain is `RSPC` (not `PRCH`); the wrong codes were passed straight to the search endpoint and caused an HTTP 500. Verified against the `RSTLOGO` domain (`DD07T`) and live `bw_search` calls
+
+---
+
 ## [0.9.0] — 2026-06-27
 
 ### Added
@@ -24,10 +32,6 @@
 - `bw_activate` — now supports `hcpr` (CompositeProvider) as an activatable object type
 - `bw_create_dtp` — new `IOBJ` target type for InfoObject attributes; the BW XML `type` attribute is correctly set to `IOBJA` (InfoObject Attribute DTP target role)
 - `bw_update_transformation` — supports field-based direct mapping for targets without an underlying InfoObject; previously always attempted an InfoObject GET, which fails for plain aDSO/InfoSource field targets
-
-### Fixed
-
-- `bw_search` / `bw_get_process_chain` — corrected the TLOGO codes in the tool and `object_type` descriptions: InfoSource is `TRCS` (not `ISFS`) and Process Chain is `RSPC` (not `PRCH`); the wrong codes were passed straight to the search endpoint and caused an HTTP 500. Verified against the `RSTLOGO` domain (`DD07T`) and live `bw_search` calls
 
 ### Notes
 
