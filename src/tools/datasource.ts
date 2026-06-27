@@ -1,4 +1,4 @@
-import { BwClient } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES } from '../bw-client.js';
 
 const BASE = '/sap/bw/modeling/repo/datasourcestructure';
 const BASE_PREFIX = `${BASE}/`;
@@ -567,6 +567,186 @@ export async function bwGetSourceSystem(client: BwClient, sourceSystem: string):
   }
 
   return JSON.stringify(result, null, 2);
+}
+
+// Full Accept header for the remote-entity value help (multiple supported versions).
+const VALUEHELP_ACCEPT = [
+  'application/vnd.sap-bw-modeling.valuehelp2-v1_0_0+xml',
+  MEDIA_TYPES['valuehelp'],
+  'application/vnd.sap-bw-modeling.isvaluehelp-v1_0_0+xml',
+].join(', ');
+
+interface RemoteEntity {
+  technical_name: string;
+  entity_type: string | null;
+  path_suffix: string | null;
+}
+
+/**
+ * bw_list_remote_entities — read-only discovery of the remote entities (HANA views /
+ * virtual tables) exposed by a source system, as offered on the DataSource proposal page.
+ *
+ * The returned technical_name is exactly what binds into the adapter externalObject when
+ * creating a DataSource via bw_create_datasource.
+ */
+export async function bwListRemoteEntities(
+  client: BwClient,
+  sourceSystem: string,
+  searchPattern: string = '*',
+  resultSize: number = 200,
+): Promise<string> {
+  const ssUpper = sourceSystem.toUpperCase();
+  const url =
+    `/sap/bw/modeling/rsdsint/values/hanaentity` +
+    `?searchPattern=${encodeURIComponent(searchPattern)}` +
+    `&sourcesystem=${encodeURIComponent(ssUpper)}` +
+    `&resultSize=${resultSize}`;
+
+  const { body } = await client.rawGet(url, { Accept: VALUEHELP_ACCEPT });
+
+  // Root <vh:valueHelp size="..." resultComplete="..."> — surface truncation info.
+  const rootAttrs = body.match(/<vh:valueHelp\b([^>]*)>/)?.[1] ?? '';
+  const sizeRaw = rootAttrs.match(/\bsize="([^"]*)"/)?.[1];
+  const size = sizeRaw !== undefined ? parseInt(sizeRaw, 10) : null;
+  const resultComplete = rootAttrs.match(/\bresultComplete="([^"]*)"/)?.[1] === 'true';
+
+  const entities: RemoteEntity[] = [];
+  const rowRe = /<row\b[^>]*>([\s\S]*?)<\/row>/g;
+  let rm: RegExpExecArray | null;
+  while ((rm = rowRe.exec(body)) !== null) {
+    const rowBody = rm[1];
+    const technicalName = rowBody.match(/<technicalName>([^<]*)<\/technicalName>/)?.[1] ?? '';
+
+    let entityType: string | null = null;
+    let pathSuffix: string | null = null;
+    const attrRe = /<attribute\b([^>]*)\/>/g;
+    let am: RegExpExecArray | null;
+    while ((am = attrRe.exec(rowBody)) !== null) {
+      const aAttrs = am[1];
+      const aName = aAttrs.match(/\bname="([^"]*)"/)?.[1] ?? '';
+      const aValue = aAttrs.match(/\bvalue="([^"]*)"/)?.[1] ?? '';
+      if (aName === 'ENTITY_TYPE') entityType = aValue;
+      else if (aName === 'PATH_SUFFIX') pathSuffix = aValue;
+    }
+
+    entities.push({ technical_name: technicalName, entity_type: entityType, path_suffix: pathSuffix });
+  }
+
+  return JSON.stringify({
+    source_system: ssUpper,
+    search_pattern: searchPattern,
+    result_size: size,
+    result_complete: resultComplete,
+    count: entities.length,
+    entities,
+  }, null, 2);
+}
+
+/**
+ * bw_create_datasource — create a DataSource on top of a remote entity, from the server's
+ * field proposal, and leave it inactive. v1: local objects only ($TMP), no field/key/
+ * partitioning editing. Activation is a separate step via bw_activate (object_type "rsds").
+ *
+ * Sequence (lock → create → unlock on the SAME session, via rawPost because the rsds compound
+ * key and the copyFrom query params do not fit client.lock/create/unlock):
+ *   1. POST ?action=lock with activity_context CREA → lockHandle
+ *   2. POST the minimal proposal body to
+ *      ?copyFromObjectName=initial&copyFromObjectType=_proposal&lockHandle=...
+ *      (server derives the full segment + field structure from the remote entity)
+ *   3. POST ?action=unlock
+ *
+ * The remote entity binds via the adapter externalObject attribute, not by name equality —
+ * hanaEntity is its own parameter (defaulting to the DataSource name only as a convenience).
+ */
+export async function bwCreateDatasource(
+  client: BwClient,
+  datasourceName: string,
+  sourceSystem: string,
+  applicationComponent: string,
+  hanaEntity?: string,
+  description?: string,
+): Promise<string> {
+  const dsUpper = datasourceName.toUpperCase();
+  const dsLower = datasourceName.toLowerCase();
+  const ssUpper = sourceSystem.toUpperCase();
+  const apco = applicationComponent.toUpperCase();
+  // externalObject must match the remote entity's technicalName exactly — do NOT transform case.
+  const externalObject = hanaEntity ?? datasourceName;
+  const desc = description ?? externalObject;
+
+  const language = process.env.BW_LANGUAGE ?? 'DE';
+  const masterSystem = new URL(process.env.BW_URL ?? 'http://localhost').hostname.split('.')[0].toUpperCase();
+  const responsible = (process.env.BW_USER ?? '').toUpperCase();
+
+  const lockUrl   = `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}?action=lock`;
+  const unlockUrl = `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}?action=unlock`;
+
+  // Step 1: Lock (CREA) — establishes the enqueue session + CSRF on this client.
+  const csrf = await client.getCsrfToken();
+  const lockResponse = await client.rawPost(lockUrl, '', {
+    'activity_context': 'CREA',
+    'Accept': RSDS_ACCEPT,
+    'x-csrf-token': csrf,
+  });
+  const lockHandle = lockResponse.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1] ?? '';
+  if (!lockHandle) {
+    throw new Error(`No <LOCK_HANDLE> in CREA lock response:\n${lockResponse.body}`);
+  }
+
+  // Step 2: Create from proposal (with lockHandle). Server materialises the full structure.
+  const createUrl =
+    `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}` +
+    `?copyFromObjectName=initial&copyFromObjectType=_proposal&lockHandle=${encodeURIComponent(lockHandle)}`;
+
+  const postBody = `<?xml version="1.0" encoding="UTF-8"?>
+<dataSource:dataSource
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns:adtcore="http://www.sap.com/adt/core"
+  xmlns:dataSource="http://www.sap.com/bw/modeling/DataSource.ecore"
+  applicationComponent="${apco}"
+  name="${dsUpper}"
+  sourceSystemName="${ssUpper}"
+  type="D">
+  <description label="${desc}" textType="3"/>
+  <adapter xsi:type="dataSource:ExtractorHANA" category="E" currentlyUsed="true"
+           name="HANA" externalObject="${externalObject}" pathSuffix=""/>
+  <tlogoProperties adtcore:language="${language}" adtcore:name="${dsUpper}"
+                   adtcore:type="RSDS" adtcore:masterLanguage="${language}"
+                   adtcore:masterSystem="${masterSystem}" adtcore:responsible="${responsible}"/>
+</dataSource:dataSource>`;
+
+  try {
+    await client.rawPost(createUrl, postBody, {
+      'Development-Class': '$TMP',
+      'Content-Type': MEDIA_TYPES['rsds'],
+      'Accept': MEDIA_TYPES['rsds'],
+      'x-csrf-token': csrf,
+    });
+  } finally {
+    // Step 3: Unlock on the same session, even if create failed.
+    await client.rawPost(unlockUrl, '', {
+      'Content-Type': MEDIA_TYPES['rsds'],
+      'Accept': MEDIA_TYPES['rsds'],
+      'x-csrf-token': csrf,
+    });
+  }
+
+  // Read back the derived structure so the caller sees what the proposal produced.
+  const structure = await bwGetDatasource(client, dsLower, ssUpper, 'text');
+
+  const header = [
+    `DataSource created (inactive): ${dsUpper} / ${ssUpper}`,
+    `Package: $TMP (local)`,
+    `Application Component: ${apco}`,
+    `HANA entity bound (adapter externalObject): ${externalObject}`,
+    '',
+    `Next step: activate with bw_activate — object_type "rsds", object_name "${dsUpper}", ` +
+      `source_system "${ssUpper}", lock_handle "".`,
+    '',
+    '── Read-back (GET .../m) ──',
+  ].join('\n');
+
+  return `${header}\n${structure}`;
 }
 
 export async function bwPreviewDatasource(

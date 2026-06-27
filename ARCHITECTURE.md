@@ -114,14 +114,23 @@ src/
     ├── composite_provider.ts # bw_get_composite_provider
     ├── cp_components.ts  # bw_get_ckf, bw_get_rkf, bw_get_structure
     ├── dataflow.ts       # bw_get_dataflow — transient data flow graph via /sap/bw/modeling/dmod/8TRANSIENT
-    ├── datasource.ts     # bw_list_source_systems, bw_list_datasources, bw_get_source_system, bw_get_datasource, bw_preview_datasource
-    ├── processchain.ts   # bw_get_process_chain — reads RSPC via bw4 API; auto-fetches variant details per step
-    ├── processvariant.ts # bw_get_process_variant — generic variant detail reader for all 93 process types
+    ├── datasource.ts     # bw_list_source_systems, bw_list_datasources, bw_get_source_system,
+    │                     # bw_get_datasource, bw_preview_datasource,
+    │                     # bw_list_remote_entities, bw_create_datasource
     ├── delete.ts         # bw_delete
     ├── dtp.ts            # bw_get_dtp, bw_get_dtps, bw_create_dtp, bw_run_dtp, bw_update_dtp, bw_set_dtp_filter_routine
     ├── infoarea.ts       # bw_get_infoarea, bw_create_infoarea, bw_move_object
     ├── infoobject.ts     # bw_get_infoobject, bw_create_infoobject, bw_update_infoobject
     ├── infosource.ts     # bw_get_infosource, bw_create_infosource, bw_update_infosource
+    ├── openhub.ts        # bw_get_open_hub
+    ├── planning.ts       # bw_get_aggregation_level, bw_get_planning_properties,
+    │                     # bw_get_planning_sequence, bw_get_planning_function
+    ├── process_chain_monitor.ts # bw_list_process_chain_runs, bw_get_process_chain_run_detail,
+    │                            # bw_list_process_chain_last_status — OData-based monitoring
+    ├── processchain.ts   # bw_get_process_chain — reads RSPC via bw4 API; auto-fetches variant details per step
+    ├── processchain_write.ts # bw_create_process_chain, bw_update_process_chain,
+    │                         # bw_activate_process_chain — BW4 Cockpit REST API
+    ├── processvariant.ts # bw_get_process_variant — generic variant detail reader for all 93 process types
     ├── push.ts           # bw_push_data, bw_get_push_schema
     ├── query.ts          # bw_get_query — full query definition parser (variables, layout, CKFs, RKFs, exceptions)
     ├── reporting.ts      # bw_query_data, bw_get_filter_values — BICS reporting endpoint (/sap/bw/modeling/comp/reporting)
@@ -131,7 +140,8 @@ src/
     ├── search.ts         # bw_search, bw_xref
     └── transformation.ts # bw_get_transformation, bw_create_transformation,
                           # bw_update_transformation, bw_set_transformation_routine,
-                          # bw_delete_transformation_routine, bw_set_transformation_runtime
+                          # bw_set_transformation_routine_fields, bw_delete_transformation_routine,
+                          # bw_set_transformation_runtime
 ```
 
 ---
@@ -220,6 +230,25 @@ Full endpoint list from BW/4HANA discovery — **47 workspaces, 130+ endpoints**
 | BW Utils | `/sap/bw/modeling/utils` |
 | Bucket services | `/sap/bw/modeling/bucket` |
 | Query replication | `/sap/bw/modeling/compreplication` |
+
+### Process Chain Authoring Endpoints (BW4 Cockpit API)
+
+| Purpose | Endpoint |
+|---|---|
+| Create / list process chains | `POST / GET /sap/bc/http/sap/bw4/v1/modeling/processchains` |
+| Read / update a chain | `GET / PUT /sap/bc/http/sap/bw4/v1/modeling/processchains/{name}` |
+| Activate a chain | `POST /sap/bc/http/sap/bw4/v1/modeling/processchains/{name}/activate` |
+| Transport pre-check | `POST /sap/bc/http/sap/bw4/v1/modeling/transports/validateobject` |
+
+### Process Chain Monitoring Endpoints (OData)
+
+| Purpose | Endpoint |
+|---|---|
+| Execution runs | `GET /sap/opu/odata/sap/RV_C_PCMLOG_CDS/Rv_C_PcmLog` |
+| Last status per chain | `GET /sap/opu/odata/sap/RV_C_PCMPROCESSCHAIN_CDS/Rv_C_PcmProcessChain` |
+| Run steps | `GET /sap/opu/odata/sap/BW4_PCM_SRV/ChainProcessSet` |
+| Run messages | `GET /sap/opu/odata/sap/BW4_PCM_SRV/ChainProcessLogSet` |
+| Status code texts | `GET /sap/opu/odata/sap/RV_C_PCMLOG_CDS/Rv_I_Rsvpcm_State` |
 
 ### Runtime / Request Monitor Endpoints
 

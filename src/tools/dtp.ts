@@ -353,6 +353,20 @@ export async function bwCreateDtp(
     sourceNameAttr = srcName;
   }
 
+  // Target element attributes. For ADSO/TRCS targets tlogo and type coincide. For an
+  // InfoObject-attribute target (target_type "IOBJ") they differ: tlogo "IOBJ" (object kind)
+  // but type "IOBJA" (DTP target role = InfoObject Attributes) — the same tlogo != type pattern
+  // as the RSDS source. Text/hierarchy targets (IOBJT/IOBJH) are not yet supported.
+  let targetTlogo: string;
+  let targetTypeAttr: string;
+  if (tgtType === 'IOBJ') {
+    targetTlogo = 'IOBJ';
+    targetTypeAttr = 'IOBJA';
+  } else {
+    targetTlogo = tgtType;
+    targetTypeAttr = tgtType;
+  }
+
   const language     = process.env.BW_LANGUAGE ?? 'DE';
   const masterSystem = new URL(process.env.BW_URL ?? 'http://localhost').hostname.split('.')[0].toUpperCase();
   const responsible  = (process.env.BW_USER ?? '').toUpperCase();
@@ -412,7 +426,7 @@ export async function bwCreateDtp(
     <object xsi:type="Dtpa:DTPObject" name="${trfnName}" tlogo="TRFN"/>${args.trfn_name_2 ? `\n    <object xsi:type="Dtpa:DTPObject" name="${args.trfn_name_2.toUpperCase()}" tlogo="TRFN"/>` : ''}
   </overview>
   <source name="${sourceNameAttr}" tlogo="${sourceTlogo}" type="${sourceTypeAttr}"/>
-  <target name="${tgtName}" tlogo="${tgtType}" type="${tgtType}"/>
+  <target name="${tgtName}" tlogo="${targetTlogo}" type="${targetTypeAttr}"/>
 </Dtpa:dataTransferProcess>`;
 
   const createClient = createClientFromEnv();

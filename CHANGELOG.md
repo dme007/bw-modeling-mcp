@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.9.0] — 2026-06-27
+
+### Added
+
+- `bw_get_aggregation_level` — reads an Aggregation Level (ALVL): the planning-enabled view on top of an InfoProvider, with the complete element list — characteristics including type, length, conversion routine, base InfoObject, compounding, and dimension group; key figures including aggregation behavior, semantics (AMO/QUA/NUM), and unit/currency reference (unit characteristic, fixed unit, or fixed currency)
+- `bw_get_planning_function` — reads a Planning Function (PLSE): function type, aggregation level, documentation, characteristic usage roles, conditions, and the full parameter tree with nested structure and values; for FORMULA functions the FOX code surfaces as the value of the FLINE parameter
+- `bw_get_planning_sequence` — reads a Planning Sequence (PLSQ): ordered step list with type code, aggregation level, planning function, and filter name per step
+- `bw_get_planning_properties` — reads the Planning Properties (PLCR) of a plan-enabled InfoProvider (real-time aDSO or CompositeProvider): key-date mode, maximum characteristic combinations, and save strategy (planning sequence and delta-read flag); data slices not yet included
+- `bw_create_process_chain` — creates a Process Chain (RSPC) via the BW/4HANA Cockpit REST API; builds the chain model from a step and edge list, creates a trigger-only skeleton, then updates it with the full model in one operation; optionally activates after creation; supported step types: `DTP_LOAD`, `ADSOACT`, `CHAIN` (local sub-chain start, verified), and collectors `AND` / `OR` / `XOR`; inline-configured process types (ABAP programs, OS commands, attribute change runs, etc.) are not yet supported
+- `bw_update_process_chain` — replaces the step model (nodes and edges) of an existing Process Chain; preserves the existing trigger node and scheduling configuration; optionally overrides description and InfoArea
+- `bw_activate_process_chain` — activates an existing Process Chain; returns the top-level activation message, severity, and full log
+- `bw_list_process_chain_runs` — lists execution runs of one or all process chains from the monitoring log; filterable by chain name, start date range, and status; ordered by start time descending; default limit 20
+- `bw_get_process_chain_run_detail` — reads step-level and message-level detail of a single chain run, including error messages; chain_id and log_id come from `bw_list_process_chain_runs` or `bw_list_process_chain_last_status`
+- `bw_list_process_chain_last_status` — last execution status and scheduling state for every chain in the system; one row per chain; includes log ID of the most recent run
+- `bw_get_open_hub` — reads an Open Hub Destination (DEST): destination type, source object, DB table, InfoArea, package, status, the complete output field list with type/length, InfoObject binding, conversion routine, compounding, and key flag; file properties for FILE-type destinations
+- `bw_list_remote_entities` — lists the remote entities (HANA views / virtual tables) a source system exposes as a DataSource basis; read-only discovery matching the Eclipse DataSource proposal page; the returned `technical_name` is exactly what binds into `bw_create_datasource`
+- `bw_create_datasource` — creates a DataSource (RSDS) on top of a remote entity from the server's field proposal, leaving it inactive; the server derives the full segment and field structure from the remote entity; local objects only (`$TMP` in v1); activation is a separate step via `bw_activate` (object_type `rsds`)
+- `bw_set_transformation_routine_fields` — edits the list of target fields a global END routine writes ("Felder setzen" in SAP GUI); accepts an explicit field list (`fields`) or an exclusion list (`exclude_fields`); requires an existing END routine; does not activate; returns lock_handle for `bw_activate`
+
+### Improved
+
+- `bw_activate` — now supports `hcpr` (CompositeProvider) as an activatable object type
+- `bw_create_dtp` — new `IOBJ` target type for InfoObject attributes; the BW XML `type` attribute is correctly set to `IOBJA` (InfoObject Attribute DTP target role)
+- `bw_update_transformation` — supports field-based direct mapping for targets without an underlying InfoObject; previously always attempted an InfoObject GET, which fails for plain aDSO/InfoSource field targets
+
+### Notes
+
+- `bw_get_planning_properties` reads `generalSettings` only; data slices (PLDS) are not yet included
+- Process chain authoring uses the BW/4HANA Cockpit REST API (`/sap/bc/http/sap/bw4/v1/modeling/processchains`) — the same API consumed internally by the BW/4HANA Cockpit
+
+---
+
 ## [0.8.0] — 2026-06-09
 
 ### Added

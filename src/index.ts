@@ -11,7 +11,7 @@ import {
 import { createClientFromEnv } from './bw-client.js';
 import { bwGetAdso, bwCreateAdso, FieldDef, bwUpdateAdso, bwUpdateAdsoAddPureField, bwUpdateAdsoSettings, AdsoSettings, bwUpdateAdsoManageKeys, bwUpdateAdsoFieldProperties, FieldProperties } from './tools/adso.js';
 import { bwGetInfoObject, bwCreateInfoObject, bwUpdateInfoObject, AttributeDef } from './tools/infoobject.js';
-import { bwGetTransformation, bwUpdateTransformation, bwCreateTransformation, bwSetTransformationRuntime, bwSetTransformationRoutine, bwDeleteTransformationRoutine } from './tools/transformation.js';
+import { bwGetTransformation, bwUpdateTransformation, bwCreateTransformation, bwSetTransformationRuntime, bwSetTransformationRoutine, bwDeleteTransformationRoutine, bwSetTransformationRoutineFields } from './tools/transformation.js';
 import { bwActivate } from './tools/activation.js';
 import { bwGetDtps, bwGetDtp, bwCreateDtp, bwRunDtp, bwUpdateDtp, bwSetDtpFilterRoutine } from './tools/dtp.js';
 import { bwSearch, bwXref } from './tools/search.js';
@@ -23,13 +23,17 @@ import { bwGetQuery } from './tools/query.js';
 import { bwGetCompositeProvider } from './tools/composite_provider.js';
 import { bwGetCkf, bwGetRkf, bwGetStructure } from './tools/cp_components.js';
 import { bwListContents } from './tools/repository.js';
-import { bwListSourceSystems, bwListDatasources, bwGetSourceSystem, bwGetDatasource, bwPreviewDatasource } from './tools/datasource.js';
+import { bwListSourceSystems, bwListDatasources, bwGetSourceSystem, bwGetDatasource, bwPreviewDatasource, bwListRemoteEntities, bwCreateDatasource } from './tools/datasource.js';
 import { bwGetDataflow } from './tools/dataflow.js';
 import { bwQueryData, bwGetFilterValues, InfoObjectState, VariableInput, DrillOperation } from './tools/reporting.js';
 import { bwGetRoles, bwGetQueryRoles, bwSetQueryRoles, bwGetRoleQueries } from './tools/roles.js';
 import { bwGetProcessChain } from './tools/processchain.js';
 import { bwGetProcessVariant } from './tools/processvariant.js';
 import { bwListRequests, bwGetRequest, bwActivateRequest } from './tools/request_monitor.js';
+import { bwGetOpenHub } from './tools/openhub.js';
+import { bwGetAggregationLevel, bwGetPlanningProperties, bwGetPlanningSequence, bwGetPlanningFunction } from './tools/planning.js';
+import { bwListProcessChainRuns, bwGetProcessChainRunDetail, bwListProcessChainLastStatus } from './tools/process_chain_monitor.js';
+import { bwCreateProcessChain, bwUpdateProcessChain, bwActivateProcessChain, CreateProcessChainParams, UpdateProcessChainParams } from './tools/processchain_write.js';
 
 // Single shared client instance (CSRF token + session cookies are reused)
 const client = createClientFromEnv();
@@ -678,6 +682,46 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'bw_set_transformation_routine_fields',
+      description:
+        'Edit the list of target fields the global END routine writes ("Felder setzen" in SAP GUI). ' +
+        'Requires an existing END routine — use bw_set_transformation_routine to create one first. ' +
+        'Provide exactly one of: fields (explicit complete set of target fields the END routine should write) ' +
+        'or exclude_fields (all target fields minus these). ' +
+        'Rejected if neither or both are given, if any field name does not exist in the target segment, ' +
+        'or if the resolved field set is empty. ' +
+        'Does not activate. Returns lock_handle for bw_activate.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          transformation_name: {
+            type: 'string',
+            description: 'Transformation name (UUID-like key).',
+          },
+          fields: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'Explicit complete set of target field names the END routine should write ' +
+              '(e.g. ["FIELD_A", "FIELD_B"]). Case-insensitive. ' +
+              'Mutually exclusive with exclude_fields.',
+          },
+          exclude_fields: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'Target fields to exclude from the END routine — all other target fields are written. ' +
+              'Case-insensitive. Mutually exclusive with fields.',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number (e.g. DEVK900123). Only required if the BW system requires transport assignment.',
+          },
+        },
+        required: ['transformation_name'],
+      },
+    },
+    {
       name: 'bw_set_transformation_runtime',
       description:
         'Switch a Transformation between HANA and ABAP runtime. ' +
@@ -707,7 +751,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'bw_activate',
       description:
-        'Activate one BW object (aDSO, Transformation, DTP, InfoObject, InfoSource, or DataSource). ' +
+        'Activate one BW object (aDSO, Transformation, DTP, InfoObject, InfoSource, DataSource, or CompositeProvider). ' +
         'Pass the lock_handle from bw_update_adso or bw_update_transformation. ' +
         'For DTP and DataSource (rsds) activation use lock_handle="" (no lock needed — standalone activation). ' +
         'For object_type "rsds" also pass source_system (a DataSource is identified by DataSource name plus source system). ' +
@@ -718,8 +762,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           object_type: {
             type: 'string',
-            enum: ['adso', 'trfn', 'dtpa', 'iobj', 'trcs', 'rsds'],
-            description: 'Object type: adso, trfn, dtpa, iobj, trcs, or rsds (DataSource).',
+            enum: ['adso', 'trfn', 'dtpa', 'iobj', 'trcs', 'rsds', 'hcpr'],
+            description: 'Object type: adso, trfn, dtpa, iobj, trcs, rsds (DataSource), or hcpr (CompositeProvider).',
           },
           object_name: {
             type: 'string',
@@ -1154,7 +1198,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           target_type: {
             type: 'string',
-            description: 'Target object type (e.g. "ADSO").',
+            description: 'Target object type (e.g. "ADSO"). Use "IOBJ" to load into an InfoObject\'s ' +
+              'attributes (encoded server-side as IOBJA). InfoObject text/hierarchy targets ' +
+              '(IOBJT/IOBJH) are not yet supported.',
           },
           description: {
             type: 'string',
@@ -1509,6 +1555,72 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['datasource_name', 'source_system'],
+      },
+    },
+    {
+      name: 'bw_list_remote_entities',
+      description:
+        'List the remote entities (HANA views / virtual tables) a source system exposes as a ' +
+        'DataSource basis — read-only discovery (the value help Eclipse shows on the DataSource ' +
+        'proposal page). Each entity\'s technical_name is exactly what binds into bw_create_datasource ' +
+        'as the HANA entity. Use this to find a valid hana_entity before creating a DataSource.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          source_system: {
+            type: 'string',
+            description: 'Logical source system name (e.g. "LSYS_NAME"). A HANA/SDA/SDI source system.',
+          },
+          search_pattern: {
+            type: 'string',
+            description: 'Wildcard pattern filtering on technicalName (default "*" for all).',
+          },
+          result_size: {
+            type: 'number',
+            description: 'Maximum number of rows to return (default 200). Check result_complete to see if truncated.',
+          },
+        },
+        required: ['source_system'],
+      },
+    },
+    {
+      name: 'bw_create_datasource',
+      description:
+        'Create a DataSource (RSDS) on top of a remote entity from the server\'s field proposal, ' +
+        'leaving it inactive. The server derives the complete field/segment structure from the ' +
+        'remote entity — no field, key, or partitioning editing is supported (v1). ' +
+        'Local objects only (Development-Class $TMP); no transport handling. ' +
+        'The HANA entity binds via the adapter externalObject attribute, not by name equality — ' +
+        'use bw_list_remote_entities to find a valid hana_entity. ' +
+        'After creation, activate separately with bw_activate (object_type "rsds", the same ' +
+        'source_system, lock_handle "").',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          datasource_name: {
+            type: 'string',
+            description: 'Technical name for the new DataSource (e.g. "DS_NAME").',
+          },
+          source_system: {
+            type: 'string',
+            description: 'Logical source system name (e.g. "LSYS_NAME"). A HANA/SDA/SDI source system.',
+          },
+          application_component: {
+            type: 'string',
+            description: 'Application component (APCO) to file the DataSource under (e.g. "APCO_NAME").',
+          },
+          hana_entity: {
+            type: 'string',
+            description: 'Remote entity technical name (technicalName from bw_list_remote_entities), bound as the ' +
+              'adapter externalObject. Defaults to datasource_name as a convenience; set independently when they differ. ' +
+              'Case-sensitive — passed to the source as-is.',
+          },
+          description: {
+            type: 'string',
+            description: 'DataSource description (default: the hana_entity value).',
+          },
+        },
+        required: ['datasource_name', 'source_system', 'application_component'],
       },
     },
     {
@@ -1903,6 +2015,398 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['object_name', 'object_type'],
       },
     },
+    {
+      name: 'bw_get_open_hub',
+      description:
+        'Read an Open Hub Destination (TLOGO DEST) definition — destination type, source, ' +
+        'DB table, InfoArea, package, status, the complete output field list with type/length, ' +
+        'InfoObject binding, conversion routine, compounding, and key flag, ' +
+        'plus file properties when the destination type is FILE.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          open_hub_name: {
+            type: 'string',
+            description: 'Technical name of the Open Hub Destination (e.g. "OBJECT_NAME").',
+          },
+        },
+        required: ['open_hub_name'],
+      },
+    },
+    {
+      name: 'bw_get_aggregation_level',
+      description:
+        'Read an Aggregation Level (TLOGO ALVL) definition — the planning-enabled view on top of ' +
+        'an InfoProvider (aDSO or CompositeProvider) used for Integrated Planning / embedded BPC. ' +
+        'Returns name, description, status, InfoArea, package, the underlying InfoProvider, ' +
+        'and the full element list split into characteristics and key figures. ' +
+        'Characteristics include type, length, conversion routine, base InfoObject, compounding, and dimension group. ' +
+        'Key figures additionally include aggregation behavior, semantics (AMO/QUA/NUM), ' +
+        'and the unit/currency reference (unit characteristic, fixed unit, or fixed currency).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          aggregation_level_name: {
+            type: 'string',
+            description: 'Technical name of the Aggregation Level (e.g. "OBJECT_NAME").',
+          },
+        },
+        required: ['aggregation_level_name'],
+      },
+    },
+    {
+      name: 'bw_get_planning_function',
+      description:
+        'Read a Planning Function (TLOGO PLSE) definition — a planning operation ' +
+        '(formula/FOX, copy, delete, repost, distribution, currency translation, custom exit, …) ' +
+        'tied to an aggregation level for Integrated Planning / embedded BPC. ' +
+        'Returns name, description, function type (planningServiceType), aggregation level, ' +
+        'documentation, status, InfoArea, package, the characteristic usage list ' +
+        '(role of each characteristic in the function), and the full parameter tree ' +
+        'with nested structure and values. For FORMULA functions the FOX code surfaces ' +
+        'as the value of the FLINE parameter.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          planning_function_name: {
+            type: 'string',
+            description: 'Technical name of the Planning Function (e.g. "OBJECT_NAME").',
+          },
+        },
+        required: ['planning_function_name'],
+      },
+    },
+    {
+      name: 'bw_get_planning_sequence',
+      description:
+        'Read a Planning Sequence (TLOGO PLSQ) definition — an ordered list of planning steps ' +
+        'for Integrated Planning / embedded BPC. Returns name, description, InfoArea, package, ' +
+        'status, and the ordered step list. Each step shows its type code, the aggregation level, ' +
+        'the planning function (planning service), and the filter name.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          planning_sequence_name: {
+            type: 'string',
+            description: 'Technical name of the Planning Sequence (e.g. "OBJECT_NAME").',
+          },
+        },
+        required: ['planning_sequence_name'],
+      },
+    },
+    {
+      name: 'bw_get_planning_properties',
+      description:
+        'Read the Planning Properties (TLOGO PLCR) of a plan-enabled InfoProvider (real-time aDSO or ' +
+        'CompositeProvider). Returns the provider name, underlying provider resource and media type, ' +
+        'InfoArea, package, status, and the general planning settings: key-date mode, maximum number ' +
+        'of characteristic combinations, and the save strategy (planning sequence and delta-read flag). ' +
+        'The PLCR shares its technical name with the InfoProvider it belongs to.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          plan_provider_name: {
+            type: 'string',
+            description: 'Technical name of the plan-enabled InfoProvider (e.g. "OBJECT_NAME"). ' +
+              'The PLCR object shares this name.',
+          },
+        },
+        required: ['plan_provider_name'],
+      },
+    },
+    {
+      name: 'bw_list_process_chain_runs',
+      description:
+        'List execution runs of one or all process chains from the process chain monitoring log. ' +
+        'Each row represents one chain run with overall status, runtime deviation, start/end timestamps, and duration. ' +
+        'Optionally filter by chain technical name, start date range, and status code. ' +
+        'Returns the log_id of each run — pass chain_id + log_id into bw_get_process_chain_run_detail for step-level details. ' +
+        'Ordered by start time descending. Default limit 20 runs.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chain_name: {
+            type: 'string',
+            description: 'Optional process chain technical name to restrict to runs of a single chain (e.g. "CHAIN_NAME"). Omit for system-wide results.',
+          },
+          date_from: {
+            type: 'string',
+            description: 'Optional lower bound for run start date (ISO format, e.g. "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM:SS"). Maps to startDate ge datetime filter.',
+          },
+          date_to: {
+            type: 'string',
+            description: 'Optional upper bound for run start date (ISO format). Maps to startDate le datetime filter.',
+          },
+          status: {
+            type: 'string',
+            description: 'Optional status code filter (e.g. as returned by the status field of previous runs). Resolves to eq filter on the status field.',
+          },
+          limit: {
+            type: 'number',
+            description: 'Maximum number of runs to return (default 20).',
+          },
+        },
+        required: [],
+      },
+    },
+    {
+      name: 'bw_get_process_chain_run_detail',
+      description:
+        'Read the execution detail of one process chain run — all process steps with type, variant, status, ' +
+        'timestamps, and parent/child relationships (predecessor graph edges), plus the full message log. ' +
+        'chain_id and log_id come from bw_list_process_chain_runs or bw_list_process_chain_last_status output. ' +
+        'Use this to diagnose a failed run: the message log contains the actual error messages.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chain_id: {
+            type: 'string',
+            description: 'Process chain technical name (e.g. "CHAIN_NAME").',
+          },
+          log_id: {
+            type: 'string',
+            description: 'Run log ID from bw_list_process_chain_runs or bw_list_process_chain_last_status (logId field).',
+          },
+        },
+        required: ['chain_id', 'log_id'],
+      },
+    },
+    {
+      name: 'bw_list_process_chain_last_status',
+      description:
+        'Read the latest execution status and scheduling state for every process chain in the system — ' +
+        'one row per chain. Includes last run status, runtime deviation, scheduling status, next scheduled start, ' +
+        'and the log_id of the most recent run (pass into bw_get_process_chain_run_detail to drill down). ' +
+        'Chains that have never run appear here too. ' +
+        'Optionally filter to chains whose last run has a specific status or whose last start date falls in a range.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          status: {
+            type: 'string',
+            description: 'Optional filter on last run status code. Returns only chains whose most recent run matches this status.',
+          },
+          last_start_from: {
+            type: 'string',
+            description: 'Optional lower bound for last run start date (ISO format, e.g. "YYYY-MM-DD"). Maps to lastStartDate ge datetime filter.',
+          },
+          last_start_to: {
+            type: 'string',
+            description: 'Optional upper bound for last run start date (ISO format). Maps to lastStartDate le datetime filter.',
+          },
+          limit: {
+            type: 'number',
+            description: 'Optional maximum number of chains to return. Omit to return all.',
+          },
+        },
+        required: [],
+      },
+    },
+    {
+      name: 'bw_create_process_chain',
+      description:
+        'Create a Process Chain (RSPC) via the BW/4HANA Cockpit REST API. ' +
+        'Builds the chain model from a list of steps and edges, creates it with a trigger-only skeleton, ' +
+        'then updates it with the full model in a single operation. Optionally activates after creation. ' +
+        'The TRIGGER (Start) node is implicit (node index 0) and must not be listed in steps. ' +
+        'DTP_LOAD and generic referenced steps use bIsReference=true; ADSOACT uses inline variants. ' +
+        'Collectors (AND, OR, XOR) require no extra fields beyond their type. ' +
+        'Edge status defaults: neutral for edges whose source is TRIGGER or a collector; positive for all others. ' +
+        'For two-step DTP loading always use bw_create_dtp first; this tool builds the process chain around existing DTPs. ' +
+        'Supported step types: DTP_LOAD (DTP load), ADSOACT (DSO data activation), CHAIN (start a local sub-chain, verified), and collectors AND / OR / XOR; the start trigger is implicit. ' +
+        'A generic referenced-step path (any process type string plus an object name, bIsReference=true) is available and verified for DTP_LOAD and CHAIN; for other types it may work but is untested. ' +
+        'Other inline-configuration process types (for example program execution, OS command, attribute change run) are not supported in this version. ' +
+        'Edges support on-success (positive) and unconditional (neutral) links; on-error (negative) links are accepted in the schema but not emitted by default.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: {
+            type: 'string',
+            description: 'Process chain technical name, uppercase, max 30 characters (e.g. "CHAIN_NAME").',
+          },
+          infoarea: {
+            type: 'string',
+            description: 'InfoArea to file the chain under (e.g. "AREA_NAME").',
+          },
+          description: {
+            type: 'string',
+            description: 'Short description / label for the process chain.',
+          },
+          steps: {
+            type: 'array',
+            description:
+              'Ordered list of steps. The TRIGGER (Start) node is implicit at index 0 — do not include it here. ' +
+              'Each step has a caller-chosen id used for edge wiring. ' +
+              'Step types: DTP_LOAD (requires dtp field), ADSOACT (requires datastores array), ' +
+              'CHAIN (requires object = sub-chain name), AND / OR / XOR (collector, no extra fields), or any other BW process type (requires object field).',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', description: 'Caller-chosen identifier used to reference this step in edges (e.g. "step1").' },
+                type: {
+                  type: 'string',
+                  description: 'Process type: "DTP_LOAD", "ADSOACT", "CHAIN", "AND", "OR", "XOR", or any BW process type string.',
+                },
+                dtp: { type: 'string', description: 'DTP technical name. Required when type is "DTP_LOAD" (e.g. "DTP_...").' },
+                description: { type: 'string', description: 'Step display description (used for DTP_LOAD, CHAIN, and generic referenced steps).' },
+                datastores: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: 'List of aDSO technical names to activate. Required when type is "ADSOACT".',
+                },
+                requestsSequential: {
+                  type: 'boolean',
+                  description: 'ADSOACT only. Activate requests sequentially (NOCONDENSE). Default false.',
+                },
+                errorOnNonActivation: {
+                  type: 'boolean',
+                  description: 'ADSOACT only. Error on non-activation of loaded requests (NOREQACTWARN). Default false.',
+                },
+                object: {
+                  type: 'string',
+                  description: 'Technical name of the referenced BW object. Required for CHAIN (sub-chain name) and other generic referenced step types (any type other than DTP_LOAD, ADSOACT, AND, OR, XOR).',
+                },
+              },
+              required: ['id', 'type'],
+            },
+          },
+          edges: {
+            type: 'array',
+            description:
+              'Directed edges connecting steps. Use the step id or the literal "TRIGGER" for the start node. ' +
+              'Status defaults: "neutral" when the source is "TRIGGER" or a collector (AND/OR/XOR); "positive" otherwise.',
+            items: {
+              type: 'object',
+              properties: {
+                from: { type: 'string', description: 'Source step id or "TRIGGER".' },
+                to: { type: 'string', description: 'Target step id or "TRIGGER".' },
+                status: {
+                  type: 'string',
+                  enum: ['neutral', 'positive', 'negative'],
+                  description: 'Edge condition. Omit to use the default (see above).',
+                },
+              },
+              required: ['from', 'to'],
+            },
+          },
+          activate: {
+            type: 'boolean',
+            description: 'If true, activate the chain immediately after creation. Default false.',
+          },
+        },
+        required: ['name', 'infoarea', 'description', 'steps', 'edges'],
+      },
+    },
+    {
+      name: 'bw_update_process_chain',
+      description:
+        'Replace the step model (nodes and edges) of an existing Process Chain (RSPC) via the BW/4HANA Cockpit REST API. ' +
+        'Reads the current chain to obtain the ETag and preserve the existing trigger node (with its scheduling configuration) ' +
+        'and the current header. Replaces only the steps and edges; the trigger is always preserved as-is. ' +
+        'Optionally overrides description and infoarea in the header. ' +
+        'Optionally activates after the update. ' +
+        'A 412 on the PUT means the ETag was stale (chain modified between read and write); the error reports this explicitly. ' +
+        'Use bw_create_process_chain to create a new chain; use this tool to update an existing one. ' +
+        'Supported step types: DTP_LOAD (DTP load), ADSOACT (DSO data activation), CHAIN (start a local sub-chain, verified), and collectors AND / OR / XOR; the start trigger is implicit. ' +
+        'A generic referenced-step path (any process type string plus an object name, bIsReference=true) is available and verified for DTP_LOAD and CHAIN; for other types it may work but is untested. ' +
+        'Other inline-configuration process types (for example program execution, OS command, attribute change run) are not supported in this version. ' +
+        'Edges support on-success (positive) and unconditional (neutral) links; on-error (negative) links are accepted in the schema but not emitted by default.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: {
+            type: 'string',
+            description: 'Process chain technical name (e.g. "CHAIN_NAME"). Case-insensitive.',
+          },
+          description: {
+            type: 'string',
+            description: 'Optional new description. If omitted, the existing chain description is kept.',
+          },
+          infoarea: {
+            type: 'string',
+            description: 'Optional new InfoArea. If omitted, the existing InfoArea is kept.',
+          },
+          steps: {
+            type: 'array',
+            description:
+              'Complete replacement step list. The TRIGGER (Start) node is implicit at index 0 — do not include it here. ' +
+              'Same shape as in bw_create_process_chain.',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', description: 'Caller-chosen identifier used to reference this step in edges.' },
+                type: {
+                  type: 'string',
+                  description: 'Process type: "DTP_LOAD", "ADSOACT", "CHAIN", "AND", "OR", "XOR", or any BW process type string.',
+                },
+                dtp: { type: 'string', description: 'DTP technical name. Required when type is "DTP_LOAD".' },
+                description: { type: 'string', description: 'Step display description (DTP_LOAD, CHAIN, and generic referenced steps).' },
+                datastores: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: 'aDSO technical names to activate. Required when type is "ADSOACT".',
+                },
+                requestsSequential: {
+                  type: 'boolean',
+                  description: 'ADSOACT only. Activate requests sequentially (NOCONDENSE). Default false.',
+                },
+                errorOnNonActivation: {
+                  type: 'boolean',
+                  description: 'ADSOACT only. Error on non-activation of loaded requests (NOREQACTWARN). Default false.',
+                },
+                object: {
+                  type: 'string',
+                  description: 'Technical name of the referenced BW object. Required for generic referenced step types.',
+                },
+              },
+              required: ['id', 'type'],
+            },
+          },
+          edges: {
+            type: 'array',
+            description:
+              'Complete replacement edge list. Use the step id or the literal "TRIGGER" for the start node. ' +
+              'Status defaults: "neutral" when the source is "TRIGGER" or a collector (AND/OR/XOR); "positive" otherwise.',
+            items: {
+              type: 'object',
+              properties: {
+                from: { type: 'string', description: 'Source step id or "TRIGGER".' },
+                to: { type: 'string', description: 'Target step id or "TRIGGER".' },
+                status: {
+                  type: 'string',
+                  enum: ['neutral', 'positive', 'negative'],
+                  description: 'Edge condition. Omit to use the default.',
+                },
+              },
+              required: ['from', 'to'],
+            },
+          },
+          activate: {
+            type: 'boolean',
+            description: 'If true, activate the chain immediately after the update. Default false.',
+          },
+        },
+        required: ['name', 'steps', 'edges'],
+      },
+    },
+    {
+      name: 'bw_activate_process_chain',
+      description:
+        'Activate an existing Process Chain (RSPC) via the BW/4HANA Cockpit REST API. ' +
+        'Use this after bw_create_process_chain (with activate=false) or to re-activate a modified chain. ' +
+        'Returns the top-level activation message, severity, and full log entries. ' +
+        'Surfaces any log entries with severity "error" in a dedicated errors field.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: {
+            type: 'string',
+            description: 'Process chain technical name (e.g. "CHAIN_NAME"). Case-insensitive.',
+          },
+        },
+        required: ['name'],
+      },
+    },
   ],
 }));
 
@@ -2133,6 +2637,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           client,
           args?.transformation_name as string,
           args?.routine_type as 'start' | 'end' | 'expert',
+          args?.transport as string | undefined
+        );
+        break;
+
+      case 'bw_set_transformation_routine_fields':
+        text = await bwSetTransformationRoutineFields(
+          client,
+          args?.transformation_name as string,
+          args?.fields as string[] | undefined,
+          args?.exclude_fields as string[] | undefined,
           args?.transport as string | undefined
         );
         break;
@@ -2377,6 +2891,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
         break;
 
+      case 'bw_list_remote_entities':
+        text = await bwListRemoteEntities(
+          client,
+          args?.source_system as string,
+          (args?.search_pattern as string | undefined) ?? '*',
+          (args?.result_size as number | undefined) ?? 200,
+        );
+        break;
+
+      case 'bw_create_datasource':
+        text = await bwCreateDatasource(
+          client,
+          args?.datasource_name as string,
+          args?.source_system as string,
+          args?.application_component as string,
+          args?.hana_entity as string | undefined,
+          args?.description as string | undefined,
+        );
+        break;
+
       case 'bw_get_composite_provider':
         text = await bwGetCompositeProvider(client, args?.composite_provider_name as string);
         break;
@@ -2491,6 +3025,117 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           (args?.levels as number) ?? -1,
           (args?.format as 'text' | 'raw') ?? 'text',
         );
+        break;
+
+      case 'bw_get_open_hub':
+        text = await bwGetOpenHub(client, args?.open_hub_name as string);
+        break;
+
+      case 'bw_get_aggregation_level':
+        text = await bwGetAggregationLevel(client, args?.aggregation_level_name as string);
+        break;
+
+      case 'bw_get_planning_function':
+        text = await bwGetPlanningFunction(client, args?.planning_function_name as string);
+        break;
+
+      case 'bw_get_planning_sequence':
+        text = await bwGetPlanningSequence(client, args?.planning_sequence_name as string);
+        break;
+
+      case 'bw_get_planning_properties':
+        text = await bwGetPlanningProperties(client, args?.plan_provider_name as string);
+        break;
+
+      case 'bw_list_process_chain_runs':
+        text = await bwListProcessChainRuns(
+          client,
+          args?.chain_name as string | undefined,
+          args?.date_from as string | undefined,
+          args?.date_to as string | undefined,
+          args?.status as string | undefined,
+          (args?.limit as number | undefined) ?? 20,
+        );
+        break;
+
+      case 'bw_get_process_chain_run_detail':
+        text = await bwGetProcessChainRunDetail(
+          client,
+          args?.chain_id as string,
+          args?.log_id as string,
+        );
+        break;
+
+      case 'bw_list_process_chain_last_status':
+        text = await bwListProcessChainLastStatus(
+          client,
+          args?.status as string | undefined,
+          args?.last_start_from as string | undefined,
+          args?.last_start_to as string | undefined,
+          args?.limit as number | undefined,
+        );
+        break;
+
+      case 'bw_create_process_chain': {
+        const rawSteps = (args?.steps as Array<Record<string, unknown>>) ?? [];
+        const steps = rawSteps.map((s) => {
+          const base: Record<string, unknown> = { id: s['id'], type: s['type'] };
+          if (s['dtp'] !== undefined) base['dtp'] = s['dtp'];
+          if (s['description'] !== undefined) base['description'] = s['description'];
+          if (s['datastores'] !== undefined) base['datastores'] = s['datastores'];
+          if (s['requestsSequential'] !== undefined) base['requestsSequential'] = s['requestsSequential'];
+          if (s['errorOnNonActivation'] !== undefined) base['errorOnNonActivation'] = s['errorOnNonActivation'];
+          if (s['object'] !== undefined) base['object'] = s['object'];
+          return base;
+        });
+        const rawEdges = (args?.edges as Array<Record<string, unknown>>) ?? [];
+        const edges = rawEdges.map((e) => ({
+          from: e['from'] as string,
+          to: e['to'] as string,
+          status: e['status'] as 'neutral' | 'positive' | 'negative' | undefined,
+        }));
+        text = await bwCreateProcessChain(client, {
+          name: args?.name as string,
+          infoarea: args?.infoarea as string,
+          description: args?.description as string,
+          steps: steps as unknown as CreateProcessChainParams['steps'],
+          edges,
+          activate: (args?.activate as boolean) ?? false,
+        });
+        break;
+      }
+
+      case 'bw_update_process_chain': {
+        const rawSteps2 = (args?.steps as Array<Record<string, unknown>>) ?? [];
+        const steps2 = rawSteps2.map((s) => {
+          const base: Record<string, unknown> = { id: s['id'], type: s['type'] };
+          if (s['dtp'] !== undefined) base['dtp'] = s['dtp'];
+          if (s['description'] !== undefined) base['description'] = s['description'];
+          if (s['datastores'] !== undefined) base['datastores'] = s['datastores'];
+          if (s['requestsSequential'] !== undefined) base['requestsSequential'] = s['requestsSequential'];
+          if (s['errorOnNonActivation'] !== undefined) base['errorOnNonActivation'] = s['errorOnNonActivation'];
+          if (s['object'] !== undefined) base['object'] = s['object'];
+          return base;
+        });
+        const rawEdges2 = (args?.edges as Array<Record<string, unknown>>) ?? [];
+        const edges2 = rawEdges2.map((e) => ({
+          from: e['from'] as string,
+          to: e['to'] as string,
+          status: e['status'] as 'neutral' | 'positive' | 'negative' | undefined,
+        }));
+        text = await bwUpdateProcessChain(client, {
+          name: args?.name as string,
+          description: args?.description as string | undefined,
+          infoarea: args?.infoarea as string | undefined,
+          steps: steps2 as unknown as UpdateProcessChainParams['steps'],
+          edges: edges2,
+          activate: (args?.activate as boolean) ?? false,
+        });
+        break;
+      }
+
+      case 'bw_activate_process_chain':
+        text = await bwActivateProcessChain(client, args?.name as string);
         break;
 
       default:

@@ -16,7 +16,39 @@ Read the blog (DE + EN): https://www.nextlytics.com/blog/agentic-ai-meets-sap-bw
 
 ---
 
-## 🆕 What's New — v0.8.0
+## 🆕 What's New — v0.9.0
+
+**Integrated Planning — complete read-only coverage**
+
+All four core object types of BW Integrated Planning (IP / embedded BPC) are now readable:
+
+- `bw_get_aggregation_level` — reads an Aggregation Level (ALVL): the planning-enabled view on top of an InfoProvider, with the complete element list — characteristics including compounding, key figures including aggregation behavior, semantics, and unit/currency reference
+- `bw_get_planning_function` — reads a Planning Function (PLSE): function type, aggregation level, characteristic usage roles, and the full parameter tree; for FORMULA functions the FOX code is surfaced directly as a parameter value
+- `bw_get_planning_sequence` — reads a Planning Sequence (PLSQ): ordered step list with aggregation level, planning function, and filter name per step
+- `bw_get_planning_properties` — reads the Planning Properties (PLCR) of a plan-enabled InfoProvider: key-date mode, maximum characteristic combinations, and save strategy
+
+**Process chain authoring and monitoring**
+
+Building on the existing `bw_get_process_chain` (structural read), three authoring and three monitoring tools are now available:
+
+- `bw_create_process_chain` / `bw_update_process_chain` / `bw_activate_process_chain` — create, replace the step model of, and activate a Process Chain (RSPC); supported step types: `DTP_LOAD`, `ADSOACT`, `CHAIN` (local sub-chain start, verified), and collectors `AND` / `OR` / `XOR`; inline-configured process types (ABAP programs, OS commands, attribute change runs, etc.) are not yet supported
+- `bw_list_process_chain_runs` — execution history of one or all chains: status, timestamps, duration, and log ID
+- `bw_get_process_chain_run_detail` — step-level and message-level detail of a single run, including error messages
+- `bw_list_process_chain_last_status` — last execution status and scheduling state for every chain in the system
+
+**Further new tools**
+
+- `bw_get_open_hub` — reads an Open Hub Destination (DEST): destination type, source object, DB table, InfoArea, and the complete output field list with types, InfoObject binding, conversion routine, and key flag
+- `bw_list_remote_entities` / `bw_create_datasource` — discover HANA views and virtual tables exposed by a source system, then create a DataSource from the server's field proposal; activation is a separate step via `bw_activate`
+- `bw_set_transformation_routine_fields` — sets the target fields an END routine writes; accepts an explicit field list or an exclusion list
+
+**Improvements**
+
+`bw_activate` now supports `hcpr` (CompositeProvider); `bw_create_dtp` accepts InfoObject attribute targets (`IOBJ`, mapped to `IOBJA`); `bw_update_transformation` supports field-based direct mappings for targets without an underlying InfoObject.
+
+---
+
+## What's New — v0.8.0
 
 **Runtime tools & request monitoring** — the first tools driven by the BW/4HANA `/sap/bc/.../bw4` manage API (the same operations you'd otherwise perform in the BW/4HANA Cockpit), not the `/sap/bw/modeling` tool API:
 
@@ -118,11 +150,12 @@ CompositeProvider read support and BW repository navigation:
 
 ### Transformation
 - Read Transformation structure (all sources, all targets)
-- Map source fields to target InfoObjects (StepDirect)
+- Map source fields to target InfoObjects or plain fields (StepDirect)
 - Set formula rules (StepFormula)
 - Set field routines — ABAP and AMDP (StepRoutine)
 - Set start routines — ABAP and AMDP
 - Set end routines — ABAP and AMDP
+- Set END routine target fields (explicit field list or exclusion list)
 - Switch runtime between ABAP and AMDP
 
 ### DTP (Data Transfer Process)
@@ -165,11 +198,13 @@ CompositeProvider read support and BW repository navigation:
 ### Data Flow Navigation
 - Traverse the complete structural data flow graph of any BW object — all connected sources and targets resolved recursively through Transformations, DTPs, InfoSources, aDSOs, DataSources, CompositeProviders, and InfoObjects; mirrors the Eclipse BWMT Transient Data Flow view
 
-### DataSource Navigation
+### DataSource Navigation & Authoring
 - List all source systems connected to the BW system (ODP_SAP, ODP_CDS, ODP_BW, ODP, FILE, HANA_SDA, HANA_LOCAL)
 - Recursively list all DataSources in a source system with full APCO hierarchy path
 - Read full source system metadata including connection details (ODP context/destination, HANA remote source and schema)
 - Read complete DataSource structure: fields with types, lengths, transfer flags, adapter configuration
+- Discover remote entities (HANA views / virtual tables) exposed by a source system
+- Create a DataSource from a remote entity using the server's field proposal (inactive; activate separately)
 
 ### BW Role Management
 - Read the full role hierarchy (ROLE + FOLDER structure)
@@ -183,17 +218,31 @@ CompositeProvider read support and BW repository navigation:
 - Get JSON push schema for a write-interface aDSO
 - Push JSON record arrays directly into an aDSO
 
-### Process Chain Navigation
+### Process Chain Navigation, Authoring & Monitoring
 - Read complete Process Chain definitions — all steps with type, variant, description, and last execution status
 - Conditional flow semantics fully resolved: DECISION branch labels (including ABAP formula expressions), OR/AND join nodes, positive/negative/neutral edge conditions
 - Automatic variant detail per step: ABAP program and selection variant, TRIGGER scheduling parameters, ADSOACT/ADSOREM aDSO targets and cleanup settings, PLSWITCHL/P target aDSO, DECISION branching formulas — all embedded inline in a single tool call
 - Recursive sub-chain expansion: CHAIN-type steps reference other Process Chains — call `bw_get_process_chain` again on any referenced chain name to expand the full hierarchy
 - Generic process variant reader: covers all 93 BW/4HANA process types including custom Z-types; unknown types return oDetail as raw JSON
+- Create a Process Chain from a step and edge list — supported types: `DTP_LOAD`, `ADSOACT`, `CHAIN`, collectors `AND` / `OR` / `XOR`
+- Replace the step model of an existing chain; activate a chain
+- Monitor execution runs: history with status and timestamps, step-level and message-level run detail, last status per chain across the entire system
 
 ### DataSource Data Preview
 - Fetch a live data preview from any DataSource (RSDS) directly from the source system
 - Field names resolved automatically from the DataSource structure; configurable record count (default 20)
 - Rendered as a padded plain-text table with column alignment
+
+### Open Hub Destination (Read)
+- Read an Open Hub Destination (DEST): destination type, source object, DB table, InfoArea, package, and status
+- Complete output field list with types, InfoObject binding, conversion routine, compounding, and key flag
+- File properties for FILE-type destinations
+
+### Integrated Planning (Read)
+- Read Aggregation Levels (ALVL) — the planning-enabled view on top of an InfoProvider; characteristics and key figures with full type and semantic detail
+- Read Planning Functions (PLSE) — function type, characteristic usage roles, and parameter tree; FOX code surfaced for FORMULA functions
+- Read Planning Sequences (PLSQ) — ordered step list with aggregation level, planning function, and filter references
+- Read Planning Properties (PLCR) — key-date mode, maximum characteristic combinations, and save strategy for plan-enabled InfoProviders
 
 ### Request Monitor & Runtime
 - List load requests for a target InfoProvider — status, last process status/action, record count, timestamp, user, TSN
@@ -203,7 +252,7 @@ CompositeProvider read support and BW repository navigation:
 
 ### General
 - Search & Where-Used (xref)
-- Activate BW objects (aDSO, InfoObject, Transformation, DTP, DataSource)
+- Activate BW objects (aDSO, InfoObject, Transformation, DTP, DataSource, CompositeProvider)
 - Release locks without activating (discard changes)
 - Delete BW objects
 - Transport request assignment

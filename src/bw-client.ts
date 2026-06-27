@@ -16,6 +16,13 @@ export const MEDIA_TYPES: Record<string, string> = {
   area: 'application/vnd.sap.bw.modeling.area-v1_1_0+xml',
   trcs: 'application/vnd.sap.bw.modeling.trcs-v1_0_0+xml',
   rsds: 'application/vnd.sap.bw.modeling.rsds-v1_1_0+xml',
+  hcpr: 'application/vnd.sap.bw.modeling.hcpr-v1_15_0+xml',
+  dest: 'application/vnd.sap.bw.modeling.dest-v1_0_0+xml',
+  alvl: 'application/vnd.sap.bw.modeling.alvl-v1_0_0+xml',
+  plcr: 'application/vnd.sap.bw.modeling.plcr-v1_0_0+xml',
+  plsq: 'application/vnd.sap.bw.modeling.plsq-v1_0_0+xml',
+  plse: 'application/vnd.sap.bw.modeling.plse-v2_0_0+xml',
+  valuehelp: 'application/vnd.sap-bw-modeling.valuehelp2-v1_1_0+xml',
 };
 
 // DTPs do not need an unlock request after activation

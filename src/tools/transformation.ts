@@ -421,6 +421,33 @@ function extractTargetElemProps(
 }
 
 /**
+ * Inspect the target-segment element for a field/InfoObject mapping target.
+ * Distinguishes field-based targets (plain InfoSource/aDSO field, no underlying
+ * InfoObject) from InfoObject-based targets: only the latter carry an
+ * `infoObjectName` attribute. Returns the full `<element>...</element>` block
+ * verbatim so callers can clone it into a new rule without an iobj read.
+ */
+function extractTargetFieldProps(
+  xml: string,
+  fieldName: string
+): { isFieldBased: boolean; elementXml: string } {
+  const tgtSegMatch = xml.match(/<target\b[^>]*>[\s\S]*?<segment[^>]*>([\s\S]*?)<\/segment>/);
+  if (!tgtSegMatch) return { isFieldBased: true, elementXml: '' };
+
+  const segContent = tgtSegMatch[1];
+  const elemRegex = new RegExp(
+    `<element\\b([^>]*name="${fieldName.toUpperCase()}"[^>]*)>([\\s\\S]*?)<\\/element>`
+  );
+  const elemMatch = segContent.match(elemRegex);
+  if (!elemMatch) return { isFieldBased: true, elementXml: '' };
+
+  return {
+    isFieldBased: !/\binfoObjectName="/.test(elemMatch[1]),
+    elementXml: elemMatch[0],
+  };
+}
+
+/**
  * Find the rule that targets the given InfoObject with a StepNoUpdate step,
  * and return its id, its group id, and the full original rule XML to replace.
  */
@@ -840,6 +867,53 @@ function buildStepDirectRule(params: {
 }
 
 /**
+ * Build a StepDirect rule XML for a field-based target element (no underlying
+ * InfoObject — see payloads/trfn_direct_field_mapping.md). Clones the source
+ * and target `<element>` blocks verbatim from their respective segments, so
+ * no infoObjectName/dimension/atom:link is introduced and associationValid
+ * stays false. Emits the server-normalized form (step id 1) used by
+ * pre-existing direct rules, rather than the editor's id="2" draft form.
+ */
+function buildStepDirectFieldRule(params: {
+  groupId: string;
+  ruleId: string;
+  sourceField: string;
+  sourceElementXml: string;
+  targetField: string;
+  targetElementXml: string;
+}): string {
+  const { groupId, ruleId, sourceField, sourceElementXml, targetField, targetElementXml } = params;
+  const src = sourceField.toUpperCase();
+  const tgt = targetField.toUpperCase();
+  const g = groupId;
+  const rv = ruleId;
+
+  const inputElem = sourceElementXml.replace(/^<element\b/, '<element xsi:type="trfn:TransformationElement"');
+  const outputElem = targetElementXml.replace(/^<element\b/, '<element xsi:type="trfn:TransformationElement"');
+
+  return `<rule id="${rv}" description="">
+      <source id="1">
+        <input>#///group${g}/rule${rv}/step1/input1</input>
+        <elementRef>#///source/segment1/${src}</elementRef>
+      </source>
+      <target id="1">
+        <output>#///group${g}/rule${rv}/step1/output1</output>
+        <elementRef>#///target/segment1/${tgt}</elementRef>
+      </target>
+      <step xsi:type="trfn:StepDirect" id="1" rank="MAIN" type="DIRECT">
+        <input id="1">
+          <output>#///group${g}/rule${rv}/source1</output>
+          ${inputElem}
+        </input>
+        <output id="1">
+          <input>#///group${g}/rule${rv}/target1</input>
+          ${outputElem}
+        </output>
+      </step>
+    </rule>`;
+}
+
+/**
  * Convert any existing rule back to StepNoUpdate (no mapping).
  * Preserves the target reference and step output element from the existing rule.
  */
@@ -1210,18 +1284,18 @@ export async function bwUpdateTransformation(
 
   // ── Direct path (default) ────────────────────────────────────────────────
 
-  // Read InfoObject to get label and type info
-  const iObjPath = `/sap/bw/modeling/iobj/${targetInfoObject.toLowerCase()}/m`;
-  const iObjResult = await client.get(iObjPath, MEDIA_TYPES['iobj']);
-  const iObjProps = parseInfoObjectProps(iObjResult.body);
+  // Determine the target kind first (field-based vs InfoObject-based) — see
+  // payloads/trfn_direct_field_mapping.md. Only InfoObject-based targets need
+  // the iobj read; a field-based target has no /iobj/ resource to read.
+  const tgtFieldProps = extractTargetFieldProps(originalXml, tgtUpper);
 
-  // Find any existing rule for the target InfoObject
+  // Find any existing rule for the target
   const ruleInfo = findRuleForTarget(originalXml, tgtUpper);
   if (!ruleInfo) {
     return JSON.stringify({
       success: false,
       message:
-        `No rule found for target InfoObject ${tgtUpper} in ` +
+        `No rule found for target ${tgtUpper} in ` +
         `transformation ${transformationName.toUpperCase()}.`,
     });
   }
@@ -1242,20 +1316,37 @@ export async function bwUpdateTransformation(
   }
 
   const srcProps = extractSourceFieldProps(originalXml, srcUpper);
-  const tgtProps = extractTargetElemProps(originalXml, tgtUpper);
 
-  const newRule = buildStepDirectRule({
-    groupId: ruleInfo.groupId,
-    ruleId: ruleInfo.ruleId,
-    sourceField: srcUpper,
-    targetIObj: tgtUpper,
-    srcType: srcProps.dataType,
-    srcLength: srcProps.length,
-    tgtConvRoutine: tgtProps.convRoutine || iObjProps.conversionRoutine,
-    tgtType: tgtProps.dataType,
-    tgtLength: tgtProps.length,
-    tgtLabel: iObjProps.label,
-  });
+  let newRule: string;
+  if (tgtFieldProps.isFieldBased) {
+    newRule = buildStepDirectFieldRule({
+      groupId: ruleInfo.groupId,
+      ruleId: ruleInfo.ruleId,
+      sourceField: srcUpper,
+      sourceElementXml: srcProps.elementXml,
+      targetField: tgtUpper,
+      targetElementXml: tgtFieldProps.elementXml,
+    });
+  } else {
+    // Read InfoObject to get label and type info
+    const iObjPath = `/sap/bw/modeling/iobj/${targetInfoObject.toLowerCase()}/m`;
+    const iObjResult = await client.get(iObjPath, MEDIA_TYPES['iobj']);
+    const iObjProps = parseInfoObjectProps(iObjResult.body);
+    const tgtProps = extractTargetElemProps(originalXml, tgtUpper);
+
+    newRule = buildStepDirectRule({
+      groupId: ruleInfo.groupId,
+      ruleId: ruleInfo.ruleId,
+      sourceField: srcUpper,
+      targetIObj: tgtUpper,
+      srcType: srcProps.dataType,
+      srcLength: srcProps.length,
+      tgtConvRoutine: tgtProps.convRoutine || iObjProps.conversionRoutine,
+      tgtType: tgtProps.dataType,
+      tgtLength: tgtProps.length,
+      tgtLabel: iObjProps.label,
+    });
+  }
 
   updatedXml = originalXml.replace(ruleInfo.oldRuleXml, newRule);
   if (updatedXml === originalXml) {
@@ -1273,7 +1364,7 @@ export async function bwUpdateTransformation(
   return JSON.stringify({
     success: true,
     message:
-      `Source field ${srcUpper} mapped to InfoObject ${tgtUpper} in ` +
+      `Source field ${srcUpper} mapped to target ${tgtUpper} in ` +
       `transformation ${transformationName.toUpperCase()}. Call bw_activate to activate.`,
     lock_handle: lockHandle,
     transformation_name: transformationName.toUpperCase(),
@@ -1510,6 +1601,150 @@ export async function bwSetTransformationRoutine(
     routine_type: routineTypeUpper,
     class_name: classNameM,
     method_name: methodName,
+    lock_handle: lockHandle,
+    transformation_name: trfnUpper,
+    object_type: 'trfn',
+  });
+}
+
+// ── bwSetTransformationRoutineFields ─────────────────────────────────────────
+
+/**
+ * bwSetTransformationRoutineFields — edit the target fields the global END
+ * routine writes ("Felder setzen" in SAP GUI).
+ *
+ * Precondition: the transformation must already have an END routine
+ * (group id="0" with routinetype="END"). If not, return an error pointing to
+ * bwSetTransformationRoutine.
+ *
+ * Flow:
+ * 1. GET XML + timestamp header.
+ * 2. Locate the END rule by regex (captures opening tag / target block / step / closing tag).
+ * 3. Read all target fields from <target><segment> in document order.
+ * 4. Resolve selected set from fields or exclude_fields; validate names and non-empty result.
+ * 5. Rebuild <target> block (sequential id from 1, original segment casing).
+ * 6. Replace only the target block; keep opening tag, <step/>, and </rule>.
+ * 7. Lock with caller's client, PUT with a separate createClientFromEnv() client.
+ *    Do NOT activate. Return lock_handle.
+ */
+export async function bwSetTransformationRoutineFields(
+  client: BwClient,
+  transformationName: string,
+  fields?: string[],
+  excludeFields?: string[],
+  transport?: string
+): Promise<string> {
+  if (!fields && !excludeFields) {
+    return JSON.stringify({
+      success: false,
+      message: 'Provide exactly one of "fields" or "exclude_fields".',
+    });
+  }
+  if (fields && excludeFields) {
+    return JSON.stringify({
+      success: false,
+      message: 'Provide exactly one of "fields" or "exclude_fields", not both.',
+    });
+  }
+
+  const trfnLower = transformationName.toLowerCase();
+  const trfnUpper = transformationName.toUpperCase();
+
+  const { body: xml, headers } = await client.get(
+    `/sap/bw/modeling/trfn/${trfnLower}/m`,
+    TRFN_ACCEPT
+  );
+  const timestamp = headers['timestamp'] ?? '';
+
+  // Capture: (1) opening rule tag, (2) old target block, (3) self-closing step, (4) whitespace + </rule>
+  const endRuleRegex = /(<rule\b[^>]*\broutinetype="END"[^>]*>)([\s\S]*?)(<step\b[\s\S]*?\/>)(\s*<\/rule>)/;
+  const endRuleMatch = xml.match(endRuleRegex);
+  if (!endRuleMatch) {
+    return JSON.stringify({
+      success: false,
+      message:
+        `Transformation ${trfnUpper} has no END routine. ` +
+        `Use bw_set_transformation_routine to create one first.`,
+    });
+  }
+
+  // Read all target fields from the segment in document order
+  const tgtSegMatch = xml.match(/<target\b[^>]*>[\s\S]*?<segment[^>]*>([\s\S]*?)<\/segment>/);
+  if (!tgtSegMatch) {
+    throw new Error(`Could not extract target segment from transformation ${trfnUpper}.`);
+  }
+  const allTargetFields: string[] = [];
+  const elemRegex = /<element\b[^>]*\bname="([^"]+)"[^>]*/g;
+  let em: RegExpExecArray | null;
+  while ((em = elemRegex.exec(tgtSegMatch[1])) !== null) {
+    allTargetFields.push(em[1]);
+  }
+
+  // Case-insensitive lookup map to original casing
+  const fieldByLower = new Map<string, string>();
+  for (const f of allTargetFields) {
+    fieldByLower.set(f.toLowerCase(), f);
+  }
+
+  let selectedFields: string[];
+  if (fields) {
+    const unknown = fields.filter(f => !fieldByLower.has(f.toLowerCase()));
+    if (unknown.length > 0) {
+      return JSON.stringify({
+        success: false,
+        message: `Unknown target fields: ${unknown.join(', ')}. Must be fields in the target segment.`,
+      });
+    }
+    selectedFields = fields.map(f => fieldByLower.get(f.toLowerCase())!);
+  } else {
+    const excludeSet = new Set((excludeFields ?? []).map(f => f.toLowerCase()));
+    const unknown = (excludeFields ?? []).filter(f => !fieldByLower.has(f.toLowerCase()));
+    if (unknown.length > 0) {
+      return JSON.stringify({
+        success: false,
+        message: `Unknown exclude_fields: ${unknown.join(', ')}. Must be fields in the target segment.`,
+      });
+    }
+    selectedFields = allTargetFields.filter(f => !excludeSet.has(f.toLowerCase()));
+  }
+
+  if (selectedFields.length === 0) {
+    return JSON.stringify({
+      success: false,
+      message: 'The resolved field set is empty. The END routine must write at least one field.',
+    });
+  }
+
+  // Rebuild <target> block with sequential id from 1, using original segment casing in elementRef
+  const newTargetBlock = selectedFields
+    .map((f, i) => `<target id="${i + 1}"><elementRef>#///target/segment1/${f}</elementRef></target>`)
+    .join('');
+
+  const newEndRule = endRuleMatch[1] + newTargetBlock + endRuleMatch[3] + endRuleMatch[4];
+  const updatedXml = xml.replace(endRuleMatch[0], newEndRule);
+  if (updatedXml === xml) {
+    throw new Error('XML unchanged after target-field replacement — replacement failed.');
+  }
+
+  // Lock with caller's client, PUT with a separate client (session isolation)
+  const lockHandle = await client.lock('trfn', trfnLower);
+  const putClient = createClientFromEnv();
+  try {
+    await putClient.put('trfn', trfnLower, lockHandle, updatedXml, timestamp, transport);
+  } catch (err) {
+    await client.unlock('trfn', trfnLower).catch(() => {/* ignore */});
+    throw err;
+  }
+
+  return JSON.stringify({
+    success: true,
+    message:
+      `END routine field list updated for transformation ${trfnUpper}. ` +
+      `${selectedFields.length} of ${allTargetFields.length} target fields selected. ` +
+      `Call bw_activate to activate.`,
+    selected_fields: selectedFields,
+    selected_count: selectedFields.length,
+    total_target_fields: allTargetFields.length,
     lock_handle: lockHandle,
     transformation_name: trfnUpper,
     object_type: 'trfn',
