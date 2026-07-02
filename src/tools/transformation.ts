@@ -13,6 +13,10 @@ export interface CreateTransformationArgs {
   package?: string;
   source_system?: string;
   copy_from_transformation?: string;
+  // InfoObject sub-type (TEXT / ATTR / HIER) — only relevant when the corresponding
+  // object type is IOBJ. Selects the InfoObject facet (text table, attributes, hierarchy).
+  source_object_subtype?: string;
+  target_object_subtype?: string;
 }
 
 /**
@@ -46,6 +50,8 @@ export async function bwCreateTransformation(
     `/sap/bw/modeling/trfn/8transient?GetIdOnly=true` +
     `&sourceobjecttype=${srcType}` +
     `&targetobjecttype=${tgtType}` +
+    (args.source_object_subtype ? `&sourceobjectsubtype=${args.source_object_subtype.toUpperCase()}` : '') +
+    (args.target_object_subtype ? `&targetobjectsubtype=${args.target_object_subtype.toUpperCase()}` : '') +
     `&sourceobjectname=${srcNameForUrl}` +
     `&targetobjectname=${tgtName}`;
 
@@ -103,8 +109,8 @@ export async function bwCreateTransformation(
     <objectStatus>inactive</objectStatus>
     <contentState>NEW</contentState>
   </tlogoProperties>
-  <source description="" id="0" name="${srcType === 'RSDS' ? srcName.padEnd(30) + (args.source_system ?? '').toUpperCase().padEnd(10) : srcName}" type="${srcType}"/>
-  <target description="" id="0" name="${tgtName}" type="${tgtType}"/>
+  <source description="" id="0" name="${srcType === 'RSDS' ? srcName.padEnd(30) + (args.source_system ?? '').toUpperCase().padEnd(10) : srcName}"${args.source_object_subtype ? ` subType="${args.source_object_subtype.toUpperCase()}"` : ''} type="${srcType}"/>
+  <target description="" id="0" name="${tgtName}"${args.target_object_subtype ? ` subType="${args.target_object_subtype.toUpperCase()}"` : ''} type="${tgtType}"/>
 </trfn:transformation>`;
 
   const copyParams = args.copy_from_transformation

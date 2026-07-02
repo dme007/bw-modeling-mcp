@@ -150,6 +150,7 @@ CompositeProvider read support and BW repository navigation:
 
 ### Transformation
 - Read Transformation structure (all sources, all targets)
+- Create a Transformation — including InfoObject (IOBJ) sources/targets with an explicit sub-type (text table, attributes/master data, hierarchy)
 - Map source fields to target InfoObjects or plain fields (StepDirect)
 - Set formula rules (StepFormula)
 - Set field routines — ABAP and AMDP (StepRoutine)
@@ -256,6 +257,7 @@ CompositeProvider read support and BW repository navigation:
 - Release locks without activating (discard changes)
 - Delete BW objects
 - Transport request assignment
+- Reassign an object to a different package (Development Class) on a transport request
 
 ---
 
@@ -409,6 +411,9 @@ Create a new InfoArea. Immediately active after creation, no activation step nee
 ### `bw_move_object`
 Move any BW object (aDSO, InfoObject, InfoArea, etc.) to a different InfoArea.
 
+### `bw_change_package`
+Reassign an existing BW object to a different package (Development Class) and record the change on a transport request via the CTO write endpoint. A single write, no activation — afterwards the object is inactive and must be re-activated with `bw_activate` (passing the same transport). For DataSources (`object_type="RSDS"`) `source_system` is mandatory (compound key) and the applied package is verified by re-reading the DataSource. Verified for `TRFN` and `RSDS`; other TLOGO types use the same mechanism but are not trace-verified.
+
 ### `bw_get_infosource`
 Read an InfoSource (TRCS) structure — fields, key fields, label, InfoArea, version status.
 
@@ -422,7 +427,7 @@ Update an existing InfoSource — fields and description.
 Read a Transformation structure including all field mapping rules, routines, source, and target. Transformation names are UUID-like keys — use `bw_xref` on the target aDSO to find them.
 
 ### `bw_create_transformation`
-Create a new Transformation. Supports all source types (aDSO, InfoSource, DataSource/RSDS) and all target types (aDSO). Can copy structure from an existing Transformation.
+Create a new Transformation. Supports all source types (aDSO, InfoSource, DataSource/RSDS) and all target types (aDSO). For InfoObject (`IOBJ`) sources or targets, set `source_object_subtype` / `target_object_subtype` to select the facet — `TEXT` (text table), `ATTR` (attributes / master data), or `HIER` (hierarchy). Can copy structure from an existing Transformation.
 
 ### `bw_update_transformation`
 Modify field mappings in an existing Transformation:

@@ -17,6 +17,7 @@ import { bwGetDtps, bwGetDtp, bwCreateDtp, bwRunDtp, bwUpdateDtp, bwSetDtpFilter
 import { bwSearch, bwXref } from './tools/search.js';
 import { bwDelete } from './tools/delete.js';
 import { bwCreateInfoArea, bwMoveObject, bwGetInfoarea } from './tools/infoarea.js';
+import { bwChangePackage } from './tools/cto.js';
 import { bwCreateInfosource, bwUpdateInfosource, bwGetInfosource, InfosourceField } from './tools/infosource.js';
 import { bwPushData, bwGetPushSchema } from './tools/push.js';
 import { bwGetQuery } from './tools/query.js';
@@ -435,6 +436,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             description: 'Technical name of an existing Transformation to copy rules from.',
           },
+          source_object_subtype: {
+            type: 'string',
+            description: 'InfoObject sub-type of the source. Only applies when source_object_type is IOBJ. Valid values: TEXT (text table), ATTR (attributes / master data), HIER (hierarchy).',
+          },
+          target_object_subtype: {
+            type: 'string',
+            description: 'InfoObject sub-type of the target. Only applies when target_object_type is IOBJ. Valid values: TEXT (text table), ATTR (attributes / master data), HIER (hierarchy).',
+          },
         },
         required: ['source_object_type', 'source_object_name', 'target_object_type', 'target_object_name'],
       },
@@ -461,6 +470,40 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['object_type', 'object_name', 'target_info_area'],
+      },
+    },
+    {
+      name: 'bw_change_package',
+      description:
+        'Assign an existing BW object to a different package (Development Class) and record the change on a transport request. ' +
+        'Single write, no activation. Afterwards the object is inactive and must be re-activated with bw_activate (pass the same transport). ' +
+        'For object_type "RSDS" (DataSource) source_system is mandatory — the key is compound and the package change is verified by re-reading the DataSource. ' +
+        'Verified for TRFN and RSDS; other TLOGO types use the same mechanism but are not trace-verified.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          object_name: {
+            type: 'string',
+            description: 'Technical name of the object to reassign (e.g. "OBJECT_NAME").',
+          },
+          object_type: {
+            type: 'string',
+            description: 'BW object type / TLOGO, e.g. "TRFN", "ADSO", "IOBJ", "TRCS", "RSDS", "HCPR".',
+          },
+          package: {
+            type: 'string',
+            description: 'Target package / Development Class (e.g. "Z_PACKAGE").',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number (e.g. DEVK900123). Required on systems with transport obligation.',
+          },
+          source_system: {
+            type: 'string',
+            description: 'Source system — required only for object_type "RSDS" (a DataSource is identified by DataSource name plus source system).',
+          },
+        },
+        required: ['object_name', 'object_type', 'package'],
       },
     },
     {
@@ -2565,6 +2608,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           package: args?.package as string | undefined,
           source_system: args?.source_system as string | undefined,
           copy_from_transformation: args?.copy_from_transformation as string | undefined,
+          source_object_subtype: args?.source_object_subtype as string | undefined,
+          target_object_subtype: args?.target_object_subtype as string | undefined,
         });
         break;
 
@@ -2573,6 +2618,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           objectType: args?.object_type as string,
           objectName: args?.object_name as string,
           targetInfoArea: args?.target_info_area as string,
+        });
+        break;
+
+      case 'bw_change_package':
+        text = await bwChangePackage(client, {
+          objectName: args?.object_name as string,
+          objectType: args?.object_type as string,
+          package: args?.package as string,
+          transport: args?.transport as string | undefined,
+          sourceSystem: args?.source_system as string | undefined,
         });
         break;
 

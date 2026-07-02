@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.9.2] — 2026-07-02
+
+### Added
+
+- `bw_change_package` — reassigns an existing BW object to a different package (Development Class) and records the change on a transport request via the CTO write endpoint (`/sap/bw/modeling/cto/write`); a single write with no activation, so the object is left inactive and must be re-activated with `bw_activate` using the same transport; for `object_type` `RSDS` the source system is mandatory (compound key) and the applied package is verified by re-reading the DataSource, guarding against the orphan-TADIR case where `writeResult="S"` is returned but the real object's package stays unchanged; verified for `TRFN` and `RSDS`
+
+### Improved
+
+- `bw_create_transformation` — new `source_object_subtype` / `target_object_subtype` parameters (`TEXT` / `ATTR` / `HIER`) to select the InfoObject facet when a source or target is an InfoObject (`IOBJ`): text table, attributes / master data, or hierarchy; passed through to both the transient GET (`sourceobjectsubtype` / `targetobjectsubtype`) and the transformation XML (`subType`)
+
+---
+
 ## [0.9.1] — 2026-06-27
 
 ### Fixed

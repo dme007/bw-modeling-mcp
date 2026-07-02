@@ -113,6 +113,7 @@ src/
     ├── adso.ts           # bw_get_adso, bw_create_adso, bw_update_adso
     ├── composite_provider.ts # bw_get_composite_provider
     ├── cp_components.ts  # bw_get_ckf, bw_get_rkf, bw_get_structure
+    ├── cto.ts            # bw_change_package — package reassignment via /sap/bw/modeling/cto/write
     ├── dataflow.ts       # bw_get_dataflow — transient data flow graph via /sap/bw/modeling/dmod/8TRANSIENT
     ├── datasource.ts     # bw_list_source_systems, bw_list_datasources, bw_get_source_system,
     │                     # bw_get_datasource, bw_preview_datasource,
@@ -223,6 +224,7 @@ Full endpoint list from BW/4HANA discovery — **47 workspaces, 130+ endpoints**
 | Validation | `GET /sap/bw/modeling/validation?objectType=...&objectName=...` |
 | Move objects | `POST /sap/bw/modeling/move_requests` |
 | BW Transport | `/sap/bw/modeling/cto` |
+| Change package (CTO write) | `POST /sap/bw/modeling/cto/write?package=...&corrnum=...&simulate=false` |
 | Jobs | `/sap/bw/modeling/jobs` |
 | BW Content (install) | `/sap/bw/modeling/bwcontent/installation` |
 | Component Refactor | `/sap/bw/modeling/comprefactor` |
