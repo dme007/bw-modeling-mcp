@@ -1,17 +1,6 @@
 import { XMLParser } from 'fast-xml-parser';
 import { BwClient } from '../bw-client.js';
-
-const CKF_ACCEPT = [
-  'application/vnd.sap.bw.modeling.ckf-v1_8_0+xml',
-  'application/vnd.sap.bw.modeling.ckf-v1_9_0+xml',
-  'application/vnd.sap.bw.modeling.ckf-v1_10_0+xml',
-].join(',');
-
-const RKF_ACCEPT = [
-  'application/vnd.sap.bw.modeling.rkf-v1_8_0+xml',
-  'application/vnd.sap.bw.modeling.rkf-v1_9_0+xml',
-  'application/vnd.sap.bw.modeling.rkf-v1_10_0+xml',
-].join(',');
+import { ckfAccept, rkfAccept } from './query.js';
 
 const STRUCTURE_ACCEPT = [
   'application/vnd.sap.bw.modeling.structure-v1_8_0+xml',
@@ -184,7 +173,7 @@ function buildDependencies(
 
 export async function bwGetCkf(client: BwClient, componentName: string): Promise<string> {
   const path = `/sap/bw/modeling/ckf/${componentName.toLowerCase()}/a`;
-  const { body } = await client.get(path, CKF_ACCEPT);
+  const { body } = await client.get(path, ckfAccept());
 
   const parser = makeParser();
   const parsed = parser.parse(body);
@@ -227,7 +216,7 @@ export async function bwGetCkf(client: BwClient, componentName: string): Promise
 
 export async function bwGetRkf(client: BwClient, componentName: string): Promise<string> {
   const path = `/sap/bw/modeling/rkf/${componentName.toLowerCase()}/a`;
-  const { body } = await client.get(path, RKF_ACCEPT);
+  const { body } = await client.get(path, rkfAccept());
 
   const parser = makeParser();
   const parsed = parser.parse(body);

@@ -53,6 +53,10 @@ export class BwClient {
   // causes SAP to create a new stateless session, invalidating the lock handle.
   private readonly basicAuth: string | null;
   private readonly frozenCookies: Set<string> = new Set();
+  // Temporary session diagnostics — enable with BW_DEBUG_SESSION=1 (or "true").
+  // All debug output goes to stderr so it never corrupts the MCP stdio protocol.
+  private readonly sessionDebug: boolean =
+    process.env.BW_DEBUG_SESSION === '1' || process.env.BW_DEBUG_SESSION === 'true';
 
   constructor(
     url: string,
@@ -112,18 +116,47 @@ export class BwClient {
   private updateCookies(response: AxiosResponse): void {
     const setCookies = response.headers['set-cookie'];
     if (!setCookies) return;
+    if (this.sessionDebug) {
+      console.error(`[bw-session] Set-Cookie received: ${JSON.stringify(setCookies)}`);
+    }
     for (const c of setCookies) {
-      const part = c.split(';')[0];
+      const attrs = c.split(';');
+      const part = attrs[0];
       const eqIdx = part.indexOf('=');
-      if (eqIdx > 0) {
-        const name = part.substring(0, eqIdx).trim();
-        if (this.frozenCookies.has(name)) continue;
-        this.cookies.set(
-          name,
-          part.substring(eqIdx + 1).trim()
-        );
+      if (eqIdx <= 0) continue;
+      const name = part.substring(0, eqIdx).trim();
+      if (this.frozenCookies.has(name)) continue;
+      const value = part.substring(eqIdx + 1).trim();
+      // Honour explicit cookie deletions (Max-Age<=0 or Expires in the past): drop the
+      // cookie from the jar instead of re-sending a stale value. Re-sending a session
+      // cookie (e.g. sap-contextid) that the server has already rolled out is a likely
+      // cause of intermittent "No Suitable Resource Found" errors on stateful calls.
+      if (this.isCookieDeletion(attrs)) {
+        this.cookies.delete(name);
+        continue;
+      }
+      this.cookies.set(name, value);
+    }
+    if (this.sessionDebug) {
+      console.error(`[bw-session] cookie jar now: ${JSON.stringify(Object.fromEntries(this.cookies.entries()))}`);
+    }
+  }
+
+  // A Set-Cookie is a deletion when Max-Age is <= 0 or Expires is in the past.
+  private isCookieDeletion(attrs: string[]): boolean {
+    for (const a of attrs.slice(1)) {
+      const eq = a.indexOf('=');
+      const key = (eq >= 0 ? a.slice(0, eq) : a).trim().toLowerCase();
+      const val = eq >= 0 ? a.slice(eq + 1).trim() : '';
+      if (key === 'max-age') {
+        const n = parseInt(val, 10);
+        if (Number.isFinite(n) && n <= 0) return true;
+      } else if (key === 'expires') {
+        const t = Date.parse(val);
+        if (Number.isFinite(t) && t <= Date.now()) return true;
       }
     }
+    return false;
   }
 
   // ── CSRF token ─────────────────────────────────────────────────────────────

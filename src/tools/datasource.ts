@@ -844,3 +844,240 @@ export async function bwPreviewDatasource(
 
   return lines.join('\n');
 }
+
+// ── bwChangeDatasourceDelta ─────────────────────────────────────────────────────
+
+export interface ChangeDatasourceDeltaArgs {
+  datasourceName: string;
+  sourceSystem: string;
+  deltaProcess: string;
+}
+
+/**
+ * bw_change_datasource_delta — change the delta process (deltaProperties@delta) of a
+ * DataSource. Full read-modify-write on the RSDS /m resource. Activation is separate
+ * (bw_activate, object_type "rsds"). See payloads/change_datasource_delta.md.
+ */
+export async function bwChangeDatasourceDelta(
+  client: BwClient,
+  args: ChangeDatasourceDeltaArgs
+): Promise<string> {
+  const dsUpper = args.datasourceName.toUpperCase();
+  const dsLower = args.datasourceName.toLowerCase();
+  const ssUpper = args.sourceSystem.toUpperCase();
+  const mUrl = `/sap/bw/modeling/rsds/${dsUpper}/${ssUpper}/m`;
+
+  // 1. Read current full body (this exact XML is PUT back with one attribute changed).
+  const { body: current } = await client.rawGet(mUrl, { Accept: RSDS_ACCEPT });
+
+  const dpMatch = current.match(/<deltaProperties\b[^>]*\bdelta="([^"]*)"[^>]*>/);
+  if (!dpMatch) {
+    return JSON.stringify({
+      success: false,
+      message: 'No <deltaProperties delta="..."> element found in the DataSource body.',
+    }, null, 2);
+  }
+  const currentDelta = dpMatch[1];
+
+  // Validate against the admissible delta values enumerated in the adapter block.
+  const admBlock = current.match(/<admissibleAttributes>([\s\S]*?)<\/admissibleAttributes>/)?.[1] ?? '';
+  const allowed: string[] = [];
+  const deltaRe = /<delta>([^<]*)<\/delta>/g;
+  let dm: RegExpExecArray | null;
+  while ((dm = deltaRe.exec(admBlock)) !== null) allowed.push(dm[1]);
+  if (allowed.length > 0 && !allowed.includes(args.deltaProcess)) {
+    return JSON.stringify({
+      success: false,
+      current_delta: currentDelta,
+      requested_delta: args.deltaProcess,
+      allowed_deltas: allowed,
+      message: 'Requested delta process is not admissible for this DataSource.',
+    }, null, 2);
+  }
+
+  // 2. Lock; capture LOCK_HANDLE and the timestamp response header for the PUT.
+  // Writing requests (lock, PUT, unlock) must carry a fetched CSRF token — rawPost/rawPut
+  // do not add one automatically. Reuse the same token across the whole sequence, on the
+  // same cookie session (same pattern as bwCreateDatasource).
+  const lockUrl = `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}?action=lock`;
+  const unlockUrl = `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}?action=unlock`;
+  const csrf = await client.getCsrfToken();
+  const lockRes = await client.rawPost(lockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf });
+  const lockHandle = lockRes.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1] ?? '';
+  if (!lockHandle) {
+    return JSON.stringify({
+      success: false,
+      message: `No <LOCK_HANDLE> in lock response:\n${lockRes.body}`,
+    }, null, 2);
+  }
+  const timestamp = (lockRes.headers['timestamp'] as string | undefined) ?? '';
+
+  try {
+    // 3. Replace only deltaProperties@delta (anchored so the adapter's delta="" is untouched).
+    const modified = current.replace(
+      /(<deltaProperties\b[^>]*\bdelta=")[^"]*(")/,
+      `$1${args.deltaProcess}$2`
+    );
+
+    // 4. PUT the full modified body.
+    const putUrl = `${mUrl}?lockHandle=${encodeURIComponent(lockHandle)}`;
+    const putRes = await client.rawPut(putUrl, modified, {
+      'Content-Type': 'application/xml, application/vnd.sap.bw.modeling.rsds-v1_1_0+xml',
+      Accept: 'application/vnd.sap.bw.modeling.rsds-v1_1_0+xml',
+      'x-csrf-token': csrf,
+      ...(timestamp ? { timestamp } : {}),
+    });
+
+    const hasError = putRes.body.includes('messageType="Error"');
+    const title = putRes.body.match(/<atom:title>([^<]*)<\/atom:title>/)?.[1] ?? '';
+
+    const result: Record<string, unknown> = {
+      success: !hasError,
+      datasource: dsUpper,
+      source_system: ssUpper,
+      previous_delta: currentDelta,
+      new_delta: args.deltaProcess,
+    };
+    if (title) result['message'] = title;
+    if (!hasError) {
+      result['next_step'] =
+        'DataSource is inactive. Activate with bw_activate (object_type "rsds", pass source_system).';
+    }
+    return JSON.stringify(result, null, 2);
+  } finally {
+    // 5. Release the enqueue (best-effort, also on failure).
+    try {
+      await client.rawPost(unlockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf });
+    } catch {
+      // ignore unlock failure
+    }
+  }
+}
+
+// ── bwSetDatasourceFields ────────────────────────────────────────────────────────
+
+export interface SetDatasourceFieldsArgs {
+  datasourceName: string;
+  sourceSystem: string;
+  fields: Array<{ name: string; transfer: boolean }>;
+  transport?: string;
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * bw_set_datasource_fields — set the transfer flag (fieldProperties@transfer) of one or
+ * more DataSource fields. Full read-modify-write on the RSDS /m resource. Only
+ * fieldProperties@transfer is changed; the adapter fieldMapping is left untouched.
+ * Activation is separate (bw_activate, object_type "rsds"). See payloads/set_datasource_fields.md.
+ */
+export async function bwSetDatasourceFields(
+  client: BwClient,
+  args: SetDatasourceFieldsArgs
+): Promise<string> {
+  const dsUpper = args.datasourceName.toUpperCase();
+  const dsLower = args.datasourceName.toLowerCase();
+  const ssUpper = args.sourceSystem.toUpperCase();
+  const mUrl = `/sap/bw/modeling/rsds/${dsUpper}/${ssUpper}/m`;
+
+  if (!args.fields || args.fields.length === 0) {
+    return JSON.stringify({ success: false, message: 'No fields given.' }, null, 2);
+  }
+
+  // 1. Read current full body.
+  const { body: current } = await client.rawGet(mUrl, { Accept: RSDS_ACCEPT });
+
+  // Resolve each requested field against its <field>/<fieldProperties>.
+  const changed: Array<{ name: string; transfer: boolean; previous: boolean }> = [];
+  const skipped: Array<{ name: string; reason: string }> = [];
+  let modified = current;
+
+  for (const f of args.fields) {
+    const nameEsc = escapeRegExp(f.name);
+    const fpRe = new RegExp(
+      `<field name="${nameEsc}"[^>]*>[\\s\\S]*?<fieldProperties\\b([^>]*)\\/>`
+    );
+    const fpMatch = modified.match(fpRe);
+    if (!fpMatch) {
+      skipped.push({ name: f.name, reason: 'field not found' });
+      continue;
+    }
+    const fpAttrs = fpMatch[1];
+    const previous = /\btransfer="true"/.test(fpAttrs);
+    const transferNotAllowed = /\btransferNotAllowed="true"/.test(fpAttrs);
+    if (f.transfer && transferNotAllowed) {
+      skipped.push({ name: f.name, reason: 'transfer not allowed for this field' });
+      continue;
+    }
+    // Replace transfer only within this field's fieldProperties element.
+    const replaceRe = new RegExp(
+      `(<field name="${nameEsc}"[^>]*>[\\s\\S]*?<fieldProperties\\b[^>]*\\btransfer=")[^"]*(")`
+    );
+    modified = modified.replace(replaceRe, `$1${f.transfer ? 'true' : 'false'}$2`);
+    changed.push({ name: f.name, transfer: f.transfer, previous });
+  }
+
+  if (changed.length === 0) {
+    return JSON.stringify({
+      success: false,
+      datasource: dsUpper,
+      source_system: ssUpper,
+      skipped,
+      message: 'No fields were changed.',
+    }, null, 2);
+  }
+
+  // 2. Lock; capture LOCK_HANDLE and the timestamp response header.
+  const lockUrl = `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}?action=lock`;
+  const unlockUrl = `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}?action=unlock`;
+  const csrf = await client.getCsrfToken();
+  const lockRes = await client.rawPost(lockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf });
+  const lockHandle = lockRes.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1] ?? '';
+  if (!lockHandle) {
+    return JSON.stringify({
+      success: false,
+      message: `No <LOCK_HANDLE> in lock response:\n${lockRes.body}`,
+    }, null, 2);
+  }
+  const timestamp = (lockRes.headers['timestamp'] as string | undefined) ?? '';
+
+  try {
+    // 3. PUT. corrNr (camelCase!) + Transport-Lock-Holder only when a transport is used.
+    const query = args.transport
+      ? `?corrNr=${encodeURIComponent(args.transport)}&lockHandle=${encodeURIComponent(lockHandle)}`
+      : `?lockHandle=${encodeURIComponent(lockHandle)}`;
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/xml, application/vnd.sap.bw.modeling.rsds-v1_1_0+xml',
+      Accept: 'application/vnd.sap.bw.modeling.rsds-v1_1_0+xml',
+    };
+    if (timestamp) headers['timestamp'] = timestamp;
+    if (args.transport) headers['Transport-Lock-Holder'] = args.transport;
+    headers['x-csrf-token'] = csrf;
+
+    const putRes = await client.rawPut(`${mUrl}${query}`, modified, headers);
+    const hasError = putRes.body.includes('messageType="Error"');
+    const title = putRes.body.match(/<atom:title>([^<]*)<\/atom:title>/)?.[1] ?? '';
+
+    const result: Record<string, unknown> = {
+      success: !hasError,
+      datasource: dsUpper,
+      source_system: ssUpper,
+      changed,
+    };
+    if (skipped.length > 0) result['skipped'] = skipped;
+    if (title) result['message'] = title;
+    if (!hasError) {
+      result['next_step'] =
+        'DataSource is inactive. Activate with bw_activate (object_type "rsds", pass source_system and, if transportable, transport).';
+    }
+    return JSON.stringify(result, null, 2);
+  } finally {
+    try {
+      await client.rawPost(unlockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf });
+    } catch {
+      // ignore unlock failure
+    }
+  }
+}

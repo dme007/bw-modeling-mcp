@@ -1,5 +1,6 @@
 import { BwClient, MEDIA_TYPES, createClientFromEnv } from '../bw-client.js';
 import { parseInfoObjectProps } from './infoobject.js';
+import { parseActivationMessages, parseDtpsDeactivated } from './activation.js';
 
 const TRFN_ACCEPT = MEDIA_TYPES['trfn'];
 
@@ -920,6 +921,85 @@ function buildStepDirectFieldRule(params: {
 }
 
 /**
+ * Convert a segment <element>…</element> block into the form used inside a rule step
+ * (input/output). Strips the segment-only attributes (posit, key, intType, dimension)
+ * and any existing xsi:type, then injects xsi:type="trfn:TransformationElement". The
+ * child nodes (inlineType, unitCurrencyElement, semantics, localProperties, …) are kept
+ * verbatim — BW normalizes any remaining differences on read-back.
+ */
+function segmentElementToStepElement(segmentElementXml: string): string {
+  return segmentElementXml.replace(/^<element\b([^>]*)>/, (_m, attrs: string) => {
+    const cleaned = attrs
+      .replace(/\s+xsi:type="[^"]*"/g, '')
+      .replace(/\s+posit="[^"]*"/g, '')
+      .replace(/\s+key="[^"]*"/g, '')
+      .replace(/\s+intType="[^"]*"/g, '')
+      .replace(/\s+dimension="[^"]*"/g, '');
+    return `<element xsi:type="trfn:TransformationElement"${cleaned}>`;
+  });
+}
+
+/**
+ * Read the unit/currency field a key figure element points to via its
+ * <unitCurrencyElement>#///{source|target}/segment1/FIELD</unitCurrencyElement> child.
+ * Returns the bare field name (e.g. "UNIT_FIELD") or '' when the element carries no unit.
+ */
+function extractUnitCurrencyField(elementXml: string): string {
+  return elementXml
+    .match(/<unitCurrencyElement>#\/\/\/[^/]+\/segment1\/([^<]+)<\/unitCurrencyElement>/)?.[1]
+    ?.trim() ?? '';
+}
+
+/**
+ * Build a combined key-figure + unit/currency direct rule (multi-source / multi-target),
+ * matching the structure Eclipse produces when a quantity is mapped together with its unit
+ * (or an amount with its currency). See payloads/trfn_unit_currency_mapping.md.
+ *
+ *   <rule conversiontype="FROM_SOURCE">
+ *     <source id="1">→ key figure   <source id="2">→ unit/currency
+ *     <target id="1">→ key figure   <target id="2">→ unit/currency
+ *     <step id="1" rank="MAIN">  key figure (carries unitCurrencyElement)
+ *     <step id="2" rank="MINOR"> unit/currency field
+ *
+ * Requires allowCurrencyAndUnitConversion="true" on the transformation root, and the
+ * caller must remove the standalone unit/currency rule (its mapping becomes the MINOR step).
+ */
+function buildCombinedDirectRule(params: {
+  groupId: string;
+  ruleId: string;
+  kfSourceField: string;
+  kfTargetField: string;
+  kfSourceElementXml: string;
+  kfTargetElementXml: string;
+  unitSourceField: string;
+  unitTargetField: string;
+  unitSourceElementXml: string;
+  unitTargetElementXml: string;
+}): string {
+  const g = params.groupId;
+  const rv = params.ruleId;
+  const kfIn  = segmentElementToStepElement(params.kfSourceElementXml);
+  const kfOut = segmentElementToStepElement(params.kfTargetElementXml);
+  const unIn  = segmentElementToStepElement(params.unitSourceElementXml);
+  const unOut = segmentElementToStepElement(params.unitTargetElementXml);
+
+  return `<rule id="${rv}" conversiontype="FROM_SOURCE" description="">
+      <source id="1"><input>#///group${g}/rule${rv}/step1/input1</input><elementRef>#///source/segment1/${params.kfSourceField}</elementRef></source>
+      <source id="2"><input>#///group${g}/rule${rv}/step2/input1</input><elementRef>#///source/segment1/${params.unitSourceField}</elementRef></source>
+      <target id="1"><output>#///group${g}/rule${rv}/step1/output1</output><elementRef>#///target/segment1/${params.kfTargetField}</elementRef></target>
+      <target id="2"><output>#///group${g}/rule${rv}/step2/output1</output><elementRef>#///target/segment1/${params.unitTargetField}</elementRef></target>
+      <step xsi:type="trfn:StepDirect" id="1" rank="MAIN" type="DIRECT">
+        <input id="1"><output>#///group${g}/rule${rv}/source1</output>${kfIn}</input>
+        <output id="1"><input>#///group${g}/rule${rv}/target1</input>${kfOut}</output>
+      </step>
+      <step xsi:type="trfn:StepDirect" id="2" rank="MINOR" type="DIRECT">
+        <input id="1"><output>#///group${g}/rule${rv}/source2</output>${unIn}</input>
+        <output id="1"><input>#///group${g}/rule${rv}/target2</input>${unOut}</output>
+      </step>
+    </rule>`;
+}
+
+/**
  * Convert any existing rule back to StepNoUpdate (no mapping).
  * Preserves the target reference and step output element from the existing rule.
  */
@@ -949,6 +1029,13 @@ function buildNoUpdateRule(ruleXml: string, ruleId: string): string {
  *   Finds any existing rule for the target InfoObject (any step type) and
  *   replaces it with StepDirect. source_field is required unless it can be
  *   inferred from the existing rule.
+ *   When unitSourceField is set, builds a COMBINED key-figure + unit/currency
+ *   direct rule (multi-source/target) instead — target_infoobject is the key
+ *   figure, unitSourceField the source unit/currency field. The target unit/
+ *   currency field is read from the key figure's <unitCurrencyElement>, the
+ *   standalone unit rule is folded into the combined rule, and the transformation
+ *   flag allowCurrencyAndUnitConversion is switched on. See
+ *   payloads/trfn_unit_currency_mapping.md.
  *
  * rule_type="routine":
  *   Finds the rule for the target InfoObject (StepDirect, StepInitial, or
@@ -978,6 +1065,7 @@ export async function bwUpdateTransformation(
   lookupObjectType?: string,
   transport?: string,
   additionalSourceFields?: string[],
+  unitSourceField?: string,
 ): Promise<string> {
   const tgtUpper = targetInfoObject.toUpperCase();
   let srcUpper = sourceField?.toUpperCase() ?? '';
@@ -1288,6 +1376,96 @@ export async function bwUpdateTransformation(
     });
   }
 
+  // ── Combined key-figure + unit/currency direct rule (multi-source/target) ──
+  // See payloads/trfn_unit_currency_mapping.md. Maps the key figure together with
+  // its unit/currency field in one rule (MAIN + MINOR steps), folds in the unit's
+  // own rule, and enables allowCurrencyAndUnitConversion on the transformation root.
+  if (unitSourceField) {
+    const unitSrcUpper = unitSourceField.toUpperCase();
+
+    const kfRule = findRuleForTarget(originalXml, tgtUpper);
+    if (!kfRule) {
+      return JSON.stringify({
+        success: false,
+        message:
+          `No rule found for target key figure ${tgtUpper} in ` +
+          `transformation ${transformationName.toUpperCase()}.`,
+      });
+    }
+
+    // Key-figure source: explicit arg, else 1:1 by name.
+    const kfSrcUpper = srcUpper || tgtUpper;
+
+    const kfSrcProps = extractSourceFieldProps(originalXml, kfSrcUpper);
+    const kfTgtProps = extractTargetFieldProps(originalXml, tgtUpper);
+
+    // Target unit/currency field is dictated by the key figure's unitCurrencyElement.
+    const unitTgtField = extractUnitCurrencyField(kfTgtProps.elementXml);
+    if (!unitTgtField) {
+      return JSON.stringify({
+        success: false,
+        message:
+          `Target key figure ${tgtUpper} has no unit/currency reference (unitCurrencyElement). ` +
+          `A combined unit/currency mapping requires the target key figure to reference a ` +
+          `unit or currency field in the aDSO.`,
+      });
+    }
+
+    const unitSrcProps = extractSourceFieldProps(originalXml, unitSrcUpper);
+    const unitTgtProps = extractTargetFieldProps(originalXml, unitTgtField);
+
+    const combinedRule = buildCombinedDirectRule({
+      groupId: kfRule.groupId,
+      ruleId: kfRule.ruleId,
+      kfSourceField: kfSrcUpper,
+      kfTargetField: tgtUpper,
+      kfSourceElementXml: kfSrcProps.elementXml,
+      kfTargetElementXml: kfTgtProps.elementXml,
+      unitSourceField: unitSrcUpper,
+      unitTargetField: unitTgtField,
+      unitSourceElementXml: unitSrcProps.elementXml,
+      unitTargetElementXml: unitTgtProps.elementXml,
+    });
+
+    updatedXml = originalXml.replace(kfRule.oldRuleXml, combinedRule);
+    if (updatedXml === originalXml) {
+      throw new Error('Combined rule replacement failed — key figure rule XML unchanged.');
+    }
+
+    // Remove the now-redundant standalone unit/currency rule (folded into the MINOR step).
+    const unitRule = findRuleForTarget(originalXml, unitTgtField);
+    if (unitRule && unitRule.oldRuleXml !== kfRule.oldRuleXml) {
+      updatedXml = updatedXml.replace(unitRule.oldRuleXml, '');
+    }
+
+    // Enable currency/unit handling on the transformation root (the Eclipse checkbox).
+    updatedXml = updatedXml.replace(
+      /allowCurrencyAndUnitConversion="false"/,
+      'allowCurrencyAndUnitConversion="true"',
+    );
+
+    const lockHandle = await client.lock('trfn', transformationName);
+    try {
+      await client.put('trfn', transformationName, lockHandle, updatedXml, timestamp, transport);
+    } catch (err) {
+      await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
+      throw err;
+    }
+
+    return JSON.stringify({
+      success: true,
+      message:
+        `Key figure ${tgtUpper} mapped together with unit/currency field ${unitTgtField} ` +
+        `(source ${unitSrcUpper}) as a combined direct rule in ` +
+        `transformation ${transformationName.toUpperCase()}. Call bw_activate to activate.`,
+      key_figure: tgtUpper,
+      unit_currency_field: unitTgtField,
+      lock_handle: lockHandle,
+      transformation_name: transformationName.toUpperCase(),
+      object_type: 'trfn',
+    });
+  }
+
   // ── Direct path (default) ────────────────────────────────────────────────
 
   // Determine the target kind first (field-based vs InfoObject-based) — see
@@ -1466,37 +1644,51 @@ export async function bwSetTransformationRoutine(
     }
   }
 
-  // Step 3: Guard — reject only if this specific routine type already exists
-  const group0Exists = /<group\b[^>]*\bid="0"/.test(xml1);
-  if (group0Exists) {
-    const routineTypeExists = new RegExp(`<rule\\b[^>]*\\broutinetype="${routineTypeUpper}"`).test(xml1);
-    if (routineTypeExists) {
-      return JSON.stringify({
-        success: false,
-        message:
-          `Transformation ${trfnUpper} already has a ${routineTypeUpper} routine. ` +
-          `Cannot add another one.`,
-      });
-    }
+  // Step 3: Guard — reject if this specific routine type already exists anywhere in the
+  //         document, regardless of group id. The server persists a sole expert routine group
+  //         as id="1" (not id="0"), so a group-scoped check would miss it.
+  const routineTypeExists = new RegExp(`<rule\\b[^>]*\\broutinetype="${routineTypeUpper}"`).test(xml1);
+  if (routineTypeExists) {
+    return JSON.stringify({
+      success: false,
+      message:
+        `Transformation ${trfnUpper} already has a ${routineTypeUpper} routine. ` +
+        `Cannot add another one.`,
+    });
   }
 
   // Step 4: Detect runtime from HANARuntime attribute on root element
   const hanaRuntimeAttr = /\bHANARuntime="([^"]+)"/.exec(xml1);
   const hanaRuntime = hanaRuntimeAttr ? hanaRuntimeAttr[1] : 'true';
 
-  // Step 5: Determine next free rule ID (max existing + 1)
+  // EXPERT on a HANA-runtime transformation must be sent as a bare step (no classNameM,
+  // no methodNameM, no target elementRefs, no sourceSegment on the group) AND with all
+  // pre-existing rule groups removed. The GUI deletes all existing rules before creating an
+  // expert routine; a remaining field-mapping group makes the server generate a plain ABAP
+  // class and force ABAP runtime (see payloads/trfn_routine_expert_hana_delta2.md).
+  const isHanaExpert = routineType === 'expert' && hanaRuntime === 'true';
+  const xmlBase = isHanaExpert ? xml1.replace(/<group\b[\s\S]*?<\/group>/g, '') : xml1;
+
+  // Step 5: Locate the field-mapping group and determine next free rule ID (max existing + 1).
+  //         Both are computed on xmlBase — for HANA expert the groups are already stripped, so
+  //         there is no group id="0" and no existing rule, giving the expert rule id 1 (matching
+  //         the native trace).
+  const group0Exists = /<group\b[^>]*\bid="0"/.test(xmlBase);
   const ruleIds: number[] = [];
   const ruleIdRegex = /<rule\b[^>]*\bid="(\d+)"/g;
   let rm: RegExpExecArray | null;
-  while ((rm = ruleIdRegex.exec(xml1)) !== null) {
+  while ((rm = ruleIdRegex.exec(xmlBase)) !== null) {
     ruleIds.push(parseInt(rm[1], 10));
   }
   const nextRuleId = ruleIds.length > 0 ? Math.max(...ruleIds) + 1 : 1;
 
-  // Step 6: Build rule content based on routine type
-  const stepAttrs =
-    `xsi:type="trfn:StepRoutine" id="1" rank="MAIN" type="ROUTINE"` +
-    ` classNameM="${classNameM}" hanaRuntime="${hanaRuntime}" methodNameM="${methodName}"`;
+  // Step 6: Build rule content based on routine type.
+  // For the bare HANA-expert step the server derives classNameM itself and generates a proper
+  // AMDP class from the stub; a fully-populated step (as for END) yields a plain ABAP class.
+  const stepAttrs = isHanaExpert
+    ? `xsi:type="trfn:StepRoutine" id="1" rank="MAIN" type="ROUTINE" hanaRuntime="${hanaRuntime}"`
+    : `xsi:type="trfn:StepRoutine" id="1" rank="MAIN" type="ROUTINE"` +
+      ` classNameM="${classNameM}" hanaRuntime="${hanaRuntime}" methodNameM="${methodName}"`;
 
   let ruleContent: string;
   if (routineType === 'start') {
@@ -1519,8 +1711,15 @@ export async function bwSetTransformationRoutine(
       sourceRefs +
       `<step ${stepAttrs}/>` +
       `</rule>`;
+  } else if (isHanaExpert) {
+    // EXPERT with HANA runtime has no per-field target elementRefs — the routine
+    // replaces the entire field mapping rather than mapping individual fields.
+    ruleContent =
+      `<rule id="${nextRuleId}" routinetype="${routineTypeUpper}">` +
+      `<step ${stepAttrs}/>` +
+      `</rule>`;
   } else {
-    // END / EXPERT: target fields from <target>/<segment>/<element>
+    // END / ABAP EXPERT: target fields from <target>/<segment>/<element>
     const tgtSegMatch = xml1.match(/<target\b[^>]*>[\s\S]*?<segment[^>]*>([\s\S]*?)<\/segment>/);
     if (!tgtSegMatch) {
       throw new Error(`Could not extract target segment from transformation ${trfnUpper}.`);
@@ -1541,22 +1740,32 @@ export async function bwSetTransformationRoutine(
       `</rule>`;
   }
 
-  // Step 7: Insert rule — append inside existing group id="0", or create new group before group id="1"
+  // Step 7: Insert rule — append inside existing group id="0", or create new group before group id="1".
+  // For HANA expert all groups were stripped in xmlBase, so group0Exists is false and the
+  // insert-before-group-id-1 replace cannot match — the append-before-</trfn:transformation>
+  // fallback is the path that fires.
   let xmlWithGroup: string;
   if (group0Exists) {
-    xmlWithGroup = xml1.replace(
+    xmlWithGroup = xmlBase.replace(
       /(<group\b[^>]*\bid="0"[^>]*>)([\s\S]*?)(<\/group>)/,
       `$1$2${ruleContent}$3`
     );
-    if (xmlWithGroup === xml1) {
+    if (xmlWithGroup === xmlBase) {
       throw new Error('Could not append rule to existing group id="0".');
     }
   } else {
-    const groupAttrs = routineType === 'start' ? '' : ` sourceSegment="#///source/segment1"`;
+    const groupAttrs = (routineType === 'start' || isHanaExpert) ? '' : ` sourceSegment="#///source/segment1"`;
     const group0Block = `<group id="0"${groupAttrs} type="G">${ruleContent}</group>`;
-    xmlWithGroup = xml1.replace(/<group\s+id="1"/, `${group0Block}<group id="1"`);
-    if (xmlWithGroup === xml1) {
-      throw new Error('Could not insert group id="0" — group id="1" not found in Transformation XML.');
+    const beforeGroup1 = xmlBase.replace(/<group\s+id="1"/, `${group0Block}<group id="1"`);
+    if (beforeGroup1 !== xmlBase) {
+      xmlWithGroup = beforeGroup1;
+    } else {
+      // No group id="1" at all — transformation has no field-mapping rule group yet.
+      // Append the new group as the last child instead of requiring group id="1" to exist.
+      xmlWithGroup = xmlBase.replace(/<\/trfn:transformation>/, `${group0Block}</trfn:transformation>`);
+      if (xmlWithGroup === xmlBase) {
+        throw new Error('Could not insert group id="0" — no insertion point found in Transformation XML.');
+      }
     }
   }
 
@@ -1572,16 +1781,22 @@ export async function bwSetTransformationRoutine(
 
   // ADT class write flow — activate the generated _M class and inject a proper skeleton.
   // For ABAP: BW generates the class only after activation — skip if 404.
-  // For HANA END/EXPERT: BW auto-generates the class; inject the correct SELECT column list
+  // For HANA END: BW auto-generates the class; inject the correct SELECT column list
   //   so the user has the right structure when adding custom logic.
-  {
+  // Skipped entirely for HANA expert: the server generates the AMDP class synchronously and
+  //   completely from the bare stub (nothing to inject — IN follows source columns, OUT follows
+  //   target columns), and locking/activating the class here can fail on a foreign editor lock
+  //   after the BW PUT has already succeeded (see payloads/trfn_routine_expert_hana_delta2.md).
+  if (!isHanaExpert) {
     const classEncoded = encodeURIComponent(classNameM).toLowerCase();
     const source = await client.adtGetSource(classEncoded);
     if (source !== null) {
       let updatedSource = source;
 
-      if (hanaRuntime === 'true' && (routineType === 'end' || routineType === 'expert')) {
-        // Replace the commented stub SELECT with a proper explicit column list
+      if (hanaRuntime === 'true' && routineType === 'end') {
+        // Replace the commented stub SELECT with a proper explicit column list.
+        // END only: for EXPERT the IN type follows source columns while OUT follows target
+        // columns, so this END-oriented (IN == OUT) column list does not apply.
         const selectStmt = buildHanaEndSelect(xmlWithGroup);
         updatedSource = source.replace(
           /-- outTab = SELECT \* FROM :inTab;/,
@@ -1601,9 +1816,11 @@ export async function bwSetTransformationRoutine(
 
   return JSON.stringify({
     success: true,
-    message:
-      `${routineTypeUpper} routine added to transformation ${trfnUpper}. ` +
-      `ABAP method ${classNameM}->${methodName} generated. Call bw_activate to activate.`,
+    message: isHanaExpert
+      ? `${routineTypeUpper} routine added to transformation ${trfnUpper}. ` +
+        `AMDP method ${classNameM}->${methodName} (SQLScript) generated. Call bw_activate to activate.`
+      : `${routineTypeUpper} routine added to transformation ${trfnUpper}. ` +
+        `ABAP method ${classNameM}->${methodName} generated. Call bw_activate to activate.`,
     routine_type: routineTypeUpper,
     class_name: classNameM,
     method_name: methodName,
@@ -1611,6 +1828,199 @@ export async function bwSetTransformationRoutine(
     transformation_name: trfnUpper,
     object_type: 'trfn',
   });
+}
+
+// ── bwSetTransformationExpertRoutine ─────────────────────────────────────────
+
+/**
+ * Replace one `METHOD <name> ... ENDMETHOD.` block inside the full class source.
+ * A function replacement is used so `$` sequences in the new block are inserted
+ * verbatim (never interpreted as regex back-references).
+ */
+function replaceMethodBlock(fullSource: string, methodName: string, newBlock: string): string {
+  const re = new RegExp(`METHOD\\s+${methodName}\\b[\\s\\S]*?ENDMETHOD\\s*\\.`, 'i');
+  if (!re.test(fullSource)) {
+    throw new Error(
+      `Method ${methodName} not found in the generated class source — cannot splice the routine body.`,
+    );
+  }
+  return fullSource.replace(re, () => newBlock.trim());
+}
+
+/**
+ * bwSetTransformationExpertRoutine — write the code of a Start / End / Expert routine
+ * into the transformation's MASTER definition so it survives TLOGO regeneration
+ * (full `bw_activate(trfn)` and transport import), not just into the generated
+ * `/BIC/<uuid>_M` class.
+ *
+ * Why this exists (root cause):
+ *   Writing only the generated `/BIC/<uuid>_M` class (abap-adt WriteSource) and
+ *   activating the CLASS updates the generated class body only. On the next TLOGO
+ *   activation of the transformation (`bw_activate` trfn) or a transport import, BW
+ *   regenerates the class from the transformation's own routine metadata and the
+ *   edit is lost ("return type mismatch … OUTTAB[…]"). The Eclipse transformation
+ *   editor avoids this by, after writing the class, re-saving the transformation
+ *   master and running a TLOGO activation via the BW modeling endpoints — which
+ *   re-registers the current class routine as the authoritative source. This tool
+ *   replicates that exact wire sequence.
+ *
+ * Sequence (mirrors the Eclipse ADT trace):
+ *   1. GET trfn master → derive classNameM + method name, verify the routine exists.
+ *   2. (if `source` given) splice the `METHOD … ENDMETHOD.` block into the current
+ *      class source, then ADT lock → PUT source → activate class → unlock.
+ *   3. GET trfn master again → fresh timestamp.
+ *   4. Lock trfn → PUT the master back (round-trip, corrNr=transport, lockHandle).
+ *   5. Priming GET, then TLOGO-activate the trfn (POST /sap/bw/modeling/activation).
+ *   6. Unlock trfn.
+ *
+ * `source` is the complete `METHOD <NAME> BY DATABASE PROCEDURE … ENDMETHOD.` block
+ * for AMDP (HANA) routines, or the complete `METHOD <NAME> … ENDMETHOD.` block for
+ * ABAP routines — the same block shape abap-adt WriteSource(method=…) expects. When
+ * `source` is omitted the class is left untouched and only the master re-save +
+ * activation runs (use this to "commit" a routine that was already edited on the
+ * generated class into the transportable master).
+ */
+export async function bwSetTransformationExpertRoutine(
+  client: BwClient,
+  transformationName: string,
+  source?: string,
+  routineType: 'start' | 'end' | 'expert' = 'expert',
+  transport?: string,
+  className?: string,
+  methodName?: string,
+): Promise<string> {
+  const trfnLower = transformationName.toLowerCase();
+  const trfnUpper = transformationName.toUpperCase();
+  const routineTypeUpper = routineType.toUpperCase();
+
+  // Step 1: GET master — derive class/method and verify the routine rule exists.
+  const { body: xml0 } = await client.get(
+    `/sap/bw/modeling/trfn/${trfnLower}/m`,
+    TRFN_ACCEPT,
+  );
+
+  // Derive the generated class name (_A → _M), unless the caller overrides it.
+  let classNameM = className;
+  if (!classNameM) {
+    const mMatch = xml0.match(/\bclassNameM="([^"]+)"/);
+    const aMatch = xml0.match(/\bclassNameA="([^"]+)"/);
+    if (mMatch) {
+      classNameM = mMatch[1];
+    } else if (aMatch) {
+      classNameM = aMatch[1].replace(/_A$/, '_M');
+    } else {
+      classNameM = `/BIC/${trfnUpper.slice(-20)}_M`;
+    }
+  }
+  const method = (methodName ?? `GLOBAL_${routineTypeUpper}`).toUpperCase();
+
+  // Guard: the routine must already exist in the transformation. This tool persists an
+  // existing routine's code — it does not create the routine rule/stub. Skip the guard
+  // when the caller passes an explicit method name (e.g. a field routine).
+  if (!methodName) {
+    const routineExists = new RegExp(`\\broutinetype="${routineTypeUpper}"`).test(xml0);
+    if (!routineExists) {
+      return JSON.stringify({
+        success: false,
+        message:
+          `Transformation ${trfnUpper} has no ${routineTypeUpper} routine yet. ` +
+          `Create it first with bw_set_transformation_routine (routine_type="${routineType}"), ` +
+          `then call bw_set_transformation_expert_routine to set its code.`,
+      });
+    }
+  }
+
+  // Step 2: Write the routine body into the generated _M class (optional).
+  if (source) {
+    if (!/METHOD\b/i.test(source) || !/ENDMETHOD\s*\./i.test(source)) {
+      return JSON.stringify({
+        success: false,
+        message:
+          `source must be a complete "METHOD ${method} … ENDMETHOD." block ` +
+          `(the same block shape abap-adt WriteSource(method=…) expects).`,
+      });
+    }
+    const classEncoded = encodeURIComponent(classNameM).toLowerCase();
+    const currentSource = await client.adtGetSource(classEncoded);
+    if (currentSource === null) {
+      return JSON.stringify({
+        success: false,
+        message:
+          `Generated class ${classNameM} does not exist yet. Activate the transformation once ` +
+          `(bw_activate trfn) so BW generates the class, then set the routine code.`,
+      });
+    }
+    const splicedSource = replaceMethodBlock(currentSource, method, source);
+
+    // Write the inactive version under an ADT lock, then UNLOCK before activating.
+    // Eclipse does exactly this (lock → PUT source → unlock → activate); activating while
+    // still holding the lock is rejected with HTTP 403 "Benutzer … bearbeitet bereits …".
+    const adtLock = await client.adtLockClass(classEncoded);
+    try {
+      await client.adtPutSource(classEncoded, adtLock, splicedSource);
+    } finally {
+      await client.adtUnlockClass(classEncoded, adtLock).catch(() => {/* ignore */});
+    }
+    await client.adtActivate(classEncoded, classNameM);
+  }
+
+  // Step 3: Re-read the master to capture a fresh timestamp (the class edit does not bump
+  //         the trfn timestamp, but re-reading avoids any optimistic-locking mismatch).
+  const { body: xml1, headers: h1 } = await client.get(
+    `/sap/bw/modeling/trfn/${trfnLower}/m`,
+    TRFN_ACCEPT,
+  );
+  const timestamp = h1['timestamp'] ?? h1['TIMESTAMP'] ?? '';
+
+  // Step 4: Lock → PUT the master back unchanged. This is the step the class-only path
+  //         skips: it re-registers the current routine source into the transformation's
+  //         transportable metadata so a later TLOGO regeneration keeps it.
+  const lockHandle = await client.lock('trfn', trfnLower);
+  let activationXml: string;
+  try {
+    await client.put('trfn', trfnLower, lockHandle, xml1, timestamp, transport);
+
+    // Step 5: Priming GET (mirrors Eclipse), then TLOGO-activate with the same lockHandle.
+    await client
+      .get(`/sap/bw/modeling/trfn/${trfnLower}/m?forceCacheUpdate=true`, TRFN_ACCEPT)
+      .catch(() => {/* priming only */});
+    activationXml = await client.activate('trfn', trfnLower, lockHandle);
+  } catch (err) {
+    await client.unlock('trfn', trfnLower).catch(() => {/* ignore */});
+    throw err;
+  }
+
+  // Step 6: Unlock.
+  await client.unlock('trfn', trfnLower).catch(() => {/* ignore */});
+
+  const messages = parseActivationMessages(activationXml);
+  const deactivatedDtps = parseDtpsDeactivated(activationXml);
+  const hasError =
+    activationXml.includes('messageType="Error"') || activationXml.includes("messageType='Error'");
+
+  const result: Record<string, unknown> = {
+    success: !hasError,
+    message: hasError
+      ? `Routine ${classNameM}->${method} written, but TLOGO activation of ${trfnUpper} reported an error. ` +
+        `Review the messages below.`
+      : `${routineTypeUpper} routine ${classNameM}->${method} persisted into the master of ${trfnUpper} ` +
+        `and the transformation was activated. The code now survives a full bw_activate(trfn) and transport import.`,
+    transformation_name: trfnUpper,
+    class_name: classNameM,
+    method_name: method,
+    object_type: 'trfn',
+    class_source_written: Boolean(source),
+    messages,
+    amdp_note:
+      'AMDP SQLSCRIPT allows 7-bit ASCII only — do not use umlauts (ä/ö/ü) or symbols like <= ' +
+      'in SQLSCRIPT code or comments; they cause a syntax error.',
+  };
+  if (deactivatedDtps.length > 0) {
+    result['dtps_deactivated_by_impact_analysis'] = deactivatedDtps;
+    result['next_step'] =
+      `Re-activate the deactivated DTPs using bw_activate with object_type="dtpa" and lock_handle="".`;
+  }
+  return JSON.stringify(result, null, 2);
 }
 
 // ── bwSetTransformationRoutineFields ─────────────────────────────────────────
@@ -1762,8 +2172,9 @@ export async function bwSetTransformationRoutineFields(
 /**
  * bw_delete_transformation_routine — remove a Start, End, or Expert routine.
  *
- * Removes the <rule routinetype="START|END|EXPERT"> from <group id="0">.
- * If no rules remain in group id="0" afterwards, removes the entire group.
+ * Locates the global routine group that contains the <rule routinetype="START|END|EXPERT">
+ * (its id is not fixed — a sole expert routine group is persisted as id="1", not id="0") and
+ * removes that rule. If no rules remain in the group afterwards, removes the entire group.
  * Single PUT (session-isolated). Returns lock_handle for bw_activate.
  */
 export async function bwDeleteTransformationRoutine(
@@ -1782,45 +2193,35 @@ export async function bwDeleteTransformationRoutine(
   );
   const timestamp = headers['timestamp'] ?? '';
 
-  // Step 2: Guard — group id="0" must exist
-  if (!/<group\s+id="0"/.test(xml)) {
-    return JSON.stringify({
-      success: false,
-      message: `Transformation ${trfnUpper} has no global routine group (group id="0").`,
-    });
-  }
-
-  // Step 3: Extract the full <group id="0">...</group> block
-  const group0Regex = /(<group\s+id="0"[^>]*>)([\s\S]*?)(<\/group>)/;
-  const group0Match = xml.match(group0Regex);
-  if (!group0Match) {
-    throw new Error(`Could not parse group id="0" from transformation ${trfnUpper}.`);
-  }
-  const [fullGroup0, groupOpen, groupBody, groupClose] = group0Match;
-
-  // Step 4: Find the rule with matching routinetype and remove it
-  // Rules look like: <rule id="N" routinetype="START">...</rule>
+  // Step 2: Locate the group that contains the rule with the matching routinetype.
+  // The routine group id is not fixed — a sole expert routine group is persisted as id="1",
+  // not id="0" — so scan all groups rather than assuming id="0".
   const ruleRegex = new RegExp(
     `<rule\\b[^>]*\\broutinetype="${routineTypeUpper}"[^>]*>[\\s\\S]*?<\\/rule>`,
     'i'
   );
-  if (!ruleRegex.test(groupBody)) {
+  const groupRegex = /<group\b[^>]*>[\s\S]*?<\/group>/g;
+  let targetGroup: string | null = null;
+  let gm: RegExpExecArray | null;
+  while ((gm = groupRegex.exec(xml)) !== null) {
+    if (ruleRegex.test(gm[0])) {
+      targetGroup = gm[0];
+      break;
+    }
+  }
+  if (!targetGroup) {
     return JSON.stringify({
       success: false,
-      message:
-        `No ${routineTypeUpper} routine found in group id="0" of transformation ${trfnUpper}.`,
+      message: `No ${routineTypeUpper} routine found in transformation ${trfnUpper}.`,
     });
   }
-  const newGroupBody = groupBody.replace(ruleRegex, '');
 
-  // Step 5: If group is now empty (no remaining <rule> elements), remove the entire group
-  const hasRemainingRules = /<rule\b/.test(newGroupBody);
-  let updatedXml: string;
-  if (!hasRemainingRules) {
-    updatedXml = xml.replace(fullGroup0, '');
-  } else {
-    updatedXml = xml.replace(fullGroup0, groupOpen + newGroupBody + groupClose);
-  }
+  // Step 3: Remove the rule; if the group has no remaining rules, remove the whole group.
+  const newGroup = targetGroup.replace(ruleRegex, '');
+  const hasRemainingRules = /<rule\b/.test(newGroup.replace(/^<group\b[^>]*>/, ''));
+  const updatedXml = hasRemainingRules
+    ? xml.replace(targetGroup, newGroup)
+    : xml.replace(targetGroup, '');
 
   if (updatedXml === xml) {
     throw new Error('XML unchanged after routine removal — replacement failed.');
@@ -1840,7 +2241,7 @@ export async function bwDeleteTransformationRoutine(
     success: true,
     message:
       `${routineTypeUpper} routine removed from transformation ${trfnUpper}.` +
-      (!hasRemainingRules ? ' Group id="0" removed (no remaining routines).' : '') +
+      (!hasRemainingRules ? ' Routine group removed (no remaining rules).' : '') +
       ' Call bw_activate to activate.',
     routine_type: routineTypeUpper,
     group_removed: !hasRemainingRules,

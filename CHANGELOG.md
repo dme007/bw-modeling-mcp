@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.9.3] — 2026-07-07
+
+### Fixed
+
+- `bw_set_transformation_routine` — EXPERT routines on HANA-runtime transformations no longer generate a plain ABAP class instead of an AMDP class. The initial step is now sent bare (no `classNameM`, no `methodNameM`, no per-field target elementRefs, no `sourceSegment` on the group) so the server derives the class itself and generates a proper AMDP class (`interfaces IF_AMDP_MARKER_HDB`, method `BY DATABASE PROCEDURE FOR HDB LANGUAGE SQLSCRIPT`); the server-generated class source is left untouched (the END-oriented SELECT skeleton no longer applies, since the EXPERT IN type follows source columns and OUT follows target columns). Verified against a native Eclipse BWMT trace
+- `bw_set_transformation_routine` — creating a global routine on a transformation that has no existing rule group no longer throws. When no `<group id="1">` is present the new group is appended as the last child of `<trfn:transformation>` instead of requiring an existing group to insert before
+
+---
+
 ## [0.9.2] — 2026-07-02
 
 ### Added

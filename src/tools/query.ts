@@ -1,5 +1,5 @@
 import { XMLParser } from 'fast-xml-parser';
-import { createClientFromEnv, MEDIA_TYPES } from '../bw-client.js';
+import { BwClient, createClientFromEnv, MEDIA_TYPES } from '../bw-client.js';
 
 // Fallback version range used when the discovery document does not advertise a
 // query media type. The exact query version depends on the BW backend SP level,
@@ -11,14 +11,76 @@ const QUERY_ACCEPT =
   'application/vnd.sap.bw.modeling.query-v1_10_0+xml, ' +
   'application/vnd.sap.bw.modeling.query-v1_11_0+xml';
 
+// Accept header for the query creation lock (matches the Eclipse wizard trace).
+export const QUERY_ACCEPT_LIST =
+  'application/vnd.sap.bw.modeling.query-v1_8_0+xml, ' +
+  'application/vnd.sap.bw.modeling.query-v1_9_0+xml, ' +
+  'application/vnd.sap.bw.modeling.query-v1_10_0+xml, ' +
+  'application/vnd.sap.bw.modeling.query-v1_11_0+xml';
+// Media type used for the create POST body and its Accept header.
+export const QUERY_V11 = 'application/vnd.sap.bw.modeling.query-v1_11_0+xml';
+
 /**
  * Accept header for query GETs: the discovery-advertised media type first (so
  * systems on a higher or lower SP level negotiate correctly), with the static
  * version range kept as a fallback.
  */
-function queryAccept(): string {
+export function queryAccept(): string {
   const discovered = MEDIA_TYPES['query'];
   return discovered ? `${discovered}, ${QUERY_ACCEPT}` : QUERY_ACCEPT;
+}
+
+// Fallback version range for the variable resource, which has its own media type
+// (a query-media-type Accept is rejected with HTTP 406). Matches the Accept list
+// Eclipse sends (see payloads/trace_20260710.log).
+const VARIABLE_ACCEPT =
+  'application/vnd.sap.bw.modeling.variable-v1_8_0+xml, ' +
+  'application/vnd.sap.bw.modeling.variable-v1_9_0+xml, ' +
+  'application/vnd.sap.bw.modeling.variable-v1_10_0+xml';
+
+/**
+ * Accept header for variable GETs: the discovery-advertised variable media type
+ * first (so systems on a higher or lower SP level negotiate correctly), with the
+ * static version range kept as a fallback.
+ */
+export function variableAccept(): string {
+  const discovered = MEDIA_TYPES['variable'];
+  return discovered ? `${discovered}, ${VARIABLE_ACCEPT}` : VARIABLE_ACCEPT;
+}
+
+// Fallback version ranges for the CKF and RKF resources (each has its own media
+// type). Kept here alongside the other Accept helpers so the query read and
+// write tools negotiate these components consistently.
+const CKF_ACCEPT =
+  'application/vnd.sap.bw.modeling.ckf-v1_8_0+xml, ' +
+  'application/vnd.sap.bw.modeling.ckf-v1_9_0+xml, ' +
+  'application/vnd.sap.bw.modeling.ckf-v1_10_0+xml';
+
+const RKF_ACCEPT =
+  'application/vnd.sap.bw.modeling.rkf-v1_8_0+xml, ' +
+  'application/vnd.sap.bw.modeling.rkf-v1_9_0+xml, ' +
+  'application/vnd.sap.bw.modeling.rkf-v1_10_0+xml';
+
+/** Accept header for CKF GETs: discovery-advertised media type first, static range as fallback. */
+export function ckfAccept(): string {
+  const discovered = MEDIA_TYPES['ckf'];
+  return discovered ? `${discovered}, ${CKF_ACCEPT}` : CKF_ACCEPT;
+}
+
+/** Accept header for RKF GETs: discovery-advertised media type first, static range as fallback. */
+export function rkfAccept(): string {
+  const discovered = MEDIA_TYPES['rkf'];
+  return discovered ? `${discovered}, ${RKF_ACCEPT}` : RKF_ACCEPT;
+}
+
+/**
+ * Media type for query write requests (create POST body / update PUT). Prefers
+ * the version the backend advertises via discovery so systems that negotiate a
+ * lower query version do not reject the write with HTTP 415; falls back to the
+ * static v1_11_0 media type when discovery carries no query entry.
+ */
+export function queryWriteMediaType(): string {
+  return MEDIA_TYPES['query'] ?? QUERY_V11;
 }
 
 function ensureArray(val: unknown): unknown[] {
@@ -277,8 +339,26 @@ function renderQueryText(q: Record<string, unknown>): string {
     lines.push('');
     lines.push('── Filter ──');
     for (const f of filter as Record<string, unknown>[]) {
-      const selections = f['selections'] as unknown[] ?? [];
-      lines.push(`  ${s(f['infoObject'])}: ${JSON.stringify(selections)}`);
+      const parts: string[] = [];
+      const fixedValues = (f['fixedValues'] as Record<string, unknown>[] | undefined) ?? [];
+      for (const fv of fixedValues) {
+        const prefix = fv['exclude'] === true ? 'exclude ' : '';
+        const lowDesc = fv['valueDesc'] ? ` (${s(fv['valueDesc'])})` : '';
+        let valueText: string;
+        if (fv['highValue'] !== undefined) {
+          const highDesc = fv['highValueDesc'] ? ` (${s(fv['highValueDesc'])})` : '';
+          valueText = `${s(fv['value'])}${lowDesc} .. ${s(fv['highValue'])}${highDesc}`;
+        } else {
+          valueText = `${s(fv['value'])}${lowDesc}`;
+        }
+        parts.push(`${prefix}${s(fv['operator'])} ${valueText}`);
+      }
+      const variable = f['variable'] as Record<string, unknown> | undefined;
+      if (variable) {
+        const varDesc = variable['description'] ? ` (${s(variable['description'])})` : '';
+        parts.push(`variable ${s(variable['technicalName'])}${varDesc}`);
+      }
+      lines.push(`  ${s(f['infoObject'])}: ${parts.length > 0 ? parts.join(', ') : '(no restriction)'}`);
     }
   }
 
@@ -286,19 +366,28 @@ function renderQueryText(q: Record<string, unknown>): string {
   const columns = q['columns'] as unknown[] ?? [];
   const free = q['freeCharacteristics'] as unknown[] ?? [];
 
+  // Label for a layout element: technical name → InfoObject name → description →
+  // "1KYFNM structure" (a key figure CustomDimension often carries none of the first three).
+  const dimLabel = (d: Record<string, unknown>) => {
+    if (d['technicalName']) return String(d['technicalName']);
+    if (d['infoObjectName']) return String(d['infoObjectName']);
+    if (d['description']) return String(d['description']);
+    return '1KYFNM structure';
+  };
+
   lines.push('');
   lines.push('── Layout ──');
   lines.push(`  ROWS (${rows.length}):`);
   for (const r of rows as Record<string, unknown>[]) {
-    lines.push(`    ${s(r['technicalName'] ?? r['infoObjectName'])}  ${s(r['description'])}  [${s(r['type'])}]`);
+    lines.push(`    ${dimLabel(r)}  ${s(r['description'])}  [${s(r['type'])}]`);
   }
   lines.push(`  COLUMNS (${columns.length}):`);
   for (const c of columns as Record<string, unknown>[]) {
-    lines.push(`    ${s(c['technicalName'] ?? c['infoObjectName'])}  ${s(c['description'])}  [${s(c['type'])}]`);
+    lines.push(`    ${dimLabel(c)}  ${s(c['description'])}  [${s(c['type'])}]`);
   }
   lines.push(`  FREE (${free.length}):`);
   for (const f of free as Record<string, unknown>[]) {
-    lines.push(`    ${s(f['technicalName'] ?? f['infoObjectName'])}  ${s(f['description'])}  [${s(f['type'])}]`);
+    lines.push(`    ${dimLabel(f)}  ${s(f['description'])}  [${s(f['type'])}]`);
   }
 
   const ckfs = q['calculatedMeasures'] as unknown[] ?? [];
@@ -500,6 +589,12 @@ export async function bwGetQuery(queryName: string, format: 'text' | 'raw' = 'te
         };
         const fromValueDesc = t['@_fromValueDesc'] as string | undefined;
         if (fromValueDesc) fv['valueDesc'] = fromValueDesc;
+        const toValue = t['Qry:toValue'] as Record<string, unknown> | undefined;
+        if (toValue) {
+          fv['highValue'] = (toValue['Qry:value'] as string) ?? '';
+          const toValueDesc = t['@_toValueDesc'] as string | undefined;
+          if (toValueDesc) fv['highValueDesc'] = toValueDesc;
+        }
         return fv;
       });
 
@@ -678,4 +773,201 @@ export async function bwGetQuery(queryName: string, format: 'text' | 'raw' = 'te
 
   if (format === 'raw') return JSON.stringify(output, null, 2);
   return renderQueryText(output);
+}
+
+/** Escape a string for use in an XML attribute value or text node. */
+function escapeXml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+export interface CreateQueryArgs {
+  query_name: string;
+  infoprovider: string;
+  description?: string;
+}
+
+/**
+ * bw_create_query — create a new, empty, consistent BW Query (TLOGO ELEM) on an
+ * InfoProvider in package $TMP.
+ *
+ * Wire protocol per payloads/query_create.md:
+ * 1. GET iprovexists           → validate the InfoProvider
+ * 2. GET queryint compexist    → name check + server-generated ELEMUID
+ * 3. POST comp/enq action=lock → lockHandle (activity_context CREA)
+ * 4. POST query/{name}/a       → create (fresh client, session isolation)
+ * 5. GET query/{name}/a        → verify persistence
+ * 6. POST comp/enq action=unlock
+ *
+ * Only package $TMP is supported; transportable packages are a documented open
+ * point (see payloads/query_create.md) and are not implemented.
+ */
+export async function bwCreateQuery(
+  client: BwClient,
+  args: CreateQueryArgs
+): Promise<string> {
+  const nameUpper = args.query_name.toUpperCase();
+  const nameLower = args.query_name.toLowerCase();
+  const iprovUpper = args.infoprovider.toUpperCase();
+  const description = args.description ?? args.query_name;
+
+  // Step 1: Validate the InfoProvider.
+  const iprovResult = await client.rawGet(
+    `/sap/bw/modeling/comp/iprovexists?iprov=${encodeURIComponent(iprovUpper)}`,
+    { 'bwmt-level': '50' });
+  if (iprovResult.headers['exists'] !== 'true') {
+    throw new Error(`InfoProvider '${iprovUpper}' does not exist.`);
+  }
+  const infoproviderTlogo = iprovResult.headers['tlogo'] ?? '';
+  const infoarea = iprovResult.headers['infoarea'] ?? '';
+
+  // Step 2: Name check + server-side UID generation.
+  const existResult = await client.rawGet(
+    `/sap/bw/modeling/queryint?action=compexist&compid=${nameLower}&type=ELEM`,
+    { 'bwmt-level': '50' });
+  if (existResult.headers['compexist'] === 'true') {
+    throw new Error(`A component named '${nameUpper}' already exists.`);
+  }
+  const elemuid = existResult.headers['elemuid'];
+  if (!elemuid) {
+    throw new Error(`compexist did not return an ELEMUID header. Headers: ${JSON.stringify(existResult.headers)}`);
+  }
+
+  // Step 3: Lock (CREA) on the primary client — the enqueue endpoint differs
+  // from the generic /{type}/{name} lock, so client.lock() cannot be reused.
+  const csrfToken = await client.getCsrfToken();
+  const lockResponse = await client.rawPost(
+    `/sap/bw/modeling/comp/enq/${nameLower}?action=lock&compuid=${elemuid}`,
+    '',
+    {
+      'activity_context': 'CREA',
+      'Accept': QUERY_ACCEPT_LIST,
+      'bwmt-level': '50',
+      'x-csrf-token': csrfToken,
+    });
+  const lockHandleMatch = lockResponse.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/);
+  if (!lockHandleMatch) {
+    throw new Error(`No <LOCK_HANDLE> in lock response:\n${lockResponse.body}`);
+  }
+  const lockHandle = lockHandleMatch[1];
+
+  // Helper: unlock on the primary client's enqueue session, tolerating failures.
+  const unlock = async () => {
+    await client.rawPost(
+      `/sap/bw/modeling/comp/enq/${nameLower}?action=unlock&compuid=${elemuid}`,
+      '',
+      { 'bwmt-level': '50', 'x-csrf-token': await client.getCsrfToken() });
+  };
+
+  try {
+    // Step 4: Build the create XML (see payloads/query_create.md).
+    const language     = process.env.BW_LANGUAGE ?? 'DE';
+    const masterSystem = new URL(process.env.BW_URL ?? 'http://localhost').hostname.split('.')[0].toUpperCase();
+    const responsible  = (process.env.BW_USER ?? '').toUpperCase();
+    const timestamp    = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+    const descEsc      = escapeXml(description);
+
+    const xmlBody = `<?xml version="1.0" encoding="UTF-8"?>
+<Qry:queryResource xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:Qry="http://www.sap.com/bw/Query.ecore" xmlns:adtcore="http://www.sap.com/adt/core">
+  <Qry:schemaVersion>1.0</Qry:schemaVersion>
+  <Qry:mainComponent xsi:type="Qry:Query" id="${elemuid}" componentVersion="110" providerName="${iprovUpper}" reusable="true" technicalName="${nameUpper}" sheetId="!VIRTUAL-003">
+    <Qry:description default="false" value="${descEsc}"/>
+    <Qry:entityProperties adtcore:changedAt="${timestamp}" adtcore:changedBy="${responsible}" adtcore:createdAt="${timestamp}" adtcore:createdBy="${responsible}" adtcore:description="${descEsc}" adtcore:language="${language}" adtcore:name="${nameUpper}" adtcore:type="ELEM" adtcore:masterLanguage="${language}" adtcore:masterSystem="${masterSystem}" adtcore:responsible="${responsible}">
+      <adtcore:packageRef adtcore:packageName="$TMP" adtcore:type="ELEM"/>
+    </Qry:entityProperties>
+    <Qry:priorities>
+      <Qry:scaling/>
+      <Qry:decimals/>
+      <Qry:convTarget/>
+      <Qry:currencyType/>
+      <Qry:signInversion/>
+      <Qry:emphasize/>
+      <Qry:formulaCollision/>
+      <Qry:singleValuesAs/>
+      <Qry:showCumulated/>
+      <Qry:localAggregation/>
+      <Qry:inputMode/>
+      <Qry:unitType/>
+      <Qry:disaggregation/>
+    </Qry:priorities>
+    <Qry:resultPosition/>
+    <Qry:uniDispHierRows/>
+    <Qry:uniDispHierCols/>
+    <Qry:filter id="!VIRTUAL-001"/>
+  </Qry:mainComponent>
+</Qry:queryResource>`;
+
+    // Step 5: Create POST on a fresh client (session isolation from the lock).
+    const client2 = createClientFromEnv();
+    const csrf2 = await client2.getCsrfToken();
+    const createResponse = await client2.rawPost(
+      `/sap/bw/modeling/query/${nameLower}/a?compuid=${elemuid}&lockHandle=${lockHandle}`,
+      xmlBody,
+      {
+        'Development-Class': '$TMP',
+        'ELEMUID': elemuid,
+        'Content-Type': `application/xml, ${queryWriteMediaType()}`,
+        'Accept': queryAccept(),
+        'bwmt-level': '50',
+        'x-csrf-token': csrf2,
+      });
+
+    // Step 6: Parse the atom feed check result. Only messageType "Error" is a
+    // failure; "Information" and "Warning" mean success.
+    const checkMessages: string[] = [];
+    const errorTitles: string[] = [];
+    const entryRegex = /<atom:entry>([\s\S]*?)<\/atom:entry>/g;
+    let entryMatch: RegExpExecArray | null;
+    while ((entryMatch = entryRegex.exec(createResponse.body)) !== null) {
+      const entry = entryMatch[1];
+      const messageType = entry.match(/messageType="([^"]*)"/)?.[1] ?? '';
+      const title = entry.match(/<atom:title>([\s\S]*?)<\/atom:title>/)?.[1]?.trim() ?? '';
+      if (title) checkMessages.push(title);
+      if (messageType === 'Error') errorTitles.push(title || '(no title)');
+    }
+    if (errorTitles.length > 0) {
+      throw new Error(`Query creation reported errors: ${errorTitles.join('; ')}`);
+    }
+
+    // Step 7: Verify persistence with a GET (same Accept header as bwGetQuery).
+    try {
+      await client.get(`/sap/bw/modeling/query/${nameLower}/a`, queryAccept());
+    } catch (verifyErr) {
+      throw new Error(
+        `Query '${nameUpper}' was not persisted after creation ` +
+        `(GET /sap/bw/modeling/query/${nameLower}/a failed): ${verifyErr}`
+      );
+    }
+
+    // Step 8: Unlock.
+    try {
+      await unlock();
+    } catch (unlockErr) {
+      process.stderr.write(`Warning: failed to unlock query/${nameLower} after creation: ${unlockErr}\n`);
+    }
+
+    return JSON.stringify({
+      success: true,
+      query_name: nameUpper,
+      infoprovider: iprovUpper,
+      infoprovider_tlogo: infoproviderTlogo,
+      infoarea,
+      elemuid,
+      check_messages: checkMessages,
+      message:
+        `Query '${nameUpper}' created empty and consistent on InfoProvider '${iprovUpper}' ` +
+        `in package $TMP. It has no rows, columns, or key figures yet.`,
+    });
+  } catch (err) {
+    // The lock was acquired; attempt to release it before rethrowing.
+    try {
+      await unlock();
+    } catch (unlockErr) {
+      process.stderr.write(`Warning: failed to unlock query/${nameLower} after error: ${unlockErr}\n`);
+    }
+    throw err;
+  }
 }

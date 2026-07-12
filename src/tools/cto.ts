@@ -32,8 +32,11 @@ function buildTransportName(typeUpper: string, nameUpper: string, sourceSystemUp
  * bw_change_package — reassign an object to a package and record it on a transport.
  * Endpoint, body and response shape: see payloads/change_package.md.
  *
- * Does not lock and does not activate. After a successful write the object is inactive
- * and must be re-activated with bw_activate (passing the same transport).
+ * Does not lock, does not activate, and does not change the object version. This is a pure
+ * TADIR/transport assignment (operation="I"): the object stays in its current state (an
+ * active object remains active), so no re-activation is required. Verified for ADSO, TRFN
+ * and DTPA. Re-activating a TRFN here would be not just unnecessary but risky — an
+ * activation with a stale lock can regenerate the AMDP method body.
  */
 export async function bwChangePackage(
   client: BwClient,
@@ -68,11 +71,12 @@ export async function bwChangePackage(
   }
   params.set('package', args.package);
   params.set('simulate', 'false');
+  params.set('allmsgs', 'true');
 
   const path = `/sap/bw/modeling/cto/write?${params.toString()}`;
 
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<bwCTO:transport xmlns:bwCTO="http://www.sap.com/bw/cto"><objects><object name="${transportName}" isTransportName="true" type="${typeUpper}" pgmid="R3TR" operation="I" genflag=""></object></objects></bwCTO:transport>`;
+<bwCTO:transport xmlns:bwCTO="http://www.sap.com/bw/cto"><objects><object name="${transportName}" altName="${nameUpper}" isTransportName="true" type="${typeUpper}" pgmid="R3TR" operation="I" genflag=""></object></objects></bwCTO:transport>`;
 
   const response = await client.postRaw(path, xml, CTO_MEDIA_TYPE);
 
@@ -80,12 +84,13 @@ export async function bwChangePackage(
   const writeResult = writeResultMatch ? writeResultMatch[1] : '';
   const writeOk = writeResult === 'S';
 
-  const messages: string[] = [];
-  const msgRegex = /<message[^>]*>([^<]+)<\/message>/g;
-  let match: RegExpExecArray | null;
-  while ((match = msgRegex.exec(response)) !== null) {
-    if (match[1].trim()) messages.push(match[1].trim());
+  const messages: Array<{ text: string; type: string }> = [];
+  const msgRegex = /<message\b[^>]*\btxt="([^"]*)"[^>]*\btype="([^"]*)"[^>]*\/?>/g;
+  let mm: RegExpExecArray | null;
+  while ((mm = msgRegex.exec(response)) !== null) {
+    messages.push({ text: mm[1], type: mm[2] });
   }
+  const hasErrorMessage = messages.some((m) => m.type === 'E');
 
   // writeResult="S" alone is not proof the package was applied to the real object:
   // a wrong key (notably a mis-built RSDS key) produces an orphan TADIR entry that
@@ -106,7 +111,7 @@ export async function bwChangePackage(
     }
   }
 
-  const success = writeOk && resolved !== false;
+  const success = writeOk && !hasErrorMessage && resolved !== false;
 
   const result: Record<string, unknown> = {
     success,
@@ -137,8 +142,104 @@ export async function bwChangePackage(
       result['verified_package'] = verifiedPackage;
     }
     result['next_step'] =
-      'Object is now inactive. Re-activate it with bw_activate, passing the same transport.';
+      'Object remains active — a package/transport reassignment does not change the object ' +
+      'version, so no re-activation is required. Do not re-activate a TRFN here: an ' +
+      'activation with a stale lock can regenerate the AMDP method body.';
   }
 
   return JSON.stringify(result, null, 2);
+}
+
+export interface ListChangeableTransportsArgs {
+  ownOnly: boolean;
+  modifiableOnly: boolean;
+  includeObjects: boolean;
+}
+
+function ctoAttr(attrs: string, name: string): string {
+  return attrs.match(new RegExp(`\\b${name}="([^"]*)"`))?.[1] ?? '';
+}
+
+/**
+ * bw_list_changeable_transports — list transport requests via cto/check.
+ * Endpoint, query params and response shape: see payloads/list_changeable_transports.md.
+ */
+export async function bwListChangeableTransports(
+  client: BwClient,
+  args: ListChangeableTransportsArgs
+): Promise<string> {
+  const path =
+    `/sap/bw/modeling/cto/check?rddetails=all&rdprops=true` +
+    `&ownonly=${args.ownOnly ? 'true' : 'false'}&allmsgs=true`;
+
+  const { body } = await client.rawGet(path, { Accept: CTO_MEDIA_TYPE });
+
+  // System changeability flags.
+  const properties: Record<string, string> = {};
+  const propRe = /<property\b([^>]*)\/>/g;
+  let pm: RegExpExecArray | null;
+  while ((pm = propRe.exec(body)) !== null) {
+    const n = ctoAttr(pm[1], 'name');
+    if (n) properties[n] = ctoAttr(pm[1], 'value');
+  }
+
+  // Requests, each with nested tasks and (optionally) objects.
+  const requests: Array<Record<string, unknown>> = [];
+  const reqRe = /<request\b([^>]*?)(?:\/>|>([\s\S]*?)<\/request>)/g;
+  let rm: RegExpExecArray | null;
+  while ((rm = reqRe.exec(body)) !== null) {
+    const reqAttrs = rm[1];
+    const reqInner = rm[2] ?? '';
+    const status = ctoAttr(reqAttrs, 'status');
+    if (args.modifiableOnly && status !== 'D') continue;
+
+    const tasks: Array<Record<string, unknown>> = [];
+    const taskRe = /<task\b([^>]*?)(?:\/>|>([\s\S]*?)<\/task>)/g;
+    let tm: RegExpExecArray | null;
+    while ((tm = taskRe.exec(reqInner)) !== null) {
+      const taskAttrs = tm[1];
+      const taskInner = tm[2] ?? '';
+      const task: Record<string, unknown> = {
+        corrnum: ctoAttr(taskAttrs, 'corrnum'),
+        owner: ctoAttr(taskAttrs, 'user'),
+        function: ctoAttr(taskAttrs, 'function'),
+        status: ctoAttr(taskAttrs, 'status'),
+      };
+      if (args.includeObjects) {
+        const objects: Array<Record<string, unknown>> = [];
+        const objRe = /<object\b([^>]*)\/>/g;
+        let om: RegExpExecArray | null;
+        while ((om = objRe.exec(taskInner)) !== null) {
+          objects.push({
+            pgmid: ctoAttr(om[1], 'pgmid'),
+            type: ctoAttr(om[1], 'type'),
+            name: ctoAttr(om[1], 'name'),
+            locked: ctoAttr(om[1], 'locked') === 'true',
+          });
+        }
+        task['objects'] = objects;
+      }
+      tasks.push(task);
+    }
+
+    requests.push({
+      corrnum: ctoAttr(reqAttrs, 'corrnum'),
+      text: ctoAttr(reqAttrs, 'txt'),
+      owner: ctoAttr(reqAttrs, 'user'),
+      function: ctoAttr(reqAttrs, 'function'),
+      status,
+      status_label: status === 'D' ? 'modifiable' : status === 'R' ? 'released' : status,
+      target: ctoAttr(reqAttrs, 'target'),
+      date: ctoAttr(reqAttrs, 'date'),
+      time: ctoAttr(reqAttrs, 'time'),
+      tasks,
+    });
+  }
+
+  return JSON.stringify({
+    transports_changeable: properties['transportsChangeable'] === 'true',
+    bw_changeable: properties['bwChangeable'] === 'true',
+    count: requests.length,
+    requests,
+  }, null, 2);
 }
