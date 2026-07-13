@@ -1,11 +1,6 @@
 import { XMLParser } from 'fast-xml-parser';
 import { BwClient } from '../bw-client.js';
-import { ckfAccept, rkfAccept } from './query.js';
-
-const STRUCTURE_ACCEPT = [
-  'application/vnd.sap.bw.modeling.structure-v1_8_0+xml',
-  'application/vnd.sap.bw.modeling.structure-v1_9_0+xml',
-].join(',');
+import { ckfAccept, rkfAccept, structureAccept } from './query.js';
 
 // ── XML Parser ───────────────────────────────────────────────────────────────
 
@@ -389,7 +384,7 @@ function parseMember(
 
 export async function bwGetStructure(client: BwClient, componentName: string): Promise<string> {
   const path = `/sap/bw/modeling/structure/${componentName.toLowerCase()}/a`;
-  const { body } = await client.get(path, STRUCTURE_ACCEPT);
+  const { body } = await client.get(path, structureAccept());
 
   const parser = makeParser();
   const parsed = parser.parse(body);

@@ -1,5 +1,5 @@
 import { BwClient, createClientFromEnv } from '../bw-client.js';
-import { QUERY_ACCEPT_LIST, queryAccept, queryWriteMediaType, variableAccept, ckfAccept, rkfAccept } from './query.js';
+import { QUERY_ACCEPT_LIST, queryAccept, queryWriteMediaType, variableAccept, ckfAccept, rkfAccept, structureAccept } from './query.js';
 
 /**
  * Query update tools (bw_update_query_layout, bw_update_query_filter).
@@ -269,6 +269,14 @@ function setFirstCustomDimension(doc: string, id: string): string {
   return doc.slice(0, start) + newOpenTag + doc.slice(openEnd + 1);
 }
 
+/** True if the mainComponent open tag already carries a firstCustomDimension attribute. */
+function mainComponentHasFirstCustomDimension(doc: string): boolean {
+  const start = doc.indexOf('<Qry:mainComponent');
+  if (start < 0) return false;
+  const openTag = doc.slice(start, doc.indexOf('>', start) + 1);
+  return openTag.includes('firstCustomDimension=');
+}
+
 /**
  * Locate the key figure structure (CustomDimension on 1KYFNM) in rows or columns,
  * scoped to the mainComponent region. These containers never nest, so a lazy
@@ -296,6 +304,63 @@ function findKeyFigureStructure(
     }
   }
   return null;
+}
+
+/**
+ * Locate a rows/columns container element by its structure id (scoped to the
+ * mainComponent region). Used to guard against inserting the same reusable
+ * structure twice. Containers never nest.
+ */
+function findContainerByStructureId(doc: string, id: string): boolean {
+  const region = locateMainComponentRegion(doc, 'structure id lookup');
+  const sub = doc.slice(region.start, region.end);
+  const re = /<Qry:(rows|columns)\b[^>]*?(\/>|>[\s\S]*?<\/Qry:\1>)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(sub)) !== null) {
+    const openTag = m[0].match(/^<Qry:(?:rows|columns)\b[^>]*?(?:\/?>)/)?.[0] ?? m[0];
+    if (openTag.includes(`id="${id}"`)) return true;
+  }
+  return false;
+}
+
+/**
+ * Locate a reusable structure container (rows/columns whose open tag carries
+ * reusable="true" and the given technical name), scoped to the mainComponent
+ * region. Returns the container element and its structure id.
+ */
+function findReusableStructureContainer(
+  doc: string,
+  techNameUpper: string
+): { container: string; id: string | undefined; element: string; start: number; end: number } | null {
+  const region = locateMainComponentRegion(doc, 'reusable structure lookup');
+  const sub = doc.slice(region.start, region.end);
+  const re = /<Qry:(rows|columns)\b[^>]*?(\/>|>[\s\S]*?<\/Qry:\1>)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(sub)) !== null) {
+    const full = m[0];
+    const openTag = full.match(/^<Qry:(?:rows|columns)\b[^>]*?(?:\/?>)/)?.[0] ?? full;
+    if (openTag.includes('reusable="true"') && openTag.includes(`technicalName="${techNameUpper}"`)) {
+      return {
+        container: m[1],
+        id: openTag.match(/\bid="([^"]+)"/)?.[1],
+        element: full,
+        start: region.start + m.index,
+        end: region.start + m.index + full.length,
+      };
+    }
+  }
+  return null;
+}
+
+/** Remove firstCustomDimension from the mainComponent open tag when it points at id. */
+function clearFirstCustomDimension(doc: string, id: string): string {
+  const start = doc.indexOf('<Qry:mainComponent');
+  if (start < 0) return doc;
+  const openEnd = doc.indexOf('>', start);
+  const openTag = doc.slice(start, openEnd + 1);
+  if (!openTag.match(new RegExp(`\\bfirstCustomDimension="${escapeRegex(id)}"`))) return doc;
+  const newOpen = openTag.replace(/\s*firstCustomDimension="[^"]*"/, '');
+  return doc.slice(0, start) + newOpen + doc.slice(openEnd + 1);
 }
 
 /** Find the id of a subComponent by its technical name (uppercased). */
@@ -435,10 +500,14 @@ function buildLayoutDimension(container: string, vid: string, iobj: string, desc
 }
 
 export interface LayoutOperation {
-  action: 'add' | 'remove';
-  target: 'rows' | 'columns' | 'free';
-  infoobject: string;
+  action: 'add' | 'remove' | 'add_structure' | 'remove_structure';
+  /** Container for add / add_structure (free only for characteristics). */
+  target?: 'rows' | 'columns' | 'free';
+  /** Characteristic technical name (add / remove). */
+  infoobject?: string;
   description?: string;
+  /** Reusable structure technical name (add_structure / remove_structure). */
+  structure_name?: string;
 }
 
 export interface UpdateQueryLayoutArgs {
@@ -448,8 +517,9 @@ export interface UpdateQueryLayoutArgs {
 
 /**
  * bw_update_query_layout — add or remove characteristics in the rows, columns, or
- * free-characteristics area of an existing BW Query. All operations are applied
- * in one read-modify-write save cycle (one PUT).
+ * free-characteristics area of an existing BW Query, and add or remove references
+ * to reusable structures (a structure is a layout container). All operations are
+ * applied in one read-modify-write save cycle (one PUT).
  */
 export async function bwUpdateQueryLayout(
   client: BwClient,
@@ -459,18 +529,44 @@ export async function bwUpdateQueryLayout(
   if (!Array.isArray(ops) || ops.length === 0) {
     throw new Error('operations must be a non-empty array.');
   }
+  for (const op of ops) {
+    if (op.action === 'add') {
+      if (!op.infoobject) throw new Error('add requires an infoobject.');
+      if (!op.target || !['rows', 'columns', 'free'].includes(op.target)) {
+        throw new Error(`add requires a target of rows, columns, or free.`);
+      }
+    } else if (op.action === 'remove') {
+      if (!op.infoobject) throw new Error('remove requires an infoobject.');
+    } else if (op.action === 'add_structure') {
+      if (!op.structure_name) throw new Error('add_structure requires a structure_name.');
+      if (!op.target || !['rows', 'columns'].includes(op.target)) {
+        throw new Error('add_structure requires a target of rows or columns.');
+      }
+    } else if (op.action === 'remove_structure') {
+      if (!op.structure_name) throw new Error('remove_structure requires a structure_name.');
+    } else {
+      throw new Error(`Invalid action '${op.action}' (expected add, remove, add_structure, or remove_structure).`);
+    }
+  }
+
+  // Resolve every referenced structure up front: the mutate callback is synchronous
+  // but structure resolution needs HTTP GETs. Each distinct structure is fetched once.
+  const resolvedStructures = new Map<string, ResolvedStructure>();
+  for (const op of ops) {
+    if (op.action === 'add_structure') {
+      const key = `${op.target}:${op.structure_name!.toLowerCase()}`;
+      if (!resolvedStructures.has(key)) {
+        resolvedStructures.set(key, await resolveStructure(client, op.structure_name!, op.target as 'rows' | 'columns'));
+      }
+    }
+  }
 
   const summary: string[] = [];
   const mutate = (xml: string): string => {
     let doc = xml;
     for (const op of ops) {
-      const iobj = (op.infoobject ?? '').toUpperCase();
-      if (!iobj) throw new Error('Each operation requires an infoobject.');
-
       if (op.action === 'add') {
-        if (!['rows', 'columns', 'free'].includes(op.target)) {
-          throw new Error(`Invalid target '${op.target}' for add (expected rows, columns, or free).`);
-        }
+        const iobj = op.infoobject!.toUpperCase();
         if (matchDimensionElement(doc, iobj)) {
           throw new Error(
             `InfoObject '${iobj}' is already present in the query layout (rows/columns/free).`
@@ -478,13 +574,14 @@ export async function bwUpdateQueryLayout(
         }
         const descEsc = escapeXml(op.description ?? iobj);
         const vid = allocateVirtualId(doc);
-        const dimFragment = buildLayoutDimension(op.target, vid, iobj, descEsc, op.description !== undefined);
+        const dimFragment = buildLayoutDimension(op.target!, vid, iobj, descEsc, op.description !== undefined);
         doc = spliceBefore(doc, '<Qry:runtimeProperties', dimFragment, 'layout add: dimension insertion point');
         const selFragment =
           `<Qry:selections xsi:type="Qry:StandardFilterSelection" dimension="${vid}" infoObject="${iobj}" usageType="asStartValue"/>`;
         doc = insertIntoFilter(doc, selFragment, 'layout add: filter bookkeeping entry');
         summary.push(`add ${iobj} to ${op.target}`);
       } else if (op.action === 'remove') {
+        const iobj = op.infoobject!.toUpperCase();
         const dim = matchDimensionElement(doc, iobj);
         if (!dim) {
           throw new Error(`InfoObject '${iobj}' is not present in the query layout (rows/columns/free).`);
@@ -497,8 +594,80 @@ export async function bwUpdateQueryLayout(
           );
         }
         summary.push(`remove ${iobj} from ${dim.container}`);
-      } else {
-        throw new Error(`Invalid action '${op.action}' (expected add or remove).`);
+      } else if (op.action === 'add_structure') {
+        const resolved = resolvedStructures.get(`${op.target}:${op.structure_name!.toLowerCase()}`)!;
+        if (findContainerByStructureId(doc, resolved.structureId)) {
+          throw new Error(`Structure '${resolved.technicalName}' is already present in the query layout.`);
+        }
+        const isKeyFigureStructure = resolved.infoObjectName === '1KYFNM';
+        if (isKeyFigureStructure && findKeyFigureStructure(doc)) {
+          throw new Error(
+            `The query already has a key figure structure (1KYFNM); it can carry at most one. ` +
+            `Remove the existing one before adding '${resolved.technicalName}'.`
+          );
+        }
+        // Carry the structure's referenced CKFs/RKFs into the document (dedup by id).
+        for (const extra of resolved.extraSubComponents) {
+          if (!hasSubComponentId(doc, extra.id)) {
+            doc = insertSubComponent(doc, extra.xml);
+          }
+        }
+        // Insert the container element (keeps the structure's own identity).
+        doc = spliceBefore(doc, '<Qry:runtimeProperties', resolved.containerXml, 'add_structure: container insertion');
+        if (isKeyFigureStructure && !mainComponentHasFirstCustomDimension(doc)) {
+          doc = setFirstCustomDimension(doc, resolved.structureId);
+          const selFragment =
+            `<Qry:selections xsi:type="Qry:StandardFilterSelection" dimension="${resolved.structureId}" infoObject="1KYFNM" usageType="asStartValue"/>`;
+          doc = insertIntoFilter(doc, selFragment, 'add_structure: key figure bookkeeping entry');
+        }
+        summary.push(`add structure ${resolved.technicalName} to ${op.target}`);
+      } else if (op.action === 'remove_structure') {
+        const nameUpper = op.structure_name!.toUpperCase();
+        const struct = findReusableStructureContainer(doc, nameUpper);
+        if (!struct) {
+          throw new Error(`Reusable structure '${nameUpper}' is not present in the query layout.`);
+        }
+        // Refuse if any remaining formula operand references one of the structure's members.
+        const memberIds = new Set<string>();
+        const idRe = /<Qry:(?:members|childMembers)\b[^>]*?\bid="([^"]+)"/g;
+        let im: RegExpExecArray | null;
+        while ((im = idRe.exec(struct.element)) !== null) memberIds.add(im[1]);
+        const rest = doc.slice(0, struct.start) + doc.slice(struct.end);
+        const referencedBy = [...memberIds].filter((id) => new RegExp(`\\bmember="${escapeRegex(id)}"`).test(rest));
+        if (referencedBy.length > 0) {
+          throw new Error(
+            `Cannot remove structure '${nameUpper}': its members are referenced by remaining formula ` +
+            `operands (member ids: ${referencedBy.join(', ')}). Remove those formulas first.`
+          );
+        }
+        // Collect the CKF/RKF component ids the structure referenced, for cleanup:
+        // the SelectionTokenForComponent tokens (component="…") and every CINLink
+        // defaultHint value (order-independent — the GET form lists value before type).
+        const refIds = new Set<string>();
+        for (const cm of struct.element.matchAll(/\bcomponent="([^"]+)"/g)) refIds.add(cm[1]);
+        for (const dh of struct.element.matchAll(/<Qry:defaultHint>[\s\S]*?<\/Qry:defaultHint>/g)) {
+          if (dh[0].includes('<Qry:type>CINLink</Qry:type>')) {
+            const v = dh[0].match(/<Qry:value>([^<]+)<\/Qry:value>/)?.[1];
+            if (v) refIds.add(v);
+          }
+        }
+        // Remove the container, its bookkeeping selection, and firstCustomDimension.
+        doc = doc.slice(0, struct.start) + doc.slice(struct.end);
+        if (struct.id) {
+          doc = removeFilterSelectionsMatching(
+            doc,
+            (ot) => ot.includes(`dimension="${struct.id}"`) && ot.includes('usageType="asStartValue"')
+          );
+          doc = clearFirstCustomDimension(doc, struct.id);
+        }
+        // Drop now-unreferenced subComponents.
+        for (const id of refIds) {
+          const stillUsed =
+            new RegExp(`\\bcomponent="${escapeRegex(id)}"`).test(doc) ||
+            doc.includes(`<Qry:value>${id}</Qry:value>`);
+          if (!stillUsed) doc = removeSubComponentById(doc, id);
+        }
+        summary.push(`remove structure ${nameUpper} from ${struct.container}`);
       }
     }
     return doc;
@@ -1299,6 +1468,69 @@ async function resolveComponent(
   return { componentId, description, subComponentXml, extraSubComponents };
 }
 
+interface ResolvedStructure {
+  structureId: string;
+  infoObjectName: string;
+  technicalName: string;
+  /** The structure's mainComponent renamed to the target container element. */
+  containerXml: string;
+  extraSubComponents: { id: string; xml: string }[];
+}
+
+/**
+ * Resolve a reusable structure into a container element (rows/columns) that keeps
+ * the structure's own identity, plus its referenced CKFs/RKFs as subComponents.
+ * See payloads/query_edit_delta2_variables_structures_ranges.md §2: the structure
+ * GET returns a Qry:queryResource whose mainComponent (xsi:type Qry:CustomDimension)
+ * maps 1:1 into the container — nothing is renumbered, no !VIRTUAL ids. If that
+ * shape does not hold we stop rather than guess.
+ */
+async function resolveStructure(
+  client: BwClient,
+  structureName: string,
+  target: 'rows' | 'columns'
+): Promise<ResolvedStructure> {
+  const nameLower = structureName.toLowerCase();
+  const nameUpper = structureName.toUpperCase();
+
+  const { body } = await client.get(`/sap/bw/modeling/structure/${nameLower}/a`, structureAccept());
+
+  const mainMatch = body.match(/<Qry:mainComponent\b[^>]*?(\/>|>[\s\S]*?<\/Qry:mainComponent>)/);
+  const rootTag = body.match(/<([\w:]+)[\s>]/)?.[1] ?? '(unknown root)';
+  const mainElement = mainMatch?.[0] ?? '';
+  const openTag = mainElement.match(/^<Qry:mainComponent\b[^>]*?(?:\/?>)/)?.[0] ?? '';
+  if (!mainMatch || !openTag.includes('xsi:type="Qry:CustomDimension"')) {
+    throw new Error(
+      `GET /sap/bw/modeling/structure/${nameLower}/a did not return a mainComponent with ` +
+      `xsi:type="Qry:CustomDimension" (response root element: <${rootTag}>). Stopping instead of guessing.`
+    );
+  }
+
+  const structureId = openTag.match(/\bid="([^"]+)"/)?.[1];
+  if (!structureId) {
+    throw new Error(`Could not determine the structure id for '${nameUpper}'.`);
+  }
+  const infoObjectName = openTag.match(/\binfoObjectName="([^"]+)"/)?.[1] ?? '';
+
+  // Rename mainComponent -> the target container element, keeping every attribute
+  // and child (the structure's full identity and member tree) verbatim.
+  const containerXml = mainElement
+    .replace(/^<Qry:mainComponent\b/, `<Qry:${target}`)
+    .replace(/<\/Qry:mainComponent>$/, `</Qry:${target}>`);
+
+  const extraSubComponents: { id: string; xml: string }[] = [];
+  const scRe = /<Qry:subComponents\b[^>]*?(\/>|>[\s\S]*?<\/Qry:subComponents>)/g;
+  let m: RegExpExecArray | null;
+  while ((m = scRe.exec(body)) !== null) {
+    const full = m[0];
+    const scOpen = full.match(/^<Qry:subComponents\b[^>]*?(?:\/?>)/)?.[0] ?? full;
+    const id = scOpen.match(/\bid="([^"]+)"/)?.[1];
+    if (id) extraSubComponents.push({ id, xml: full });
+  }
+
+  return { structureId, infoObjectName, technicalName: nameUpper, containerXml, extraSubComponents };
+}
+
 /**
  * bw_update_query_key_figures — manage the key figure structure (CustomDimension
  * on 1KYFNM) of an existing BW Query: add basic key figures, add references to
@@ -1306,6 +1538,11 @@ async function resolveComponent(
  * members, set member display properties (decimals, hidden, sign inversion) and
  * exception aggregation, and remove members. All operations are applied in one
  * read-modify-write save cycle (one PUT).
+ *
+ * Member operations target the query's 1KYFNM CustomDimension whether it is a
+ * local structure (built here) or a reusable structure referenced via
+ * bw_update_query_layout add_structure — findKeyFigureStructure matches both
+ * forms (the reusable form only carries extra open-tag attributes).
  */
 export async function bwUpdateQueryKeyFigures(
   client: BwClient,
@@ -1457,6 +1694,220 @@ export async function bwUpdateQueryKeyFigures(
     success: true,
     query_name: args.query_name.toUpperCase(),
     applied_operations: summary,
+    check_messages: messages,
+  });
+}
+
+// ── Query-level settings ─────────────────────────────────────────────────────
+
+export interface HierarchyDisplay {
+  active?: boolean;
+  /** Display level; written two-digit (e.g. 5 → "05"). */
+  level?: number;
+}
+
+export interface DocumentLinks {
+  info_provider?: boolean;
+  master_data?: boolean;
+  meta_data?: boolean;
+}
+
+export interface UpdateQuerySettingsArgs {
+  query_name: string;
+  description?: string;
+  zero_suppression_rows?: boolean;
+  zero_suppression_columns?: boolean;
+  result_position_top?: boolean;
+  result_position_left?: boolean;
+  sign_presentation?: string;
+  suppress_repeated_key_values?: boolean;
+  show_scaling_factor?: boolean;
+  adjust_formatting?: boolean;
+  zero_presentation_kind?: string;
+  zero_presentation_custom_value?: string;
+  hierarchy_display_rows?: HierarchyDisplay;
+  hierarchy_display_columns?: HierarchyDisplay;
+  document_links?: DocumentLinks;
+}
+
+/**
+ * Set attributes on an existing self-closing settings element inside the
+ * mainComponent region (the GET always returns the expanded element forms). Each
+ * attribute is replaced in place, or appended if absent. Errors when the element
+ * itself is missing rather than inventing one.
+ */
+function setSettingElementAttrs(
+  doc: string,
+  tag: string,
+  attrs: Record<string, string>,
+  context: string
+): string {
+  const region = locateMainComponentRegion(doc, context);
+  const sub = doc.slice(region.start, region.end);
+  const m = new RegExp(`<Qry:${tag}\\b[^>]*?/>`).exec(sub);
+  if (!m) {
+    throw new Error(`Setting element <Qry:${tag}/> is missing from the query document (${context}).`);
+  }
+  let element = m[0];
+  for (const [name, value] of Object.entries(attrs)) {
+    const attrRe = new RegExp(`\\s${escapeRegex(name)}="[^"]*"`);
+    const replacement = ` ${name}="${value}"`;
+    element = attrRe.test(element) ? element.replace(attrRe, replacement) : element.replace(/\/>$/, `${replacement}/>`);
+  }
+  const absStart = region.start + m.index;
+  return doc.slice(0, absStart) + element + doc.slice(absStart + m[0].length);
+}
+
+/** Set an attribute on the mainComponent open tag (replace in place, or add if absent). */
+function setMainComponentAttr(doc: string, name: string, value: string): string {
+  const start = doc.indexOf('<Qry:mainComponent');
+  if (start < 0) throw new Error(`Could not locate '<Qry:mainComponent' in the query document (settings).`);
+  const openEnd = doc.indexOf('>', start);
+  let openTag = doc.slice(start, openEnd + 1);
+  const attrRe = new RegExp(`\\s${escapeRegex(name)}="[^"]*"`);
+  const replacement = ` ${name}="${value}"`;
+  openTag = attrRe.test(openTag)
+    ? openTag.replace(attrRe, replacement)
+    : openTag.replace(/^<Qry:mainComponent\b/, `<Qry:mainComponent${replacement}`);
+  return doc.slice(0, start) + openTag + doc.slice(openEnd + 1);
+}
+
+/** Set the entityProperties adtCore:description attribute (replace in place, or add if absent). */
+function setEntityPropertiesDescription(doc: string, descEsc: string): string {
+  const region = locateMainComponentRegion(doc, 'entityProperties description');
+  const sub = doc.slice(region.start, region.end);
+  const m = /<Qry:entityProperties\b[^>]*>/.exec(sub);
+  if (!m) throw new Error('entityProperties element is missing from the query document (settings).');
+  let openTag = m[0];
+  const attrRe = /\sadtCore:description="[^"]*"/;
+  const replacement = ` adtCore:description="${descEsc}"`;
+  openTag = attrRe.test(openTag)
+    ? openTag.replace(attrRe, replacement)
+    : openTag.replace(/^<Qry:entityProperties\b/, `<Qry:entityProperties${replacement}`);
+  const absStart = region.start + m.index;
+  return doc.slice(0, absStart) + openTag + doc.slice(absStart + m[0].length);
+}
+
+/** Replace the query-level Qry:description element and the adtCore:description attribute. */
+function setQueryDescription(doc: string, descEsc: string): string {
+  const region = locateMainComponentRegion(doc, 'query description');
+  const sub = doc.slice(region.start, region.end);
+  const m = /<Qry:description\b[^>]*?(\/>|>[\s\S]*?<\/Qry:description>)/.exec(sub);
+  if (!m) throw new Error('Query description element is missing from the query document (settings).');
+  const newEl = `<Qry:description default="false" value="${descEsc}"/>`;
+  const absStart = region.start + m.index;
+  const out = doc.slice(0, absStart) + newEl + doc.slice(absStart + m[0].length);
+  return setEntityPropertiesDescription(out, descEsc);
+}
+
+/**
+ * bw_update_query_settings — change query-level display and behaviour settings of
+ * an existing BW Query via the shared read-modify-write engine (one PUT). Only the
+ * provided settings are applied; the provider, technical name, and package cannot
+ * be changed.
+ */
+export async function bwUpdateQuerySettings(
+  client: BwClient,
+  args: UpdateQuerySettingsArgs
+): Promise<string> {
+  const settingKeys = Object.keys(args).filter(
+    (k) => k !== 'query_name' && (args as unknown as Record<string, unknown>)[k] !== undefined
+  );
+  if (settingKeys.length === 0) {
+    throw new Error('bw_update_query_settings requires at least one setting to change.');
+  }
+
+  const bool = (b: boolean) => (b ? 'true' : 'false');
+  const applied: string[] = [];
+
+  const applyHierarchy = (doc: string, tag: string, h: HierarchyDisplay, context: string): string => {
+    const attrs: Record<string, string> = {};
+    if (h.active !== undefined) attrs['active'] = bool(h.active);
+    if (h.level !== undefined) {
+      if (!Number.isInteger(h.level) || h.level < 0) throw new Error(`${context}: level must be a non-negative integer.`);
+      attrs['level'] = String(h.level).padStart(2, '0');
+    }
+    if (Object.keys(attrs).length === 0) throw new Error(`${context}: provide active and/or level.`);
+    return setSettingElementAttrs(doc, tag, attrs, context);
+  };
+
+  const mutate = (xml: string): string => {
+    let doc = xml;
+
+    if (args.description !== undefined) {
+      doc = setQueryDescription(doc, escapeXml(args.description));
+      applied.push('description');
+    }
+
+    const zs: Record<string, string> = {};
+    if (args.zero_suppression_rows !== undefined) zs['rows'] = bool(args.zero_suppression_rows);
+    if (args.zero_suppression_columns !== undefined) zs['columns'] = bool(args.zero_suppression_columns);
+    if (Object.keys(zs).length > 0) {
+      doc = setSettingElementAttrs(doc, 'zeroSuppression', zs, 'zero suppression');
+      applied.push('zero_suppression');
+    }
+
+    const rp: Record<string, string> = {};
+    if (args.result_position_top !== undefined) rp['onTop'] = bool(args.result_position_top);
+    if (args.result_position_left !== undefined) rp['onLeft'] = bool(args.result_position_left);
+    if (Object.keys(rp).length > 0) {
+      doc = setSettingElementAttrs(doc, 'resultPosition', rp, 'result position');
+      applied.push('result_position');
+    }
+
+    const zp: Record<string, string> = {};
+    if (args.zero_presentation_kind !== undefined) zp['kind'] = escapeXml(args.zero_presentation_kind);
+    if (args.zero_presentation_custom_value !== undefined) zp['customValue'] = escapeXml(args.zero_presentation_custom_value);
+    if (Object.keys(zp).length > 0) {
+      doc = setSettingElementAttrs(doc, 'zeroPresentation', zp, 'zero presentation');
+      applied.push('zero_presentation');
+    }
+
+    if (args.hierarchy_display_rows) {
+      doc = applyHierarchy(doc, 'uniDispHierRows', args.hierarchy_display_rows, 'hierarchy display rows');
+      applied.push('hierarchy_display_rows');
+    }
+    if (args.hierarchy_display_columns) {
+      doc = applyHierarchy(doc, 'uniDispHierCols', args.hierarchy_display_columns, 'hierarchy display columns');
+      applied.push('hierarchy_display_columns');
+    }
+
+    if (args.document_links) {
+      const dl: Record<string, string> = {};
+      if (args.document_links.info_provider !== undefined) dl['infoProvider'] = bool(args.document_links.info_provider);
+      if (args.document_links.master_data !== undefined) dl['masterData'] = bool(args.document_links.master_data);
+      if (args.document_links.meta_data !== undefined) dl['metaData'] = bool(args.document_links.meta_data);
+      if (Object.keys(dl).length > 0) {
+        doc = setSettingElementAttrs(doc, 'documentLinks', dl, 'document links');
+        applied.push('document_links');
+      }
+    }
+
+    if (args.sign_presentation !== undefined) {
+      doc = setMainComponentAttr(doc, 'signPresentation', escapeXml(args.sign_presentation));
+      applied.push('sign_presentation');
+    }
+    if (args.suppress_repeated_key_values !== undefined) {
+      doc = setMainComponentAttr(doc, 'suppressRepeatedKeyValues', bool(args.suppress_repeated_key_values));
+      applied.push('suppress_repeated_key_values');
+    }
+    if (args.show_scaling_factor !== undefined) {
+      doc = setMainComponentAttr(doc, 'showScalingFactor', bool(args.show_scaling_factor));
+      applied.push('show_scaling_factor');
+    }
+    if (args.adjust_formatting !== undefined) {
+      doc = setMainComponentAttr(doc, 'adjustFormatting', bool(args.adjust_formatting));
+      applied.push('adjust_formatting');
+    }
+
+    return doc;
+  };
+
+  const { messages } = await withQueryDocument(client, args.query_name, mutate);
+  return JSON.stringify({
+    success: true,
+    query_name: args.query_name.toUpperCase(),
+    applied_settings: applied,
     check_messages: messages,
   });
 }

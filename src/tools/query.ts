@@ -73,6 +73,18 @@ export function rkfAccept(): string {
   return discovered ? `${discovered}, ${RKF_ACCEPT}` : RKF_ACCEPT;
 }
 
+// Fallback version range for the reusable structure resource (v1_9_0 is the
+// traced backend type). Kept alongside the other Accept helpers.
+const STRUCTURE_ACCEPT =
+  'application/vnd.sap.bw.modeling.structure-v1_8_0+xml, ' +
+  'application/vnd.sap.bw.modeling.structure-v1_9_0+xml';
+
+/** Accept header for structure GETs: discovery-advertised media type first, static range as fallback. */
+export function structureAccept(): string {
+  const discovered = MEDIA_TYPES['structure'];
+  return discovered ? `${discovered}, ${STRUCTURE_ACCEPT}` : STRUCTURE_ACCEPT;
+}
+
 /**
  * Media type for query write requests (create POST body / update PUT). Prefers
  * the version the backend advertises via discovery so systems that negotiate a

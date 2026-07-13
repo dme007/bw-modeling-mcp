@@ -21,7 +21,7 @@ import { bwChangePackage, bwListChangeableTransports } from './tools/cto.js';
 import { bwCreateInfosource, bwUpdateInfosource, bwGetInfosource, InfosourceField } from './tools/infosource.js';
 import { bwPushData, bwGetPushSchema } from './tools/push.js';
 import { bwGetQuery, bwCreateQuery } from './tools/query.js';
-import { bwUpdateQueryLayout, bwUpdateQueryFilter, bwUpdateQueryKeyFigures, LayoutOperation, FilterOperation, KeyFigureOperation } from './tools/query_update.js';
+import { bwUpdateQueryLayout, bwUpdateQueryFilter, bwUpdateQueryKeyFigures, bwUpdateQuerySettings, LayoutOperation, FilterOperation, KeyFigureOperation, UpdateQuerySettingsArgs } from './tools/query_update.js';
 import { bwGetCompositeProvider } from './tools/composite_provider.js';
 import { bwGetCkf, bwGetRkf, bwGetStructure } from './tools/cp_components.js';
 import { bwListContents } from './tools/repository.js';
@@ -948,15 +948,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'bw_delete',
       description:
-        'Delete a BW object permanently (aDSO, InfoObject, Transformation, DTP, etc.). ' +
+        'Delete a BW object permanently (aDSO, InfoObject, Transformation, DTP, Query, etc.). ' +
         'Sequence: lock (with /m) → DELETE → unlock. No activation needed — deletion is immediate. ' +
+        'Queries (object_type "query", alias "elem") use a dedicated delete sequence; deleting a query ' +
+        'does NOT delete the reusable components (variables, CKFs, RKFs) it references — only the query itself. ' +
         'Dependency note: delete aDSOs before their InfoObjects, not the other way around.',
       inputSchema: {
         type: 'object',
         properties: {
           object_type: {
             type: 'string',
-            description: 'BW object type: adso, iobj, trfn, dtpa, etc.',
+            description: 'BW object type: adso, iobj, trfn, dtpa, query (alias elem), etc.',
           },
           object_name: {
             type: 'string',
@@ -1586,10 +1588,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'bw_update_query_layout',
       description:
-        'Modify an existing BW Query: add or remove characteristics in the rows, columns, or ' +
-        'free-characteristics area. All operations are applied in a single save. ' +
-        'Variables, intervals, exclusions, and key figure members are not yet supported. ' +
-        'All names must be technical names (e.g. "IOBJ_NAME", "QUERY_NAME").',
+        'Modify an existing BW Query layout: add or remove characteristics in the rows, columns, or ' +
+        'free-characteristics area, and add or remove references to reusable structures (a structure is a ' +
+        'layout container). All operations are applied in a single save. ' +
+        'All names must be technical names (e.g. "IOBJ_NAME", "STRUCTURE_NAME", "QUERY_NAME").',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1605,24 +1607,35 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
               properties: {
                 action: {
                   type: 'string',
-                  enum: ['add', 'remove'],
-                  description: 'Add a characteristic to a container, or remove it from the layout.',
+                  enum: ['add', 'remove', 'add_structure', 'remove_structure'],
+                  description:
+                    'add / remove: add a characteristic to a container or remove it from the layout. ' +
+                    'add_structure: add a reference to a reusable structure into rows or columns. ' +
+                    'remove_structure: remove a referenced reusable structure.',
                 },
                 target: {
                   type: 'string',
                   enum: ['rows', 'columns', 'free'],
-                  description: 'Target container for "add" (rows, columns, or free characteristics).',
+                  description:
+                    'Target container. Required for "add" (rows, columns, or free) and "add_structure" ' +
+                    '(rows or columns).',
                 },
                 infoobject: {
                   type: 'string',
-                  description: 'Technical name of the characteristic (e.g. "IOBJ_NAME").',
+                  description: 'Technical name of the characteristic (required for "add" / "remove", e.g. "IOBJ_NAME").',
+                },
+                structure_name: {
+                  type: 'string',
+                  description:
+                    'Technical name of the reusable structure (required for "add_structure" / ' +
+                    '"remove_structure", e.g. "STRUCTURE_NAME").',
                 },
                 description: {
                   type: 'string',
-                  description: 'Optional display description. Defaults to the InfoObject name.',
+                  description: 'Optional display description for "add". Defaults to the InfoObject name.',
                 },
               },
-              required: ['action', 'target', 'infoobject'],
+              required: ['action'],
             },
           },
         },
@@ -1721,7 +1734,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         'to reusable CKFs/RKFs (with optional local restrictions), add local formula members (recursive ' +
         'operator/operand tree), set member display properties (decimals, hidden, sign inversion) and ' +
         'exception aggregation, and remove members. All operations are applied in a single save. ' +
-        'Reusable structure references are not yet supported. ' +
+        'Member operations also apply to a reusable key figure structure referenced via ' +
+        'bw_update_query_layout add_structure. ' +
         'All names must be technical names (e.g. "IOBJ_NAME", "CKF_NAME", "QUERY_NAME").',
       inputSchema: {
         type: 'object',
@@ -1877,6 +1891,64 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['query_name', 'operations'],
+      },
+    },
+    {
+      name: 'bw_update_query_settings',
+      description:
+        'Change query-level display and behaviour settings of an existing BW Query (description, zero ' +
+        'suppression, result position, sign presentation, zero presentation, universal display hierarchy, ' +
+        'document links, and related flags). Only the provided settings are applied in a single save. ' +
+        'The InfoProvider, technical name, and package cannot be changed. ' +
+        'All names must be technical names (e.g. "QUERY_NAME").',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query_name: {
+            type: 'string',
+            description: 'Technical name of the query to modify (e.g. "QUERY_NAME").',
+          },
+          description: { type: 'string', description: 'Query description text.' },
+          zero_suppression_rows: { type: 'boolean', description: 'Suppress zero-value rows.' },
+          zero_suppression_columns: { type: 'boolean', description: 'Suppress zero-value columns.' },
+          result_position_top: { type: 'boolean', description: 'Place the result row on top.' },
+          result_position_left: { type: 'boolean', description: 'Place the result column on the left.' },
+          sign_presentation: {
+            type: 'string',
+            description: 'Sign presentation (e.g. "inFrontOf", "after").',
+          },
+          suppress_repeated_key_values: { type: 'boolean', description: 'Suppress repeated key values.' },
+          show_scaling_factor: { type: 'boolean', description: 'Show the scaling factor.' },
+          adjust_formatting: { type: 'boolean', description: 'Adjust formatting.' },
+          zero_presentation_kind: { type: 'string', description: 'Zero presentation kind (e.g. "withCurrency").' },
+          zero_presentation_custom_value: { type: 'string', description: 'Custom value shown for zeros.' },
+          hierarchy_display_rows: {
+            type: 'object',
+            description: 'Universal display hierarchy for rows.',
+            properties: {
+              active: { type: 'boolean', description: 'Whether the display hierarchy is active.' },
+              level: { type: 'integer', minimum: 0, description: 'Display level (written two-digit).' },
+            },
+          },
+          hierarchy_display_columns: {
+            type: 'object',
+            description: 'Universal display hierarchy for columns.',
+            properties: {
+              active: { type: 'boolean', description: 'Whether the display hierarchy is active.' },
+              level: { type: 'integer', minimum: 0, description: 'Display level (written two-digit).' },
+            },
+          },
+          document_links: {
+            type: 'object',
+            description: 'Document link visibility.',
+            properties: {
+              info_provider: { type: 'boolean', description: 'Show InfoProvider document links.' },
+              master_data: { type: 'boolean', description: 'Show master data document links.' },
+              meta_data: { type: 'boolean', description: 'Show metadata document links.' },
+            },
+          },
+        },
+        required: ['query_name'],
       },
     },
     {
@@ -3726,6 +3798,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           structure_target: args?.structure_target as 'rows' | 'columns' | undefined,
           operations: args?.operations as KeyFigureOperation[],
         });
+        break;
+
+      case 'bw_update_query_settings':
+        text = await bwUpdateQuerySettings(client, args as unknown as UpdateQuerySettingsArgs);
         break;
 
       case 'bw_list_contents':
