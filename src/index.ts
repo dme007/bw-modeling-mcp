@@ -884,8 +884,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description:
         'Switch a Transformation between HANA and ABAP runtime. ' +
         'Only changes the HANARuntime attribute — no rule changes. ' +
-        'If the runtime already matches the target value, returns early without a PUT. ' +
-        'Returns a lock_handle for bw_activate.',
+        'The current runtime is read from the active version; if it already matches, returns early. ' +
+        'Activates automatically and verifies the change landed in the active version — no separate bw_activate needed. ' +
+        'Returns an error (not success) if the switch does not persist, e.g. when the server refuses HANA runtime for this transformation.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1285,7 +1286,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           storage: {
             type: 'string',
-            description: 'Storage area code (default "AQ").',
+            description:
+              'Storage area code (default "AQ"). Take it from the "Storage" line of the ' +
+              'bw_list_requests output — the code differs by target type (e.g. AQ inbound, ' +
+              'AT/AX active data aDSO, ATTE active text table InfoObject). A wrong code 404s ' +
+              'the header/DTP/process sections, but the message log is still returned.',
           },
           format: {
             type: 'string',
@@ -1365,9 +1370,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           target_type: {
             type: 'string',
-            description: 'Target object type (e.g. "ADSO"). Use "IOBJ" to load into an InfoObject\'s ' +
-              'attributes (encoded server-side as IOBJA). InfoObject text/hierarchy targets ' +
-              '(IOBJT/IOBJH) are not yet supported.',
+            description: 'Target object type (e.g. "ADSO"). Use "IOBJ" to load into an InfoObject; ' +
+              'the loaded sub-object (attributes / texts / hierarchies) is selected with ' +
+              'target_object_subtype.',
+          },
+          target_object_subtype: {
+            type: 'string',
+            enum: ['ATTR', 'TEXT', 'HIER'],
+            description: 'InfoObject sub-object to load into. Only applies when target_type is "IOBJ". ' +
+              'ATTR (default) = attributes/master data (IOBJA), TEXT = texts (IOBJT), ' +
+              'HIER = hierarchies (IOBJH). Must match the sub-object the transformation chain targets.',
           },
           description: {
             type: 'string',
@@ -1563,8 +1575,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'bw_create_query',
       description:
-        'Create a new, empty BW Query (TLOGO ELEM) on an InfoProvider in package $TMP. ' +
-        'The query is created empty and consistent — it has no rows, columns, or key figures yet. ' +
+        'Create a new BW Query (TLOGO ELEM) on an InfoProvider in package $TMP. ' +
+        'Without copy_from the query is created empty and consistent (no rows, columns, or key figures yet). ' +
+        'With copy_from the new query is created as a full copy of an existing query (layout, filter, ' +
+        'variables, key figures); the description parameter still applies to the copy, and infoprovider ' +
+        'may be omitted (it is derived from the source query). ' +
         'Support for transportable packages is not yet available; only package $TMP is supported.',
       inputSchema: {
         type: 'object',
@@ -1575,14 +1590,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           infoprovider: {
             type: 'string',
-            description: 'Technical name of the InfoProvider the query is built on (e.g. "PROVIDER_NAME").',
+            description:
+              'Technical name of the InfoProvider the query is built on (e.g. "PROVIDER_NAME"). ' +
+              'Required unless copy_from is given, in which case it defaults to the source query\'s provider.',
           },
           description: {
             type: 'string',
             description: 'Query description. Defaults to query_name if omitted.',
           },
+          copy_from: {
+            type: 'string',
+            description:
+              'Technical name of an existing query to copy (e.g. "QUERY_NAME"). The new query is created ' +
+              'as a full copy of its content.',
+          },
         },
-        required: ['query_name', 'infoprovider'],
+        required: ['query_name'],
       },
     },
     {
@@ -1598,6 +1621,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           query_name: {
             type: 'string',
             description: 'Technical name of the query to modify (e.g. "QUERY_NAME").',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number (e.g. DEVK900123). Only needed when the query lives on a transportable package; omit for $TMP queries.',
           },
           operations: {
             type: 'array',
@@ -1656,6 +1683,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           query_name: {
             type: 'string',
             description: 'Technical name of the query to modify (e.g. "QUERY_NAME").',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number (e.g. DEVK900123). Only needed when the query lives on a transportable package; omit for $TMP queries.',
           },
           operations: {
             type: 'array',
@@ -1744,6 +1775,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             description: 'Technical name of the query to modify (e.g. "QUERY_NAME").',
           },
+          transport: {
+            type: 'string',
+            description: 'Transport request number (e.g. DEVK900123). Only needed when the query lives on a transportable package; omit for $TMP queries.',
+          },
           structure_target: {
             type: 'string',
             enum: ['rows', 'columns'],
@@ -1800,7 +1835,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                     '{ "type": "component", "component_name": "CKF_NAME" } (references the structure member that ' +
                     'wraps that CKF/RKF — the component must already be added as a structure member; a query ' +
                     'formula cannot reference a component id directly); ' +
-                    '{ "type": "key_figure", "name": "IOBJ_NAME" }; { "type": "constant", "value": "5" }.',
+                    '{ "type": "key_figure", "name": "IOBJ_NAME" }; { "type": "constant", "value": "5" }. ' +
+                    'Operator codes (BW analytic engine, operand counts enforced): ' +
+                    'basic +,- (1-2), *,/ (2); ** power, DIV, MOD (2). ' +
+                    'math ABS, CEIL, FLOOR, FRAC, TRUNC, SIGN, SQRT, EXP, LOG, LOG10, MAX0, MIN0 (1); MAX, MIN (2). ' +
+                    'percentage %, %A, %_A (2); %CT, %GT, %RT, %XT, %YT (1). ' +
+                    'data COUNT, DELTA, NDIV0, NODIM, NOERR, FIX, DATE, TIME, CMR, SUMCT, SUMGT, SUMRT, SUMXT, SUMYT (1). ' +
+                    'trig SIN, COS, TAN, SINH, COSH, TANH, ASIN, ACOS, ATAN (1). ' +
+                    'boolean NOT (1); AND, OR, XOR and relational <, <=, <>, ==, >, >= (2); IF cond;true;false (3). ' +
+                    '(LEAF is not supported — BW needs a dedicated nullary token this tool does not emit.) ' +
+                    'The infix/prefix XML encoding does not matter: BW stores formulas as an execution tree and normalizes ' +
+                    'the display, so binary operators (%, **, MOD, relational, boolean) are accepted when emitted as prefix ' +
+                    '— tested and confirmed. Only +,-,*,/ are emitted as XML infix.',
                 },
                 exception_aggregation: {
                   type: 'object',
@@ -1907,6 +1953,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           query_name: {
             type: 'string',
             description: 'Technical name of the query to modify (e.g. "QUERY_NAME").',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number (e.g. DEVK900123). Only needed when the query lives on a transportable package; omit for $TMP queries.',
           },
           description: { type: 'string', description: 'Query description text.' },
           zero_suppression_rows: { type: 'boolean', description: 'Suppress zero-value rows.' },
@@ -2115,8 +2165,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'bw_set_datasource_fields',
       description:
-        'Set the transfer flag of one or more DataSource fields (fieldProperties@transfer). ' +
-        'Full read-modify-write; only the field transfer flags change. Fields marked transferNotAllowed are skipped when enabling transfer. ' +
+        'Set the transfer flag of one or more DataSource fields (fieldProperties@transfer) ' +
+        'and/or the segment language field designation. ' +
+        'Full read-modify-write; only the field transfer flags and/or the segment languageField change. ' +
+        'Fields marked transferNotAllowed are skipped when enabling transfer. ' +
+        'At least one of fields / language_field must be given. ' +
         'Leaves the DataSource inactive — activate separately with bw_activate (object_type "rsds"). ' +
         'Pass transport for a transportable DataSource so the change is recorded on that request.',
       inputSchema: {
@@ -2142,12 +2195,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
               required: ['name', 'transfer'],
             },
           },
+          language_field: {
+            type: 'string',
+            description:
+              'Set to a field name (e.g. "FIELD_NAME") to designate the segment language field, ' +
+              'set to "" to clear the designation. Clearing it fixes ODP text loads that abort with ' +
+              '"Filter condition cannot be interpreted by DataSource" (RODPS_SAPI004). ' +
+              'After the change, activate the DataSource with bw_activate (object_type "rsds").',
+          },
           transport: {
             type: 'string',
             description: 'Transport request (e.g. DEVK900123). Required for a transportable DataSource; omit for local ($TMP).',
           },
         },
-        required: ['datasource_name', 'source_system', 'fields'],
+        required: ['datasource_name', 'source_system'],
       },
     },
     {
@@ -3715,6 +3776,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           source_system: args?.source_system as string | undefined,
           target_name: args?.target_name as string,
           target_type: args?.target_type as string,
+          target_object_subtype: args?.target_object_subtype as string | undefined,
           description: args?.description as string | undefined,
           package: args?.package as string | undefined,
           filter_field: args?.filter_field as string | undefined,
@@ -3773,8 +3835,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'bw_create_query':
         text = await bwCreateQuery(client, {
           query_name: args?.query_name as string,
-          infoprovider: args?.infoprovider as string,
+          infoprovider: args?.infoprovider as string | undefined,
           description: args?.description as string | undefined,
+          copy_from: args?.copy_from as string | undefined,
         });
         break;
 
@@ -3782,6 +3845,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         text = await bwUpdateQueryLayout(client, {
           query_name: args?.query_name as string,
           operations: args?.operations as LayoutOperation[],
+          transport: args?.transport as string | undefined,
         });
         break;
 
@@ -3789,6 +3853,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         text = await bwUpdateQueryFilter(client, {
           query_name: args?.query_name as string,
           operations: args?.operations as FilterOperation[],
+          transport: args?.transport as string | undefined,
         });
         break;
 
@@ -3797,6 +3862,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           query_name: args?.query_name as string,
           structure_target: args?.structure_target as 'rows' | 'columns' | undefined,
           operations: args?.operations as KeyFigureOperation[],
+          transport: args?.transport as string | undefined,
         });
         break;
 
@@ -3846,7 +3912,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         text = await bwSetDatasourceFields(client, {
           datasourceName: args?.datasource_name as string,
           sourceSystem: args?.source_system as string,
-          fields: args?.fields as Array<{ name: string; transfer: boolean }>,
+          fields: args?.fields as Array<{ name: string; transfer: boolean }> | undefined,
+          languageField: args?.language_field as string | undefined,
           transport: args?.transport as string | undefined,
         });
         break;

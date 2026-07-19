@@ -131,7 +131,8 @@ export async function bwListRequests(
   lines.push('');
 
   if (requests.length === 0) {
-    lines.push('(no requests found)');
+    lines.push('(no requests found — requests appear asynchronously after a DTP start;');
+    lines.push(' retry after a few seconds and verify the target is the final target of the DTP)');
     return lines.join('\n');
   }
 
@@ -144,6 +145,7 @@ export async function bwListRequests(
     lines.push(`  Timestamp:    ${req.lastTimeStamp ?? ''}`);
     lines.push(`  User:         ${req.user?.fullName ?? ''}`);
     lines.push(`  TSN:          ${req.requestTsn ?? ''}`);
+    lines.push(`  Storage:      ${req.storage ?? ''}`);
     lines.push('');
   }
 
@@ -162,69 +164,108 @@ export async function bwGetRequest(
   const processesUrl = `/sap/bc/http/sap/bw4/v1/manage/processes?request=${encodeURIComponent(requestTsn)}&storage=${s}`;
   const logsUrl = `/sap/bc/http/sap/bw4/v1/manage/processes/${encodeURIComponent(requestTsn)}/logs?top=100&readMaximumNumberOfResults=true`;
 
-  const [headerRes, dtpInfoRes, processesRes, logsRes] = await Promise.all([
+  // The message log is the primary diagnostic source and needs no storage code, so it must
+  // never die on a 404 of the storage-dependent header/DTP-info/process endpoints (a wrong
+  // storage code 404s those but the log is still reachable). allSettled isolates each.
+  const [headerRes, dtpInfoRes, processesRes, logsRes] = await Promise.allSettled([
     client.rawGet(headerUrl, GET_HEADERS),
     client.rawGet(dtpInfoUrl, GET_HEADERS),
     client.rawGet(processesUrl, GET_HEADERS),
     client.rawGet(logsUrl, GET_HEADERS),
   ]);
 
-  const header = JSON.parse(headerRes.body) as RequestListItem;
-  const dtpInfo = JSON.parse(dtpInfoRes.body) as DtpInformation;
-  const processes = JSON.parse(processesRes.body) as ProcessStep[];
-  const logs = JSON.parse(logsRes.body) as LogMessage[];
+  const errMsg = (r: PromiseRejectedResult): string =>
+    r.reason instanceof Error ? r.reason.message : String(r.reason);
 
   if (format === 'raw') {
-    return JSON.stringify({ header, dtpInformation: dtpInfo, processes, logs }, null, 2);
+    return JSON.stringify({
+      header: headerRes.status === 'fulfilled'
+        ? JSON.parse(headerRes.value.body) as RequestListItem
+        : { error: errMsg(headerRes) },
+      dtpInformation: dtpInfoRes.status === 'fulfilled'
+        ? JSON.parse(dtpInfoRes.value.body) as DtpInformation
+        : { error: errMsg(dtpInfoRes) },
+      processes: processesRes.status === 'fulfilled'
+        ? JSON.parse(processesRes.value.body) as ProcessStep[]
+        : { error: errMsg(processesRes) },
+      logs: logsRes.status === 'fulfilled'
+        ? JSON.parse(logsRes.value.body) as LogMessage[]
+        : { error: errMsg(logsRes) },
+    }, null, 2);
+  }
+
+  // The message log is the mandatory section. If even it failed, there is nothing useful to
+  // return — surface the error like before.
+  if (logsRes.status === 'rejected') {
+    throw new Error(errMsg(logsRes));
   }
 
   const requestStatus = await getRequestStatusMap(client);
   const processStatus = await getProcessStatusMap(client);
 
   const lines: string[] = [];
+  const unavailable = (r: PromiseRejectedResult): string =>
+    `(section not available: ${errMsg(r)} — check the storage code, take it from bw_list_requests)`;
 
   // Section 1 — header
   // Both the header request status and the last process status are shown: for some green
   // inbound loads requestStatus lags at "Y" (in process) while lastProcessStatus already
   // reads "G" (green). Surfacing both keeps a genuinely running request distinguishable
   // from a finished one without remapping requestStatus.
-  lines.push(`Request: ${header.requestTsnExternal ?? requestTsn}`);
-  lines.push(`  Status:       ${decodeStatus(requestStatus, header.requestStatus)}`);
-  lines.push(`  Last Process: ${decodeStatus(processStatus, header.lastProcessStatus)}`);
-  lines.push(`  Last Action:  ${header.lastAction ?? ''}`);
-  lines.push(`  Tooltip:      ${header.statusTooltip ?? ''}`);
-  lines.push(`  Records:      ${header.records ?? ''}`);
-  lines.push(`  User:         ${header.user?.fullName ?? ''}`);
-  lines.push(`  Timestamp:    ${header.lastTimeStamp ?? ''}`);
+  if (headerRes.status === 'fulfilled') {
+    const header = JSON.parse(headerRes.value.body) as RequestListItem;
+    lines.push(`Request: ${header.requestTsnExternal ?? requestTsn}`);
+    lines.push(`  Status:       ${decodeStatus(requestStatus, header.requestStatus)}`);
+    lines.push(`  Last Process: ${decodeStatus(processStatus, header.lastProcessStatus)}`);
+    lines.push(`  Last Action:  ${header.lastAction ?? ''}`);
+    lines.push(`  Tooltip:      ${header.statusTooltip ?? ''}`);
+    lines.push(`  Records:      ${header.records ?? ''}`);
+    lines.push(`  User:         ${header.user?.fullName ?? ''}`);
+    lines.push(`  Timestamp:    ${header.lastTimeStamp ?? ''}`);
+  } else {
+    lines.push(`Request: ${requestTsn}`);
+    lines.push(`  ${unavailable(headerRes)}`);
+  }
 
   // Section 2 — DTP information
   lines.push('');
   lines.push('── DTP Information ──');
-  lines.push(`  DTP:          ${dtpInfo.dataTransferProcess ?? ''}`);
-  lines.push(`  Description:  ${dtpInfo.dtpDescription ?? ''}`);
-  lines.push(`  Process Mode: ${dtpInfo.processModeDescription ?? ''}`);
-  lines.push(`  Start:        ${dtpInfo.requestStart ?? ''}`);
-  lines.push(`  Finish:       ${dtpInfo.requestFinish ?? ''}`);
-  lines.push(`  Duration:     ${dtpInfo.requestDuration ?? ''}`);
-  lines.push(`  Package Size: ${dtpInfo.packageSize ?? ''}`);
+  if (dtpInfoRes.status === 'fulfilled') {
+    const dtpInfo = JSON.parse(dtpInfoRes.value.body) as DtpInformation;
+    lines.push(`  DTP:          ${dtpInfo.dataTransferProcess ?? ''}`);
+    lines.push(`  Description:  ${dtpInfo.dtpDescription ?? ''}`);
+    lines.push(`  Process Mode: ${dtpInfo.processModeDescription ?? ''}`);
+    lines.push(`  Start:        ${dtpInfo.requestStart ?? ''}`);
+    lines.push(`  Finish:       ${dtpInfo.requestFinish ?? ''}`);
+    lines.push(`  Duration:     ${dtpInfo.requestDuration ?? ''}`);
+    lines.push(`  Package Size: ${dtpInfo.packageSize ?? ''}`);
+  } else {
+    lines.push(`  ${unavailable(dtpInfoRes)}`);
+  }
 
   // Section 3 — process steps
   lines.push('');
-  lines.push(`── Process Steps (${processes.length}) ──`);
-  for (const step of processes) {
-    lines.push(`  ${step.processTsnExternal ?? ''} — ${step.processTypeDescription ?? ''}`);
-    lines.push(`      Status:    ${decodeStatus(processStatus, step.processStatus)}`);
-    lines.push(`      Timestamp: ${step.timestamp ?? ''}`);
+  if (processesRes.status === 'fulfilled') {
+    const processes = JSON.parse(processesRes.value.body) as ProcessStep[];
+    lines.push(`── Process Steps (${processes.length}) ──`);
+    for (const step of processes) {
+      lines.push(`  ${step.processTsnExternal ?? ''} — ${step.processTypeDescription ?? ''}`);
+      lines.push(`      Status:    ${decodeStatus(processStatus, step.processStatus)}`);
+      lines.push(`      Timestamp: ${step.timestamp ?? ''}`);
+    }
+  } else {
+    lines.push('── Process Steps ──');
+    lines.push(`  ${unavailable(processesRes)}`);
   }
 
-  // Section 4 — message log
+  // Section 4 — message log. longText is SAPscript-to-HTML; its only added value over
+  // message is the "Meldungsnr. {MSGID}" — extract that and append it, drop the raw HTML.
+  const logs = JSON.parse(logsRes.value.body) as LogMessage[];
   lines.push('');
   lines.push(`── Message Log (${logs.length}) ──`);
   for (const log of logs) {
-    lines.push(`  [${log.severity ?? ''}] ${log.message ?? ''}`);
-    if (log.longText && log.longText.length > 0) {
-      lines.push(`      ${log.longText}`);
-    }
+    const msgNo = log.longText?.match(/Meldungsnr\.\s*([A-Z0-9_\/]+)/)?.[1];
+    lines.push(`  [${log.severity ?? ''}] ${log.message ?? ''}${msgNo ? ` (${msgNo})` : ''}`);
   }
 
   return lines.join('\n');

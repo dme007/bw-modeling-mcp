@@ -943,3 +943,20 @@ export function createClientFromEnv(): BwClient {
   }
   return new BwClient(url, user, password, client, language);
 }
+
+/**
+ * One-shot read through a BRAND-NEW session with forceCacheUpdate=true.
+ *
+ * The BW ADT backend keeps a per-session model buffer: a session that has
+ * previously locked/written an object reliably serves STALE reads afterwards
+ * (even with forceCacheUpdate=true), and pre-lock reads may project outdated
+ * state. Building a read-modify-write on such a read silently resurrects old
+ * attribute values on the PUT. A fresh session always returns the database
+ * state, including an existing unactivated M draft. Use this for every
+ * pre-lock model read and for verification reads; post-lock reads in the
+ * locking session are refreshed by the lock itself and may stay as they are.
+ */
+export async function freshRead(path: string, accept: string): Promise<GetResult> {
+  const sep = path.includes('?') ? '&' : '?';
+  return createClientFromEnv().get(`${path}${sep}forceCacheUpdate=true`, accept);
+}

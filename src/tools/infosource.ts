@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, freshRead } from '../bw-client.js';
 
 const TRCS_MEDIA = 'application/vnd.sap.bw.modeling.trcs-v1_0_0+xml';
 
@@ -11,7 +11,7 @@ const TRCS_MEDIA = 'application/vnd.sap.bw.modeling.trcs-v1_0_0+xml';
  */
 export async function bwGetInfosource(client: BwClient, name: string): Promise<string> {
   const nameLower = name.toLowerCase();
-  const result = await client.get(`/sap/bw/modeling/trcs/${nameLower}/m`, TRCS_MEDIA);
+  const result = await freshRead(`/sap/bw/modeling/trcs/${nameLower}/m`, TRCS_MEDIA);
   const xml = result.body;
 
   // Root attributes
@@ -237,8 +237,9 @@ export async function bwUpdateInfosource(
   // 1. Lock (no activity_context = update mode)
   const lockHandle = await client.lock('trcs', name);
 
-  // 2. GET current XML
-  const getResult = await client.get(trcsPath, TRCS_MEDIA);
+  // 2. GET current XML — post-lock in the locking session (the lock refreshes the
+  //    session's model buffer); forceCacheUpdate additionally syncs the server cache.
+  const getResult = await client.get(`${trcsPath}?forceCacheUpdate=true`, TRCS_MEDIA);
   const timestamp = getResult.headers['timestamp'] ?? getResult.headers['TIMESTAMP'];
   let xml = getResult.body;
 

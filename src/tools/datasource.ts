@@ -959,7 +959,8 @@ export async function bwChangeDatasourceDelta(
 export interface SetDatasourceFieldsArgs {
   datasourceName: string;
   sourceSystem: string;
-  fields: Array<{ name: string; transfer: boolean }>;
+  fields?: Array<{ name: string; transfer: boolean }>;
+  languageField?: string;
   transport?: string;
 }
 
@@ -982,8 +983,9 @@ export async function bwSetDatasourceFields(
   const ssUpper = args.sourceSystem.toUpperCase();
   const mUrl = `/sap/bw/modeling/rsds/${dsUpper}/${ssUpper}/m`;
 
-  if (!args.fields || args.fields.length === 0) {
-    return JSON.stringify({ success: false, message: 'No fields given.' }, null, 2);
+  const hasFields = !!args.fields && args.fields.length > 0;
+  if (!hasFields && args.languageField === undefined) {
+    return JSON.stringify({ success: false, message: 'Neither fields nor language_field given.' }, null, 2);
   }
 
   // 1. Read current full body.
@@ -994,7 +996,7 @@ export async function bwSetDatasourceFields(
   const skipped: Array<{ name: string; reason: string }> = [];
   let modified = current;
 
-  for (const f of args.fields) {
+  for (const f of args.fields ?? []) {
     const nameEsc = escapeRegExp(f.name);
     const fpRe = new RegExp(
       `<field name="${nameEsc}"[^>]*>[\\s\\S]*?<fieldProperties\\b([^>]*)\\/>`
@@ -1019,7 +1021,23 @@ export async function bwSetDatasourceFields(
     changed.push({ name: f.name, transfer: f.transfer, previous });
   }
 
-  if (changed.length === 0) {
+  // Segment-level languageField patch (primary segment only). The GET serialization
+  // is round-tripped back with just this one attribute value changed.
+  let segmentChange: { languageField: string; previous: string } | undefined;
+  if (args.languageField !== undefined) {
+    const prev = modified.match(/<segment\b[^>]*\blanguageField="([^"]*)"/)?.[1];
+    if (prev === undefined) {
+      skipped.push({ name: 'languageField', reason: 'no languageField attribute on segment' });
+    } else {
+      modified = modified.replace(
+        /(<segment\b[^>]*\blanguageField=")[^"]*(")/,
+        `$1${args.languageField}$2`
+      );
+      segmentChange = { languageField: args.languageField, previous: prev };
+    }
+  }
+
+  if (changed.length === 0 && segmentChange === undefined) {
     return JSON.stringify({
       success: false,
       datasource: dsUpper,
@@ -1066,6 +1084,7 @@ export async function bwSetDatasourceFields(
       source_system: ssUpper,
       changed,
     };
+    if (segmentChange) result['segment_change'] = segmentChange;
     if (skipped.length > 0) result['skipped'] = skipped;
     if (title) result['message'] = title;
     if (!hasError) {

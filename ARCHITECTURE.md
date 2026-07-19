@@ -113,11 +113,13 @@ src/
     ├── adso.ts           # bw_get_adso, bw_create_adso, bw_update_adso
     ├── composite_provider.ts # bw_get_composite_provider
     ├── cp_components.ts  # bw_get_ckf, bw_get_rkf, bw_get_structure
-    ├── cto.ts            # bw_change_package — package reassignment via /sap/bw/modeling/cto/write
+    ├── cto.ts            # bw_change_package — package reassignment via /sap/bw/modeling/cto/write;
+    │                     # bw_list_changeable_transports — transport state via cto/check
     ├── dataflow.ts       # bw_get_dataflow — transient data flow graph via /sap/bw/modeling/dmod/8TRANSIENT
     ├── datasource.ts     # bw_list_source_systems, bw_list_datasources, bw_get_source_system,
     │                     # bw_get_datasource, bw_preview_datasource,
-    │                     # bw_list_remote_entities, bw_create_datasource
+    │                     # bw_list_remote_entities, bw_create_datasource,
+    │                     # bw_change_datasource_delta, bw_set_datasource_fields
     ├── delete.ts         # bw_delete
     ├── dtp.ts            # bw_get_dtp, bw_get_dtps, bw_create_dtp, bw_run_dtp, bw_update_dtp, bw_set_dtp_filter_routine
     ├── infoarea.ts       # bw_get_infoarea, bw_create_infoarea, bw_move_object
@@ -130,17 +132,24 @@ src/
     │                            # bw_list_process_chain_last_status — OData-based monitoring
     ├── processchain.ts   # bw_get_process_chain — reads RSPC via bw4 API; auto-fetches variant details per step
     ├── processchain_write.ts # bw_create_process_chain, bw_update_process_chain,
-    │                         # bw_activate_process_chain — BW4 Cockpit REST API
+    │                         # bw_activate_process_chain, bw_append_process_chain_dtp,
+    │                         # bw_swap_process_chain_dtp, bw_add_process_chain_error_links,
+    │                         # bw_create_decision_variant — BW4 Cockpit REST API
     ├── processvariant.ts # bw_get_process_variant — generic variant detail reader for all 93 process types
     ├── push.ts           # bw_push_data, bw_get_push_schema
-    ├── query.ts          # bw_get_query — full query definition parser (variables, layout, CKFs, RKFs, exceptions)
+    ├── query.ts          # bw_get_query — full query definition parser (variables, layout, CKFs, RKFs, exceptions);
+    │                     # bw_create_query — create empty or as a full copy (copy_from)
+    ├── query_update.ts   # bw_update_query_layout, bw_update_query_filter,
+    │                     # bw_update_query_key_figures, bw_update_query_settings
     ├── reporting.ts      # bw_query_data, bw_get_filter_values — BICS reporting endpoint (/sap/bw/modeling/comp/reporting)
     ├── repository.ts     # bw_list_contents
     ├── request_monitor.ts # bw_list_requests, bw_get_request, bw_activate_request — RSPM request monitor / data activation via the bw4 manage API
     ├── roles.ts          # bw_get_roles, bw_get_role_queries, bw_get_query_roles, bw_set_query_roles
     ├── search.ts         # bw_search, bw_xref
+    ├── transport.ts      # bw_create_transport_task — add a task to a workbench transport
     └── transformation.ts # bw_get_transformation, bw_create_transformation,
                           # bw_update_transformation, bw_set_transformation_routine,
+                          # bw_set_transformation_expert_routine,
                           # bw_set_transformation_routine_fields, bw_delete_transformation_routine,
                           # bw_set_transformation_runtime
 ```

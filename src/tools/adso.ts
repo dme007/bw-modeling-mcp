@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead } from '../bw-client.js';
 import { parseInfoObjectProps } from './infoobject.js';
 
 // ── aDSO type presets ────────────────────────────────────────────────────────
@@ -93,7 +93,7 @@ export async function bwUpdateAdsoSettings(
   const adsoPath = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
 
   // 1. Read current XML
-  const adsoResult = await client.get(adsoPath, ADSO_ACCEPT);
+  const adsoResult = await freshRead(adsoPath, ADSO_ACCEPT);
   const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
   let xml = adsoResult.body;
 
@@ -161,7 +161,7 @@ export async function bwGetAdso(
   format: 'text' | 'raw' = 'text',
 ): Promise<string> {
   const path = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
-  const result = await client.get(path, ADSO_ACCEPT);
+  const result = await freshRead(path, ADSO_ACCEPT);
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
   const ts = result.headers['timestamp'] ?? '';
   const rawOutput = `aDSO: ${adsoName.toUpperCase()}\nStatus: ${status}\nTimestamp: ${ts}\n\n${result.body}`;
@@ -446,7 +446,7 @@ export async function bwUpdateAdsoManageKeys(
   const adsoPath = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
 
   // 1. Read current XML
-  const adsoResult = await client.get(adsoPath, ADSO_ACCEPT);
+  const adsoResult = await freshRead(adsoPath, ADSO_ACCEPT);
   const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
   let xml = adsoResult.body;
 
@@ -518,7 +518,7 @@ export async function bwUpdateAdsoFieldProperties(
 
   // 1. GET full XML
   const adsoPath = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
-  const adsoResult = await client.get(adsoPath, ADSO_ACCEPT);
+  const adsoResult = await freshRead(adsoPath, ADSO_ACCEPT);
   const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
   const fullXml = adsoResult.body;
 
@@ -906,7 +906,7 @@ export async function bwUpdateAdsoAddPureField(
   const adsoUpper = adsoName.toUpperCase();
   const adsoPath = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
 
-  const adsoResult = await client.get(adsoPath, ADSO_ACCEPT);
+  const adsoResult = await freshRead(adsoPath, ADSO_ACCEPT);
   const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
   let xml = adsoResult.body;
 
@@ -1000,7 +1000,7 @@ export async function bwUpdateAdso(
 
   // Read current aDSO once (full XML + timestamp)
   const adsoPath = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
-  const adsoResult = await client.get(adsoPath, ADSO_ACCEPT);
+  const adsoResult = await freshRead(adsoPath, ADSO_ACCEPT);
   const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
 
   let updatedXml = adsoResult.body;
@@ -1024,14 +1024,17 @@ export async function bwUpdateAdso(
       });
     }
   } else {
-    // add_field — read each InfoObject and inject
+    // add_field — read each InfoObject and inject. One fresh reader session for the
+    // whole call: an InfoObject created/edited earlier through the shared client
+    // could otherwise be served from a stale session buffer.
+    const iobjReader = createClientFromEnv();
     for (const name of names) {
       if (updatedXml.includes(`infoObjectName="${name}"`)) {
         skipped.push(name);
         continue;
       }
-      const iObjResult = await client.get(
-        `/sap/bw/modeling/iobj/${name.toLowerCase()}/m`,
+      const iObjResult = await iobjReader.get(
+        `/sap/bw/modeling/iobj/${name.toLowerCase()}/m?forceCacheUpdate=true`,
         MEDIA_TYPES['iobj']
       );
       const iObjProps = parseInfoObjectProps(iObjResult.body);

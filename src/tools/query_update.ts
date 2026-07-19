@@ -413,6 +413,7 @@ async function withQueryDocument(
   client: BwClient,
   queryName: string,
   mutate: (xml: string) => string,
+  corrNr?: string,
 ): Promise<{ messages: string[] }> {
   const nameLower = queryName.toLowerCase();
   const path = `/sap/bw/modeling/query/${nameLower}/a`;
@@ -440,8 +441,9 @@ async function withQueryDocument(
 
     const client2 = createClientFromEnv();
     const csrf2 = await client2.getCsrfToken();
+    const corrNrPrefix = corrNr ? `corrNr=${corrNr}&` : '';
     const putResponse = await client2.rawPut(
-      `${path}?lockHandle=${lockHandle}`,
+      `${path}?${corrNrPrefix}lockHandle=${lockHandle}`,
       mutated,
       {
         'timestamp': timestamp,
@@ -513,6 +515,7 @@ export interface LayoutOperation {
 export interface UpdateQueryLayoutArgs {
   query_name: string;
   operations: LayoutOperation[];
+  transport?: string;
 }
 
 /**
@@ -673,7 +676,7 @@ export async function bwUpdateQueryLayout(
     return doc;
   };
 
-  const { messages } = await withQueryDocument(client, args.query_name, mutate);
+  const { messages } = await withQueryDocument(client, args.query_name, mutate, args.transport);
   return JSON.stringify({
     success: true,
     query_name: args.query_name.toUpperCase(),
@@ -711,6 +714,7 @@ export interface FilterOperation {
 export interface UpdateQueryFilterArgs {
   query_name: string;
   operations: FilterOperation[];
+  transport?: string;
 }
 
 /**
@@ -1015,7 +1019,7 @@ export async function bwUpdateQueryFilter(
     return doc;
   };
 
-  const { messages } = await withQueryDocument(client, args.query_name, mutate);
+  const { messages } = await withQueryDocument(client, args.query_name, mutate, args.transport);
   return JSON.stringify({
     success: true,
     query_name: args.query_name.toUpperCase(),
@@ -1076,6 +1080,7 @@ export interface UpdateQueryKeyFiguresArgs {
   query_name: string;
   structure_target?: 'rows' | 'columns';
   operations: KeyFigureOperation[];
+  transport?: string;
 }
 
 /** Build the additional restriction groups (one per characteristic) for a member. */
@@ -1267,6 +1272,36 @@ function resolveOneMember(
 }
 
 /**
+ * Operand count per formula operator code, as [min, max], from the BW analytic engine
+ * operator catalog (SAP BW/4HANA "Priority of Formula Operators"). Codes not listed
+ * here fall back to the lenient "at least one operand" check so unusual/system-specific
+ * operators are not rejected. Codes are matched upper-cased.
+ */
+const FORMULA_OPERATOR_ARITY: Record<string, [number, number]> = {
+  // basic
+  '+': [1, 2], '-': [1, 2], '*': [2, 2], '/': [2, 2], '**': [2, 2], DIV: [2, 2], MOD: [2, 2],
+  // math (unary)
+  ABS: [1, 1], CEIL: [1, 1], FLOOR: [1, 1], FRAC: [1, 1], TRUNC: [1, 1], SIGN: [1, 1],
+  SQRT: [1, 1], EXP: [1, 1], LOG: [1, 1], LOG10: [1, 1], MAX0: [1, 1], MIN0: [1, 1],
+  // math (binary)
+  MAX: [2, 2], MIN: [2, 2],
+  // percentage
+  '%': [2, 2], '%A': [2, 2], '%_A': [2, 2],
+  '%CT': [1, 1], '%GT': [1, 1], '%RT': [1, 1], '%XT': [1, 1], '%YT': [1, 1],
+  // data functions
+  COUNT: [1, 1], DELTA: [1, 1], NDIV0: [1, 1], NODIM: [1, 1], NOERR: [1, 1], FIX: [1, 1],
+  DATE: [1, 1], TIME: [1, 1], CMR: [1, 1],
+  SUMCT: [1, 1], SUMGT: [1, 1], SUMRT: [1, 1], SUMXT: [1, 1], SUMYT: [1, 1],
+  // trigonometric (unary)
+  SIN: [1, 1], COS: [1, 1], TAN: [1, 1], SINH: [1, 1], COSH: [1, 1], TANH: [1, 1],
+  ASIN: [1, 1], ACOS: [1, 1], ATAN: [1, 1],
+  // boolean
+  NOT: [1, 1], AND: [2, 2], OR: [2, 2], XOR: [2, 2],
+  '<': [2, 2], '<=': [2, 2], '<>': [2, 2], '==': [2, 2], '>': [2, 2], '>=': [2, 2], '=': [2, 2],
+  IF: [3, 3],
+};
+
+/**
  * Render a formula node tree. The root element is Qry:formulaToken; nested operands
  * are Qry:childToken. Operator codes +,-,*,/ map to FormulaInfixOperator, any other
  * code to FormulaPrefixOperator. Member / component operands resolve against the
@@ -1276,10 +1311,32 @@ function renderFormulaNode(node: FormulaNode, doc: string, tag: string): string 
   if (!node || typeof node !== 'object') throw new Error('Invalid formula node.');
   const type = node['type'];
   if (type === 'operator') {
-    const code = String(node['code'] ?? '');
-    if (!code) throw new Error('Formula operator node requires a code.');
+    const rawCode = String(node['code'] ?? '');
+    if (!rawCode) throw new Error('Formula operator node requires a code.');
+    const code = rawCode.toUpperCase();
+    if (code === 'LEAF') {
+      // BW encodes LEAF as a dedicated nullary token, not a prefix operator. Emitting it
+      // as a zero-child prefix operator makes the generator report the calculation function
+      // as blank ("Berechnungsfunktion nicht unterstützt", HTTP 500) and saves the query
+      // inconsistent. Reject client-side until a dedicated LEAF token is implemented.
+      throw new Error(
+        "Formula operator 'LEAF' is not supported by add_formula: BW requires a dedicated " +
+        'nullary token encoding, and a zero-operand prefix operator is rejected by the query generator.'
+      );
+    }
     const operands = Array.isArray(node['operands']) ? (node['operands'] as FormulaNode[]) : [];
-    if (operands.length === 0) throw new Error(`Formula operator '${code}' requires at least one operand.`);
+    const arity = FORMULA_OPERATOR_ARITY[code];
+    if (arity) {
+      const [min, max] = arity;
+      if (operands.length < min || operands.length > max) {
+        const expected = min === max ? `${min}` : `${min}-${max}`;
+        throw new Error(
+          `Formula operator '${code}' expects ${expected} operand(s) but got ${operands.length}.`
+        );
+      }
+    } else if (operands.length === 0) {
+      throw new Error(`Formula operator '${code}' requires at least one operand.`);
+    }
     const xsiType = ['+', '-', '*', '/'].includes(code) ? 'Qry:FormulaInfixOperator' : 'Qry:FormulaPrefixOperator';
     const children = operands.map((o) => renderFormulaNode(o, doc, 'Qry:childToken')).join('');
     return `<${tag} xsi:type="${xsiType}" code="${escapeXml(code)}">${children}</${tag}>`;
@@ -1689,7 +1746,7 @@ export async function bwUpdateQueryKeyFigures(
     return doc;
   };
 
-  const { messages } = await withQueryDocument(client, args.query_name, mutate);
+  const { messages } = await withQueryDocument(client, args.query_name, mutate, args.transport);
   return JSON.stringify({
     success: true,
     query_name: args.query_name.toUpperCase(),
@@ -1728,6 +1785,7 @@ export interface UpdateQuerySettingsArgs {
   hierarchy_display_rows?: HierarchyDisplay;
   hierarchy_display_columns?: HierarchyDisplay;
   document_links?: DocumentLinks;
+  transport?: string;
 }
 
 /**
@@ -1903,7 +1961,7 @@ export async function bwUpdateQuerySettings(
     return doc;
   };
 
-  const { messages } = await withQueryDocument(client, args.query_name, mutate);
+  const { messages } = await withQueryDocument(client, args.query_name, mutate, args.transport);
   return JSON.stringify({
     success: true,
     query_name: args.query_name.toUpperCase(),

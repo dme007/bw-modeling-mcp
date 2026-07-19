@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES, createClientFromEnv } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead } from '../bw-client.js';
 
 // ── KYF: objectSpecificDataType → keyfigureType / semantics ──────────────────
 
@@ -562,7 +562,7 @@ export async function bwGetInfoObject(
 ): Promise<string> {
   const accept = MEDIA_TYPES['iobj'];
   const path = `/sap/bw/modeling/iobj/${infoObjectName.toLowerCase()}/m`;
-  const result = await client.get(path, accept);
+  const result = await freshRead(path, accept);
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
   return `InfoObject: ${infoObjectName.toUpperCase()}\nStatus: ${status}\n\n${result.body}`;
 }

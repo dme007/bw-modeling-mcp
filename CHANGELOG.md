@@ -1,11 +1,48 @@
 # Changelog
 
-## [0.9.3] — 2026-07-07
+## [1.0.0] — 2026-07-17
+
+The largest feature drop so far, and the release that takes the server to 1.0: a broad
+wave of write tools turns what was already a solid read/write toolkit into full
+BW/4HANA modeling coverage — query authoring, extended process chain authoring,
+transport-request integration, and a hardened session model. No breaking API changes.
+
+### Added
+
+- Query authoring — the query object graduates from read-only to fully writable:
+  - `bw_create_query` — create a new, consistent query (TLOGO ELEM) on an InfoProvider in package $TMP; with the new `copy_from` parameter the query is created as a full copy of an existing query (layout, filter, variables, key figures), deriving the InfoProvider from the source when none is given
+  - `bw_update_query_layout` — rows, columns, structures, and free characteristics
+  - `bw_update_query_filter` — query filter and restrictions
+  - `bw_update_query_key_figures` — basic key figures, RKF/CKF references, and local formula members (recursive operator/operand tree), with exception aggregation, display properties, and member removal
+  - `bw_update_query_settings` — query properties
+  - all four update tools accept an optional `transport` request number for queries on a transportable package
+  - query deletion via `bw_delete`
+- Process chain authoring, extended:
+  - `bw_append_process_chain_dtp` — append one DTP load step (optionally with its own DSO activation step) to an existing chain
+  - `bw_swap_process_chain_dtp` — swap one DTP load variant for another in an existing chain
+  - `bw_add_process_chain_error_links` — add on-error (negative) links by mirroring the existing success links
+  - `bw_create_decision_variant` — create a DECISION process variant for use as a branch/decision step
+- Transport lifecycle:
+  - `bw_create_transport_task` — add a task (sub-request) for a user to an existing workbench transport request
+  - `bw_list_changeable_transports` — list transport requests and their tasks via the BW transport state (`cto/check`)
+- DataSource authoring:
+  - `bw_change_datasource_delta` — change the delta process of a DataSource (full read-modify-write of `deltaProperties`)
+  - `bw_set_datasource_fields` — set the transfer flag of DataSource fields and/or the segment `language_field`
+- `bw_set_transformation_expert_routine` — write Start/End/Expert routine code into the transformation master so it survives activation and transport
+
+### Improved
+
+- `bw_create_dtp` — `target_object_subtype` (`ATTR` / `TEXT` / `HIER`) selects the InfoObject sub-object role for InfoObject targets, mapped to the correct DTP type code (`IOBJA` / `IOBJT` / `IOBJH`); previously only attribute targets were reachable
+- `bw_update_query_key_figures` — `add_formula` documents the full BW analytic-engine operator catalog (basic, percentage, data, mathematical, trigonometric, and boolean operators plus ternary `IF`) and validates each operator's operand count before saving, so a malformed formula fails with a clear message instead of leaving the query saved in an inconsistent state; operator codes are now case-insensitive. `LEAF` (which BW encodes as a dedicated nullary token, not a prefix operator) is rejected client-side rather than producing an HTTP 500
 
 ### Fixed
 
+- `bw_set_transformation_runtime` — runtime switches no longer report false `runtime_not_persisted` errors and no longer get silently reverted. Root cause was the server-side ADT session model buffer: a session that had previously read (or locked) the transformation keeps serving its stale model even with `forceCacheUpdate=true`, so (a) the post-activation verify read the OLD active version through the shared long-lived client and reported a persisted switch as failed, and (b) a later read-modify-write through the same session could resurrect the stale `HANARuntime` value and re-persist it. The switch attempt (lock → GET `/m?forceCacheUpdate=true` → PUT → activate → unlock) and every active-version read (initial `already_set` decision and verify) now each run in a fresh session, which always returns the database state. Verified live with an abap→hana round-trip and independent virgin-session confirmation; the failure mode is value-independent (`sapHANAExecutionPossible` `COULD` and `MUST_NOT` alike, matching a manual-GUI trace of the `COULD` case)
+- Transformation write tools hardened against the same stale-session hazard: `bw_get_transformation`, `bw_update_transformation`, `bw_set_transformation_routine`, `bw_set_transformation_expert_routine`, `bw_set_transformation_routine_fields`, `bw_delete_transformation_routine`, and the post-create persistence check now read the transformation model through a fresh session with `forceCacheUpdate=true` (shared helper). Their previous pre-lock reads through the long-lived client could return a pinned stale model, and PUTting a model built on such a read silently resurrects old attribute values — the plausible mechanism behind observed runtime reversions. Lock ownership and the returned `lock_handle` contract are unchanged; verified live that the shared read path returns the database state through a deliberately dirtied session
+- The same fresh-session read hardening applied across the other object types (shared `freshRead` helper in the BW client): all five aDSO update tools and `bw_get_adso` (their model reads ran before the lock, the hazardous pattern), the `bw_get_infosource` / `bw_get_infoobject` / `bw_get_dtp` / DTP-details readers (diagnostic reads must reflect the database, not a pinned session buffer — this also removes the known stale inactive-shadow behavior of `bw_get_dtp`), the InfoObject lookups inside aDSO field addition, and `bw_update_infosource`'s post-lock read now passes `forceCacheUpdate=true`. Update tools that already lock before reading (InfoObject, InfoSource, DTP) were left on the locking session, since the lock refreshes the session's model buffer (verified live)
 - `bw_set_transformation_routine` — EXPERT routines on HANA-runtime transformations no longer generate a plain ABAP class instead of an AMDP class. The initial step is now sent bare (no `classNameM`, no `methodNameM`, no per-field target elementRefs, no `sourceSegment` on the group) so the server derives the class itself and generates a proper AMDP class (`interfaces IF_AMDP_MARKER_HDB`, method `BY DATABASE PROCEDURE FOR HDB LANGUAGE SQLSCRIPT`); the server-generated class source is left untouched (the END-oriented SELECT skeleton no longer applies, since the EXPERT IN type follows source columns and OUT follows target columns). Verified against a native Eclipse BWMT trace
 - `bw_set_transformation_routine` — creating a global routine on a transformation that has no existing rule group no longer throws. When no `<group id="1">` is present the new group is appended as the last child of `<trfn:transformation>` instead of requiring an existing group to insert before
+- `bw_get_request` / `bw_list_requests` — the message log (the primary diagnostic source) no longer dies on a 404 from the storage-dependent header/DTP-info/process endpoints when the storage code is wrong; each section is now isolated via `Promise.allSettled` and reported independently
 
 ---
 

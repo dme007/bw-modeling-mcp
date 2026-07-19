@@ -798,19 +798,23 @@ function escapeXml(s: string): string {
 
 export interface CreateQueryArgs {
   query_name: string;
-  infoprovider: string;
+  infoprovider?: string;
   description?: string;
+  copy_from?: string;
 }
 
 /**
- * bw_create_query — create a new, empty, consistent BW Query (TLOGO ELEM) on an
- * InfoProvider in package $TMP.
+ * bw_create_query — create a new, consistent BW Query (TLOGO ELEM) on an
+ * InfoProvider in package $TMP. With copy_from, the new query is created as a full
+ * copy of an existing query (the server copies the entire source content).
  *
- * Wire protocol per payloads/query_create.md:
+ * Wire protocol per payloads/query_create.md (and payloads/query_copy.md for the
+ * copy variant):
  * 1. GET iprovexists           → validate the InfoProvider
  * 2. GET queryint compexist    → name check + server-generated ELEMUID
  * 3. POST comp/enq action=lock → lockHandle (activity_context CREA)
- * 4. POST query/{name}/a       → create (fresh client, session isolation)
+ * 4. POST query/{name}/a       → create (fresh client, session isolation);
+ *                                copy adds copyFromObjectName={SOURCE_UPPER}
  * 5. GET query/{name}/a        → verify persistence
  * 6. POST comp/enq action=unlock
  *
@@ -823,8 +827,40 @@ export async function bwCreateQuery(
 ): Promise<string> {
   const nameUpper = args.query_name.toUpperCase();
   const nameLower = args.query_name.toLowerCase();
-  const iprovUpper = args.infoprovider.toUpperCase();
   const description = args.description ?? args.query_name;
+  const copyFromUpper = args.copy_from?.toUpperCase();
+  const copyFromLower = args.copy_from?.toLowerCase();
+
+  // Resolve the InfoProvider. When copying, validate the source and — if no
+  // infoprovider was given — derive it from the source query's providerName.
+  let iprovUpper: string;
+  if (copyFromLower) {
+    const srcExist = await client.rawGet(
+      `/sap/bw/modeling/queryint?action=compexist&compid=${copyFromLower}&type=ELEM`,
+      { 'bwmt-level': '50' });
+    if (srcExist.headers['compexist'] !== 'true') {
+      throw new Error(`Source query '${copyFromUpper}' does not exist (compexist != true).`);
+    }
+    if (args.infoprovider) {
+      iprovUpper = args.infoprovider.toUpperCase();
+    } else {
+      const srcGet = await client.get(`/sap/bw/modeling/query/${copyFromLower}/a`, queryAccept());
+      const mainOpen = srcGet.body.match(/<Qry:mainComponent\b[^>]*>/)?.[0] ?? '';
+      const prov = mainOpen.match(/\bproviderName="([^"]+)"/)?.[1];
+      if (!prov) {
+        throw new Error(
+          `Could not derive the InfoProvider from source query '${copyFromUpper}' ` +
+          `(no providerName on its mainComponent).`
+        );
+      }
+      iprovUpper = prov.toUpperCase();
+    }
+  } else {
+    if (!args.infoprovider) {
+      throw new Error('infoprovider is required when copy_from is not set.');
+    }
+    iprovUpper = args.infoprovider.toUpperCase();
+  }
 
   // Step 1: Validate the InfoProvider.
   const iprovResult = await client.rawGet(
@@ -915,8 +951,10 @@ export async function bwCreateQuery(
     // Step 5: Create POST on a fresh client (session isolation from the lock).
     const client2 = createClientFromEnv();
     const csrf2 = await client2.getCsrfToken();
+    // Copy adds copyFromObjectName={SOURCE_UPPER} before compuid (payloads/query_copy.md).
+    const copyParam = copyFromUpper ? `copyFromObjectName=${copyFromUpper}&` : '';
     const createResponse = await client2.rawPost(
-      `/sap/bw/modeling/query/${nameLower}/a?compuid=${elemuid}&lockHandle=${lockHandle}`,
+      `/sap/bw/modeling/query/${nameLower}/a?${copyParam}compuid=${elemuid}&lockHandle=${lockHandle}`,
       xmlBody,
       {
         'Development-Class': '$TMP',
@@ -968,10 +1006,13 @@ export async function bwCreateQuery(
       infoprovider_tlogo: infoproviderTlogo,
       infoarea,
       elemuid,
+      ...(copyFromUpper ? { copied_from: copyFromUpper } : {}),
       check_messages: checkMessages,
-      message:
-        `Query '${nameUpper}' created empty and consistent on InfoProvider '${iprovUpper}' ` +
-        `in package $TMP. It has no rows, columns, or key figures yet.`,
+      message: copyFromUpper
+        ? `Query '${nameUpper}' created as a copy of '${copyFromUpper}' on InfoProvider '${iprovUpper}' ` +
+          `in package $TMP, including the full source content (layout, filter, variables, key figures).`
+        : `Query '${nameUpper}' created empty and consistent on InfoProvider '${iprovUpper}' ` +
+          `in package $TMP. It has no rows, columns, or key figures yet.`,
     });
   } catch (err) {
     // The lock was acquired; attempt to release it before rethrowing.

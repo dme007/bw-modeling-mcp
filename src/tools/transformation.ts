@@ -1,8 +1,26 @@
-import { BwClient, MEDIA_TYPES, createClientFromEnv } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead } from '../bw-client.js';
 import { parseInfoObjectProps } from './infoobject.js';
-import { parseActivationMessages, parseDtpsDeactivated } from './activation.js';
+import { parseActivationMessages, parseDtpsDeactivated, bwActivate } from './activation.js';
 
 const TRFN_ACCEPT = MEDIA_TYPES['trfn'];
+
+/**
+ * Read the inactive (/m) version of a Transformation through a FRESH session
+ * with forceCacheUpdate=true.
+ *
+ * The shared long-lived client pins a per-session model buffer once it has read
+ * an object; later PRE-LOCK reads return that stale state even with
+ * forceCacheUpdate=true (verified live). A read-modify-write built on such a
+ * read silently resurrects old attribute values on the PUT — this reverted an
+ * already-persisted HANARuntime switch. A fresh session always returns the
+ * database state, including an existing unactivated M draft. (Locking does
+ * refresh the buffer, but the reads below happen before locking.)
+ */
+async function freshReadInactive(
+  trfnLower: string
+): Promise<{ body: string; headers: Record<string, string> }> {
+  return freshRead(`/sap/bw/modeling/trfn/${trfnLower}/m`, TRFN_ACCEPT);
+}
 
 // ── bwCreateTransformation ────────────────────────────────────────────────────
 
@@ -130,9 +148,10 @@ export async function bwCreateTransformation(
     true,
   );
 
-  // Step 4: Verify persisted
+  // Step 4: Verify persisted — through a fresh session so the check reflects the
+  // database, not the creating session's model buffer.
   try {
-    await client.get(`/sap/bw/modeling/trfn/${trfnLower}/m`, TRFN_ACCEPT);
+    await freshReadInactive(trfnLower);
   } catch {
     throw new Error(
       `Transformation '${trfnName}' was not persisted after creation ` +
@@ -163,12 +182,11 @@ export async function bwCreateTransformation(
  * Note: Transformation name is a UUID-like generated key, not human-readable.
  */
 export async function bwGetTransformation(
-  client: BwClient,
+  _client: BwClient,
   transformationName: string,
   format: 'text' | 'raw' = 'text',
 ): Promise<string> {
-  const path = `/sap/bw/modeling/trfn/${transformationName.toLowerCase()}/m`;
-  const result = await client.get(path, TRFN_ACCEPT);
+  const result = await freshReadInactive(transformationName.toLowerCase());
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
   const ts = result.headers['timestamp'] ?? '';
   const xml = result.body;
@@ -1071,8 +1089,7 @@ export async function bwUpdateTransformation(
   let srcUpper = sourceField?.toUpperCase() ?? '';
 
   // Step 1: Read current Transformation (get full XML + timestamp)
-  const trfnPath = `/sap/bw/modeling/trfn/${transformationName.toLowerCase()}/m`;
-  const trfnResult = await client.get(trfnPath, TRFN_ACCEPT);
+  const trfnResult = await freshReadInactive(transformationName.toLowerCase());
   const timestamp = trfnResult.headers['timestamp'] ?? trfnResult.headers['TIMESTAMP'];
   const originalXml = trfnResult.body;
 
@@ -1622,10 +1639,7 @@ export async function bwSetTransformationRoutine(
   const methodName = `GLOBAL_${routineTypeUpper}`;
 
   // Step 1: GET current XML
-  const { body: xml1, headers: headers1 } = await client.get(
-    `/sap/bw/modeling/trfn/${trfnLower}/m`,
-    TRFN_ACCEPT
-  );
+  const { body: xml1, headers: headers1 } = await freshReadInactive(trfnLower);
   const timestamp1 = headers1['timestamp'] ?? '';
 
   // Step 2: Derive classNameM — from classNameA on root, from any existing StepRoutine, or
@@ -1894,10 +1908,7 @@ export async function bwSetTransformationExpertRoutine(
   const routineTypeUpper = routineType.toUpperCase();
 
   // Step 1: GET master — derive class/method and verify the routine rule exists.
-  const { body: xml0 } = await client.get(
-    `/sap/bw/modeling/trfn/${trfnLower}/m`,
-    TRFN_ACCEPT,
-  );
+  const { body: xml0 } = await freshReadInactive(trfnLower);
 
   // Derive the generated class name (_A → _M), unless the caller overrides it.
   let classNameM = className;
@@ -1966,10 +1977,7 @@ export async function bwSetTransformationExpertRoutine(
 
   // Step 3: Re-read the master to capture a fresh timestamp (the class edit does not bump
   //         the trfn timestamp, but re-reading avoids any optimistic-locking mismatch).
-  const { body: xml1, headers: h1 } = await client.get(
-    `/sap/bw/modeling/trfn/${trfnLower}/m`,
-    TRFN_ACCEPT,
-  );
+  const { body: xml1, headers: h1 } = await freshReadInactive(trfnLower);
   const timestamp = h1['timestamp'] ?? h1['TIMESTAMP'] ?? '';
 
   // Step 4: Lock → PUT the master back unchanged. This is the step the class-only path
@@ -2066,10 +2074,7 @@ export async function bwSetTransformationRoutineFields(
   const trfnLower = transformationName.toLowerCase();
   const trfnUpper = transformationName.toUpperCase();
 
-  const { body: xml, headers } = await client.get(
-    `/sap/bw/modeling/trfn/${trfnLower}/m`,
-    TRFN_ACCEPT
-  );
+  const { body: xml, headers } = await freshReadInactive(trfnLower);
   const timestamp = headers['timestamp'] ?? '';
 
   // Capture: (1) opening rule tag, (2) old target block, (3) self-closing step, (4) whitespace + </rule>
@@ -2187,10 +2192,7 @@ export async function bwDeleteTransformationRoutine(
   const routineTypeUpper = routineType.toUpperCase();
 
   // Step 1: GET current XML
-  const { body: xml, headers } = await client.get(
-    `/sap/bw/modeling/trfn/${trfnLower}/m`,
-    TRFN_ACCEPT
-  );
+  const { body: xml, headers } = await freshReadInactive(trfnLower);
   const timestamp = headers['timestamp'] ?? '';
 
   // Step 2: Locate the group that contains the rule with the matching routinetype.
@@ -2254,74 +2256,186 @@ export async function bwDeleteTransformationRoutine(
 // ── bwSetTransformationRuntime ────────────────────────────────────────────────
 
 /**
- * bw_set_transformation_runtime — toggle HANARuntime on a Transformation.
+ * Read the HANARuntime attribute from the ACTIVE version of a Transformation.
+ * Returns 'true' | 'false', or null when there is no active version yet
+ * (never activated) or the attribute is absent. The active version is the
+ * authoritative state — the inactive (/m) version can carry an unactivated edit.
  *
- * Only changes the HANARuntime attribute on the root <trfn:transformation>
- * element. All rules and segments are passed through unchanged.
- * Returns lock_handle for bw_activate.
+ * MUST read through a fresh session with forceCacheUpdate=true. A session that
+ * has previously read (or locked) the object keeps serving its stale model
+ * buffer even with forceCacheUpdate — verified live: after a persisted switch,
+ * the switching session still reported the OLD value while a fresh session saw
+ * the new one. Reading through the shared client produced false-negative
+ * "runtime_not_persisted" errors AND wrong "already_set" decisions.
  */
-export async function bwSetTransformationRuntime(
-  client: BwClient,
-  transformationName: string,
-  runtime: 'hana' | 'abap',
-  transport?: string
-): Promise<string> {
-  const trfnUpper = transformationName.toUpperCase();
-  const trfnLower = transformationName.toLowerCase();
+async function readActiveHanaRuntime(trfnLower: string): Promise<'true' | 'false' | null> {
+  try {
+    const freshReader = createClientFromEnv();
+    const { body } = await freshReader.get(
+      `/sap/bw/modeling/trfn/${trfnLower}/a?forceCacheUpdate=true`,
+      TRFN_ACCEPT
+    );
+    const m = body.match(/\bHANARuntime="(true|false)"/);
+    return (m?.[1] as 'true' | 'false' | undefined) ?? null;
+  } catch {
+    return null;
+  }
+}
 
-  // Step 1: Lock
+/**
+ * Lock → GET /m → flip HANARuntime → PUT → activate, as one attempt.
+ * Returns the parsed activation result. Releases the lock on any failure
+ * before activation, and delegates the unlock-after-activate to bwActivate.
+ *
+ * The whole attempt runs in a FRESH session: the shared long-lived client can
+ * hold a stale server-side model buffer for this object (from an earlier read
+ * in another tool call), and a stale GET /m here would silently resurrect old
+ * attribute values (including HANARuntime itself) on the PUT — this is how
+ * previously-persisted runtime switches got reverted. forceCacheUpdate on the
+ * GET additionally syncs the server model cache from the DB, as Eclipse does.
+ */
+async function attemptRuntimeSwitch(
+  trfnUpper: string,
+  trfnLower: string,
+  targetValue: 'true' | 'false',
+  transport?: string
+): Promise<Record<string, unknown>> {
+  const client = createClientFromEnv();
   const lockHandle = await client.lock('trfn', trfnLower);
 
   try {
-    // Step 2: GET current XML
     const { body: xml, headers } = await client.get(
-      `/sap/bw/modeling/trfn/${trfnLower}/m`,
+      `/sap/bw/modeling/trfn/${trfnLower}/m?forceCacheUpdate=true`,
       TRFN_ACCEPT
     );
     const timestamp = headers['timestamp'] ?? '';
 
-    // Step 3: Check current value — early return if already correct
-    const currentMatch = xml.match(/\bHANARuntime="(true|false)"/);
-    const currentValue = currentMatch?.[1] ?? 'true';
-    const targetValue  = runtime.toLowerCase() === 'hana' ? 'true' : 'false';
-
-    if (currentValue === targetValue) {
-      await client.unlock('trfn', trfnLower).catch(() => {/* ignore */});
-      return JSON.stringify({
-        success: true,
-        already_set: true,
-        message:
-          `Transformation ${trfnUpper} already has HANARuntime="${targetValue}". No change needed.`,
-        runtime,
-        transformation_name: trfnUpper,
-        object_type: 'trfn',
-      });
+    if (!/\bHANARuntime="(true|false)"/.test(xml)) {
+      throw new Error('HANARuntime attribute not found in transformation XML — cannot switch runtime.');
     }
-
-    // Step 4: Replace HANARuntime attribute
+    // Force the target value onto the inactive version. The string may already equal
+    // the target when the inactive (/m) version has drifted from the active (/a) one;
+    // that is exactly the case we must still PUT + activate to bring the active version
+    // in line, so an unchanged string is not an error here.
     const updatedXml = xml.replace(
       /\bHANARuntime="(true|false)"/,
       `HANARuntime="${targetValue}"`
     );
 
-    if (updatedXml === xml) {
-      throw new Error('HANARuntime replacement failed — XML unchanged.');
-    }
-
-    // Step 5: PUT
     await client.put('trfn', trfnLower, lockHandle, updatedXml, timestamp, transport);
   } catch (err) {
     await client.unlock('trfn', trfnLower).catch(() => {/* ignore */});
     throw err;
   }
 
+  // bwActivate uses a fresh session, primes the HANA cache, retries on the known
+  // "rule deleted" pattern, and unlocks afterwards. If it throws (network/transport),
+  // release the lock so it does not linger.
+  let activationRaw: string;
+  try {
+    activationRaw = await bwActivate(client, 'trfn', trfnUpper, lockHandle, transport);
+  } catch (err) {
+    await client.unlock('trfn', trfnLower).catch(() => {/* ignore */});
+    throw err;
+  }
+
+  try {
+    return JSON.parse(activationRaw) as Record<string, unknown>;
+  } catch {
+    return { raw: activationRaw };
+  }
+}
+
+/**
+ * bw_set_transformation_runtime — switch a Transformation between HANA and ABAP
+ * runtime, activate it, and verify the change landed in the ACTIVE version.
+ *
+ * Only the HANARuntime attribute on the root <trfn:transformation> element is
+ * changed; all rules and segments are passed through unchanged.
+ *
+ * The current runtime is read from the active version (/a), so "already set" is
+ * decided against the authoritative state — not against an unactivated /m edit.
+ *
+ * The switch is not complete until activation, so the tool activates internally
+ * and then re-reads the active version. Success is returned ONLY when the active
+ * version actually reports the target HANARuntime. If the server silently keeps
+ * the old runtime (e.g. it refuses HANA for this transformation), an error is
+ * returned instead of a false-positive success. One retry covers a transient
+ * non-persist. No separate bw_activate call is required.
+ */
+export async function bwSetTransformationRuntime(
+  _client: BwClient,
+  transformationName: string,
+  runtime: 'hana' | 'abap',
+  transport?: string
+): Promise<string> {
+  const trfnUpper = transformationName.toUpperCase();
+  const trfnLower = transformationName.toLowerCase();
+  const targetValue: 'true' | 'false' = runtime.toLowerCase() === 'hana' ? 'true' : 'false';
+
+  // Step 1: Decide against the ACTIVE version — the authoritative runtime state.
+  const activeValue = await readActiveHanaRuntime(trfnLower);
+  if (activeValue === targetValue) {
+    return JSON.stringify({
+      success: true,
+      already_set: true,
+      message:
+        `Transformation ${trfnUpper} already runs on ${runtime.toUpperCase()} ` +
+        `(active version HANARuntime="${targetValue}"). No change needed.`,
+      runtime,
+      transformation_name: trfnUpper,
+      object_type: 'trfn',
+    });
+  }
+
+  // Step 2: Switch + activate, then verify against the active version. Retry once
+  // to cover a transient non-persist; give up with an error if it still won't stick.
+  const MAX_ATTEMPTS = 2;
+  let lastActivation: Record<string, unknown> = {};
+  let verified: 'true' | 'false' | null = null;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    lastActivation = await attemptRuntimeSwitch(trfnUpper, trfnLower, targetValue, transport);
+    verified = await readActiveHanaRuntime(trfnLower);
+    if (verified === targetValue) break;
+  }
+
+  // Step 3: No false-positive — report failure if the active version did not change.
+  if (verified !== targetValue) {
+    return JSON.stringify({
+      success: false,
+      error: 'runtime_not_persisted',
+      message:
+        `Runtime switch to "${runtime}" did NOT persist. After activation the active version reports ` +
+        `HANARuntime="${verified ?? 'unknown'}" (expected "${targetValue}"). The BW server may refuse ` +
+        `${runtime.toUpperCase()} runtime for this transformation.`,
+      runtime,
+      expected_hana_runtime: targetValue,
+      active_hana_runtime: verified,
+      activation_messages: lastActivation['messages'],
+      transformation_name: trfnUpper,
+      object_type: 'trfn',
+    });
+  }
+
+  // A runtime switch can deactivate dependent DTPs (impact analysis) — surface them so the
+  // caller re-activates them; bwActivate already parses this from the activation response.
+  const deactivatedDtps = lastActivation['dtps_deactivated_by_impact_analysis'];
+
   return JSON.stringify({
     success: true,
+    activated: true,
+    verified: true,
     message:
-      `Transformation ${trfnUpper} runtime switched to "${runtime}" (HANARuntime="${runtime === 'hana' ? 'true' : 'false'}"). Call bw_activate to activate.`,
+      `Transformation ${trfnUpper} switched to "${runtime}" runtime and activated ` +
+      `(active version HANARuntime="${targetValue}", verified). No separate bw_activate needed.`,
     runtime,
-    lock_handle: lockHandle,
     transformation_name: trfnUpper,
     object_type: 'trfn',
+    activation_messages: lastActivation['messages'],
+    ...(deactivatedDtps ? {
+      dtps_deactivated_by_impact_analysis: deactivatedDtps,
+      next_step: 'Re-activate the deactivated DTP(s) with bw_activate (object_type="dtpa", lock_handle="").',
+    } : {}),
   });
 }

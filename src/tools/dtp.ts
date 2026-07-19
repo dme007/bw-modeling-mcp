@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES, createClientFromEnv } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead } from '../bw-client.js';
 import { bwActivate } from './activation.js';
 
 interface XrefEntry {
@@ -84,7 +84,7 @@ export async function bwGetDtps(
  */
 export async function bwGetDtpDetails(client: BwClient, dtpName: string): Promise<string> {
   const path = `/sap/bw/modeling/dtpa/${dtpName.toLowerCase()}/m`;
-  const result = await client.get(path, MEDIA_TYPES['dtpa']);
+  const result = await freshRead(path, MEDIA_TYPES['dtpa']);
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
   return `DTP: ${dtpName.toUpperCase()}\nStatus: ${status}\n\n${result.body}`;
 }
@@ -229,8 +229,10 @@ function parseDtpXml(xml: string, status: string): DtpInfo {
  *   Parse key fields and return readable summary.
  */
 export async function bwGetDtp(client: BwClient, dtpName: string): Promise<string> {
-  const path = `/sap/bw/modeling/dtpa/${dtpName.toLowerCase()}/m?forceCacheUpdate=true`;
-  const result = await client.get(path, MEDIA_TYPES['dtpa']);
+  // Fresh session: the shared client's buffer serves the stale inactive shadow
+  // after this session touched the DTP (forceCacheUpdate alone does not help there).
+  const path = `/sap/bw/modeling/dtpa/${dtpName.toLowerCase()}/m`;
+  const result = await freshRead(path, MEDIA_TYPES['dtpa']);
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
 
   const info = parseDtpXml(result.body, status);
@@ -327,6 +329,7 @@ export interface CreateDtpArgs {
   source_system?: string;
   target_name: string;
   target_type: string;
+  target_object_subtype?: string;
   description?: string;
   package?: string;
   filter_field?: string;
@@ -382,14 +385,30 @@ export async function bwCreateDtp(
   }
 
   // Target element attributes. For ADSO/TRCS targets tlogo and type coincide. For an
-  // InfoObject-attribute target (target_type "IOBJ") they differ: tlogo "IOBJ" (object kind)
-  // but type "IOBJA" (DTP target role = InfoObject Attributes) — the same tlogo != type pattern
-  // as the RSDS source. Text/hierarchy targets (IOBJT/IOBJH) are not yet supported.
+  // InfoObject target (target_type "IOBJ") they differ: tlogo "IOBJ" (object kind) but the
+  // type carries the loaded sub-object role — the same tlogo != type pattern as the RSDS
+  // source. The role is selected by target_object_subtype: ATTR → IOBJA (attributes, default),
+  // TEXT → IOBJT (texts), HIER → IOBJH (hierarchies). The type code must match the sub-object
+  // fed by the transformation chain, otherwise the server rejects the create with
+  // SADT_RESOURCE 006 (verified against the GUI reference trace: <target ... type="IOBJT"/>).
   let targetTlogo: string;
   let targetTypeAttr: string;
   if (tgtType === 'IOBJ') {
+    const subtype = (args.target_object_subtype ?? 'ATTR').toUpperCase();
+    const IOBJ_SUBTYPE_TO_TYPE: Record<string, string> = {
+      ATTR: 'IOBJA',
+      TEXT: 'IOBJT',
+      HIER: 'IOBJH',
+    };
+    const typeCode = IOBJ_SUBTYPE_TO_TYPE[subtype];
+    if (!typeCode) {
+      throw new Error(
+        `Invalid target_object_subtype "${args.target_object_subtype}" for an InfoObject target. ` +
+        `Valid values: ATTR (attributes, default), TEXT (texts), HIER (hierarchies).`
+      );
+    }
     targetTlogo = 'IOBJ';
-    targetTypeAttr = 'IOBJA';
+    targetTypeAttr = typeCode;
   } else {
     targetTlogo = tgtType;
     targetTypeAttr = tgtType;
