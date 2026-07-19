@@ -19,7 +19,7 @@ Read the blog (DE + EN): https://www.nextlytics.com/blog/agentic-ai-meets-sap-bw
 ## 🆕 What's New — v1.0.0
 
 **The biggest feature drop yet — and the jump to 1.0.** A broad wave of write tools
-rounds out full **read/write BW/4HANA modeling coverage**. No breaking changes.
+rounds out full **read/write BW/4HANA modeling coverage**.
 
 **🏆 Query authoring — from read-only to fully writable**
 
