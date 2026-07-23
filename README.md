@@ -16,6 +16,26 @@ Read the blog (DE + EN): https://www.nextlytics.com/blog/agentic-ai-meets-sap-bw
 
 ---
 
+## 🆕 What's New — v1.1.0
+
+**Two new authoring tools and a safer DTP filter-routine path.**
+
+**🏆 New tools**
+
+- `bw_create_rkf` — create a reusable Restricted Key Figure (ELEM) on an InfoProvider from a base key figure plus characteristic restrictions. Built for mass creation (one RKF per call); each value is validated against the InfoProvider and written consistent, no separate activation
+- `bw_add_process_chain_program` — add an "Execute ABAP Program" step (RSPC type ABAP) to an existing chain, optionally with an SE38 variant; in-place edit with `before` / `after` / `predecessor` positioning, idempotent
+
+**➕ Improved**
+
+- `ADSOREM` step type (DSO request cleanup) in `bw_create_process_chain` and `bw_update_process_chain` — per-aDSO cleanup action and request selection
+
+**🐛 Fixes**
+
+- `bw_set_dtp_filter_routine` — the routine is syntax-checked before activation; broken code is reported instead of falsely marked "activated", the ADT lock is released on error, and real activation failures are surfaced
+- Process chain transport check — a stale-session `validateobject` 404 is handled softly instead of aborting, so it no longer blocks follow-up writes to local (`$TMP`) chains
+
+---
+
 ## 🆕 What's New — v1.0.0
 
 **The biggest feature drop yet — and the jump to 1.0.** A broad wave of write tools
@@ -134,10 +154,11 @@ rounds out full **read/write BW/4HANA modeling coverage**.
 ### CompositeProvider (Read)
 - Read CompositeProvider structure — view node type (Union/Join), source providers (inputs) with mapping count, all fields with dimension classification, join conditions, and temporal join details
 
-### Global CP Components (Read)
+### Global CP Components (Read & Authoring)
 - Read global Calculated Key Figure (CKF) — formula recursively resolved to a human-readable string, full dependency graph of all referenced sub-components
 - Read global Restricted Key Figure (RKF) — base measure, all characteristic restriction groups with field and value details
 - Read global Structure — all members with Formula/Selection breakdown, referenced components, characteristic filters, optional child members
+- Create a reusable Restricted Key Figure (RKF) on an InfoProvider — from a base key figure plus characteristic restrictions (built for mass creation, one per call); each value is validated against the InfoProvider and written consistent, no separate activation
 
 ### Repository Navigation
 - Navigate the full BW repository tree — drill from InfoArea to type folder to object to sub-folder, mirroring the Eclipse BWMT Project Explorer; each entry returns a `children_path` for seamless drill-down
@@ -173,9 +194,9 @@ rounds out full **read/write BW/4HANA modeling coverage**.
 - Automatic variant detail per step: ABAP program and selection variant, TRIGGER scheduling parameters, ADSOACT/ADSOREM aDSO targets and cleanup settings, PLSWITCHL/P target aDSO, DECISION branching formulas — all embedded inline in a single tool call
 - Recursive sub-chain expansion: CHAIN-type steps reference other Process Chains — call `bw_get_process_chain` again on any referenced chain name to expand the full hierarchy
 - Generic process variant reader: covers all 93 BW/4HANA process types including custom Z-types; unknown types return oDetail as raw JSON
-- Create a Process Chain from a step and edge list — supported types: `DTP_LOAD`, `ADSOACT`, `CHAIN`, collectors `AND` / `OR` / `XOR`
+- Create a Process Chain from a step and edge list — supported types: `DTP_LOAD`, `ADSOACT`, `ADSOREM` (DSO request cleanup), `CHAIN`, collectors `AND` / `OR` / `XOR`
 - Replace the step model of an existing chain; activate a chain
-- Incrementally edit an existing chain — append a DTP load step (optionally with its own DSO activation), swap one DTP load variant for another, add on-error (negative) links mirroring the existing success links
+- Incrementally edit an existing chain — append a DTP load step (optionally with its own DSO activation), swap one DTP load variant for another, add on-error (negative) links mirroring the existing success links, add an "Execute ABAP Program" step (optionally with an SE38 variant) positioned before/after any step
 - Create a DECISION process variant for use as a branch/decision step
 - Monitor execution runs: history with status and timestamps, step-level and message-level run detail, last status per chain across the entire system
 
@@ -418,7 +439,7 @@ Start (execute) a run of an existing, active DTP. Returns the new run request id
 Update a DTP — description, value filters on fields, and extraction mode (`extraction_mode` = `full` / `delta`). Note: switching between Delta and Full has BW delta-init implications — a later delta load may require re-initialization.
 
 ### `bw_set_dtp_filter_routine`
-Set an ABAP routine filter on a DTP field.
+Set an ABAP routine filter on a DTP field. The generated routine's inactive version is syntax-checked before activation — broken code is reported with the ABAP messages and the DTP is left unchanged, instead of being falsely reported as activated.
 
 ### `bw_get_push_schema`
 Get the expected JSON schema for pushing data into a write-interface aDSO.
@@ -461,7 +482,7 @@ Read a Process Chain (RSPC) definition — header metadata, scheduling and monit
 Read the detail configuration of a single Process Chain step variant. Generic across all process types — oDetail rendered as indented JSON. Use process_type and variant_name from `bw_get_process_chain` output.
 
 ### `bw_create_process_chain`
-Create a Process Chain (RSPC) from a step and edge list — builds the model, creates a trigger-only skeleton, then updates it with the full model in one operation; optionally activates. Supported step types: `DTP_LOAD`, `ADSOACT`, `CHAIN` (local sub-chain start), collectors `AND` / `OR` / `XOR`.
+Create a Process Chain (RSPC) from a step and edge list — builds the model, creates a trigger-only skeleton, then updates it with the full model in one operation; optionally activates. Supported step types: `DTP_LOAD`, `ADSOACT`, `ADSOREM` (DSO request cleanup), `CHAIN` (local sub-chain start), collectors `AND` / `OR` / `XOR`.
 
 ### `bw_update_process_chain`
 Replace the step model (nodes and edges) of an existing Process Chain, preserving the existing trigger node and scheduling. Optionally overrides description and InfoArea.
@@ -480,6 +501,9 @@ Add on-error (negative) links to an existing Process Chain by mirroring the exis
 
 ### `bw_create_decision_variant`
 Create a DECISION process variant (a standalone TLOGO object) for use as a branch/decision step in a Process Chain.
+
+### `bw_add_process_chain_program`
+Add an "Execute ABAP Program" step (RSPC process type ABAP) to an existing Process Chain, optionally with a named SE38 selection variant. In-place edit — the program call is stored as an inline process variant inside the chain model (no separate variant object). Positioning via `before` / `after` / `predecessor` (default: strand end closest to the trigger); idempotent (a matching ABAP step is skipped), with ETag concurrency and transport handling.
 
 ### `bw_preview_datasource` _(Read only)_
 Fetch a live data preview from a DataSource. Resolves field names automatically and renders a formatted table. Parameters: `datasource_name`, `source_system`, `records` (default 20).
@@ -507,6 +531,9 @@ Read a global Restricted Key Figure — base measure, all characteristic restric
 
 ### `bw_get_structure` _(Read only)_
 Read a global Structure — all members with type (Formula/Selection), referenced components, characteristic filters, optional child members, and metadata.
+
+### `bw_create_rkf`
+Create one reusable Restricted Key Figure (TLOGO ELEM) on an InfoProvider from a base key figure plus one or more characteristic restrictions. Built for mass creation (one RKF per call); each restriction value is validated against the InfoProvider and mapped to its internal key before the write, and the RKF is written consistent (no separate activation step). Supports `Equal` / `Between` / `LessThan` / `GreaterThan` / `LessEqual` / `GreaterEqual` / `Contains` operators and exclusions, an optional InfoArea, and a transport request for transportable packages.
 
 ### `bw_list_contents` _(Read only)_
 Navigate the BW repository tree. Pass a path such as `""` (all InfoAreas), `"area/MYAREA"` (InfoArea contents), `"hcpr/CP_NAME"` (CP sub-folders), or `"adso/ADSO_NAME/trfn"` (Transformations on an aDSO). Each entry includes `children_path` to drill down further.

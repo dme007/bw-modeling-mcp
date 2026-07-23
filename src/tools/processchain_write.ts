@@ -51,6 +51,30 @@ interface StepAdsoAct {
   errorOnNonActivation?: boolean;
 }
 
+// One aDSO cleanup entry inside an ADSOREM ("Delete Requests from DataStore Object") step.
+interface AdsoRemDatastore {
+  // aDSO technical name whose requests are cleaned up.
+  datastore: string;
+  // Cleanup action code from the cockpit "Bereinigungsaktion" dropdown (single char).
+  // Observed: "A" = activate requests, "C" = remove old requests from the change log.
+  // The valid action depends on the aDSO type; an unsuitable action is rejected at activation.
+  action: string;
+  // Clean up all requests (ALL_REQUESTS). When true, the count/age selectors are ignored.
+  allRequests?: boolean;
+  // Keep the last N requests (NUMBER_REQUESTS); older ones are removed.
+  numberRequests?: number;
+  // Remove requests older than N days (NUMBER_DAYS).
+  numberDays?: number;
+  // Processing package size (PACKAGE_SIZE); 0 = server default.
+  packageSize?: number;
+}
+
+interface StepAdsoRem {
+  id: string;
+  type: 'ADSOREM';
+  remDatastores: AdsoRemDatastore[];
+}
+
 interface StepCollector {
   id: string;
   type: 'AND' | 'OR' | 'XOR';
@@ -72,7 +96,7 @@ interface StepGeneric {
   description?: string;
 }
 
-export type Step = StepDtpLoad | StepAdsoAct | StepCollector | StepDecision | StepGeneric;
+export type Step = StepDtpLoad | StepAdsoAct | StepAdsoRem | StepCollector | StepDecision | StepGeneric;
 
 export interface EdgeDef {
   from: string;
@@ -184,6 +208,42 @@ export interface AppendProcessChainDtpParams {
   transportRequest?: string;
 }
 
+export interface AddProcessChainProgramParams {
+  name: string;
+  // ABAP program / report to execute (e.g. "REPORT_NAME"). Resolved via the cockpit
+  // value help; stored in the inline variant's oDetail.PROGRAM.
+  program: string;
+  // Optional ABAP report (SE38) variant name (e.g. "VARIANT_NAME"). When given, it is
+  // stored in oDetail.VARIANT so the report runs with that selection variant.
+  variant?: string;
+  // Step/node description (sVariantDescription). Cosmetic.
+  description?: string;
+  // Cosmetic value-help enrichment carried in the oDetail rows. Optional — the server
+  // re-derives them from the program/variant when omitted.
+  programPackage?: string;
+  programDescription?: string;
+  variantDescription?: string;
+  // Call mode. true (default) → X_SYNCHRON; async is not verified, keep the default.
+  synchronous?: boolean;
+  // Call location. true (default) → X_LOCAL (run on this system).
+  local?: boolean;
+  // Insert BEFORE this node (its DTP/variant name, or an aDSO held by an ADSOACT node):
+  // the target's incoming edges are rerouted through the new program step, then the new
+  // step links to the target. Use this to run the program ahead of an existing step.
+  before?: string;
+  // Insert AFTER this node: the target's outgoing edges are rerouted to leave from the
+  // new step instead, so the program runs between the target and its successors.
+  after?: string;
+  // When neither before nor after is set, append behind the strand end closest to the
+  // trigger (same rule as bw_append_process_chain_dtp).
+  predecessor?: string;
+  // "both" (default): add a positive and a negative edge per new link ("always continue");
+  // "success_only": add only the positive edge.
+  edgeMode?: 'both' | 'success_only';
+  activate?: boolean;
+  transportRequest?: string;
+}
+
 // ── Low-level helpers ──────────────────────────────────────────────────────────
 
 function writeHeaders(csrf: string): Record<string, string> {
@@ -265,12 +325,23 @@ async function resolveTransportHeader(
         warning: `validateobject returned HTTP 404 twice; proceeding with the supplied transport_request '${chosenRequest.toUpperCase()}'.`,
       };
     }
-    throw new Error(
-      `Transport check (validateobject) returned HTTP 404 twice — the MCP session is stale ` +
-      `(not a transport, object or CSRF problem). Retry in a fresh session, or pass ` +
-      `transport_request. The chain was NOT written (a transportable chain must not be ` +
-      `saved without a transport request).`
-    );
+    // A validateobject 404 is a stale stateful-session artifact, not a real transport/object
+    // problem: in a healthy session the same call returns 200 (verified — e.g. a $TMP chain
+    // reports package "$TMP", requests:[]). It typically appears only AFTER an earlier write
+    // in the same session has rolled the ICF session (the first write of a session succeeds,
+    // the next one 404s here). Aborting therefore wrongly blocked follow-up writes to local
+    // ($TMP) chains, which need no transport at all. Instead proceed WITHOUT a transport
+    // header (same soft handling as bw_create_process_chain's pre-check): a $TMP object then
+    // saves fine, and a genuinely transportable object is still refused by the PUT with
+    // HTTP 403 ("system settings do not allow changes"), which the caller surfaces — at which
+    // point transport_request must be supplied.
+    return {
+      header: {},
+      warning:
+        `Transport check (validateobject) returned HTTP 404 (stale MCP session); proceeded ` +
+        `without a transport header. If the write fails with HTTP 403 the object is ` +
+        `transportable — retry with transport_request.`,
+    };
   };
 
   let vo: { body: string; headers: Record<string, string> };
@@ -352,6 +423,14 @@ function buildNode(step: Step, inlineKeyMap: Map<string, string>): object {
       iAutoRepeatWaitDuration: 0,
     };
   }
+  if (step.type === 'ADSOREM') {
+    return {
+      sProcessType: 'ADSOREM',
+      bIsReference: false,
+      sProcessVariant: inlineKeyMap.get(step.id)!,
+      iAutoRepeatWaitDuration: 0,
+    };
+  }
   if (COLLECTORS.has(step.type)) {
     return { sProcessType: step.type };
   }
@@ -384,6 +463,28 @@ function buildAdsoActVariant(step: StepAdsoAct, inlineKeyMap: Map<string, string
       DATASTORES: step.datastores.map((ds) => ({ DATASTORE: ds, DESCRIPTION: '', HOTCOLDFLAG: '' })),
       NOCONDENSE: step.requestsSequential ?? false,
       NOREQACTWARN: step.errorOnNonActivation ?? false,
+    },
+    aSocket: [],
+  };
+}
+
+// Build the inline variant for an ADSOREM ("Delete Requests from DataStore Object") step.
+// oDetail shape traced from a cockpit-saved variant: a DATASTORES array, one entry per aDSO,
+// each carrying its cleanup ACTION plus the request-selection options. The read-back
+// "DATASTORE.valueContext" enrichment is server-side only and is not sent on write.
+function buildAdsoRemVariant(step: StepAdsoRem, inlineKeyMap: Map<string, string>): object {
+  return {
+    sProcessVariant: inlineKeyMap.get(step.id)!,
+    sVariantDescription: '',
+    oDetail: {
+      DATASTORES: step.remDatastores.map((d) => ({
+        DATASTORE: d.datastore,
+        ACTION: d.action,
+        ALL_REQUESTS: d.allRequests ?? false,
+        NUMBER_REQUESTS: d.numberRequests ?? 0,
+        NUMBER_DAYS: d.numberDays ?? 0,
+        PACKAGE_SIZE: d.packageSize ?? 0,
+      })),
     },
     aSocket: [],
   };
@@ -505,11 +606,11 @@ function buildModelParts(
   const nodeTypeMap = new Map<string, string>([['TRIGGER', 'TRIGGER']]);
   steps.forEach((step) => nodeTypeMap.set(step.id, step.type));
 
-  // assign INLINE_n keys to ADSOACT nodes (starting at 1; trigger owns INLINE_0)
+  // assign INLINE_n keys to inline-configured nodes (ADSOACT, ADSOREM); trigger owns INLINE_0
   let inlineCounter = 1;
   const inlineKeyMap = new Map<string, string>();
   for (const step of steps) {
-    if (step.type === 'ADSOACT') {
+    if (step.type === 'ADSOACT' || step.type === 'ADSOREM') {
       inlineKeyMap.set(step.id, `INLINE_${inlineCounter++}`);
     }
   }
@@ -536,8 +637,12 @@ function buildModelParts(
   }));
 
   const stepInlineVariants = steps
-    .filter((s) => s.type === 'ADSOACT')
-    .map((s) => buildAdsoActVariant(s as StepAdsoAct, inlineKeyMap));
+    .filter((s) => s.type === 'ADSOACT' || s.type === 'ADSOREM')
+    .map((s) =>
+      s.type === 'ADSOACT'
+        ? buildAdsoActVariant(s as StepAdsoAct, inlineKeyMap)
+        : buildAdsoRemVariant(s as StepAdsoRem, inlineKeyMap)
+    );
 
   return { stepNodes, aEdge, stepInlineVariants };
 }
@@ -1372,5 +1477,267 @@ export async function bwAppendProcessChainDtp(
     }
   }
 
+  return JSON.stringify(result, null, 2);
+}
+
+// ── bw_add_process_chain_program ───────────────────────────────────────────────
+//
+// Add an "Execute ABAP Program" step (RSPC process type ABAP, "Programm ausführen") to
+// an existing chain in place. The program call is stored as an INLINE process variant
+// (bIsReference:false) inside the chain model — there is NO separate variant TLOGO
+// object and no extra POST. We send a placeholder inline key ("INLINE_PROG_n"); the
+// server rewrites it to a generated ILV_ key on save (same mechanism as the ADSOACT
+// inline variant in bw_append_process_chain_dtp).
+//
+// The oDetail schema was traced from the BW/4HANA Cockpit; see
+// payloads/process_chain_abap_program.md:
+//   { X_SYNCHRON:"X", X_LOCAL:"X", X_PROGRAM:"X",
+//     PROGRAM:[{ key, text, row:{ uri, name, description, package } }],
+//     VARIANT:[{ key, text, row:{ uri, name, description } }] }
+//
+// Positioning: `before` reroutes the target's incoming edges through the new step
+// (Start → PROGRAM → target), `after` reroutes the target's outgoing edges to leave from
+// the new step, and with neither the step is appended behind the strand end closest to
+// the trigger.
+
+const ABAP_PROGRAM_URI_BASE = '/sap/bc/http/sap/bw4/v1/system/abapreports';
+
+function buildAbapProgramVariant(
+  key: string,
+  params: AddProcessChainProgramParams
+): { node: object; inlineVariant: object } {
+  const prog = params.program.toUpperCase();
+  const variant = params.variant ? params.variant.toUpperCase() : undefined;
+  const synchronous = params.synchronous ?? true;
+  const local = params.local ?? true;
+
+  const oDetail: Record<string, unknown> = {
+    X_SYNCHRON: synchronous ? 'X' : '',
+    X_LOCAL: local ? 'X' : '',
+    X_PROGRAM: 'X',
+    PROGRAM: [
+      {
+        key: prog,
+        text: prog,
+        row: {
+          uri: `${ABAP_PROGRAM_URI_BASE}/${prog}`,
+          name: prog,
+          description: params.programDescription ?? '',
+          package: params.programPackage ?? '',
+        },
+      },
+    ],
+    VARIANT: variant
+      ? [
+          {
+            key: variant,
+            text: params.variantDescription ?? variant,
+            row: {
+              uri: `/sap/bw4/system/abapreports/${prog}/variants/${variant}`,
+              name: variant,
+              description: params.variantDescription ?? '',
+            },
+          },
+        ]
+      : [],
+  };
+
+  const node = {
+    sProcessType: 'ABAP',
+    bIsReference: false,
+    bProcess: true,
+    bData: false,
+    bSkipped: false,
+    iAutoRepeatCount: 0,
+    iAutoRepeatWaitDuration: 0,
+    iDebugWaitDuration: 0,
+    sNotificationFailure: '',
+    sNotificationSuccess: '',
+    sProcessVariant: key,
+    sVariantDescription: params.description ?? '',
+  };
+
+  const inlineVariant = {
+    sProcessVariant: key,
+    sVariantDescription: params.description ?? '',
+    oDetail,
+    aSocket: [],
+  };
+
+  return { node, inlineVariant };
+}
+
+// Resolve a node index from a name: a node's own sProcessVariant (DTP/variant name), or
+// an aDSO held by an ADSOACT node's inline DATASTORES. Mirrors bw_append_process_chain_dtp.
+function findChainNodeIndex(model: any, nodes: any[], nameU: string): number {
+  let idx = nodes.findIndex((n) => (n.sProcessVariant ?? '').toUpperCase() === nameU);
+  if (idx < 0) {
+    idx = nodes.findIndex((n) => {
+      if (n.sProcessType !== 'ADSOACT') return false;
+      const iv = (model.aInlineVariant ?? []).find((v: any) => v.sProcessVariant === n.sProcessVariant);
+      return (iv?.oDetail?.DATASTORES ?? []).some((d: any) => (d.DATASTORE ?? '').toUpperCase() === nameU);
+    });
+  }
+  return idx;
+}
+
+export async function bwAddProcessChainProgram(
+  client: BwClient,
+  params: AddProcessChainProgramParams
+): Promise<string> {
+  const { name, program, variant, before, after, predecessor, edgeMode = 'both', activate = false, transportRequest } = params;
+  const nameLc = name.toLowerCase();
+
+  if (before && after) {
+    throw new Error("Pass only one of 'before' or 'after' (they are mutually exclusive).");
+  }
+
+  // ── Step 1: GET current chain (ETag + model) ───────────────────────────────
+  let etag: string;
+  let model: any;
+  try {
+    const got = await client.rawGet(`${BASE}/${nameLc}`, { Accept: JSON_CT });
+    etag = got.headers['etag'] as string;
+    if (!etag) throw new Error('No ETag returned by GET');
+    const root = JSON.parse(got.body);
+    model = root.model ?? root;
+  } catch (err: any) {
+    throw new Error(`GET chain '${name}': ${err.message}`);
+  }
+
+  const nodes: any[] = model.aNode ?? (model.aNode = []);
+  const edges: any[] = model.aEdge ?? (model.aEdge = []);
+  model.aInlineVariant = model.aInlineVariant ?? [];
+
+  const progU = program.toUpperCase();
+  const varU = variant ? variant.toUpperCase() : undefined;
+
+  // Idempotency: an ABAP step already calling the same program (+ variant) → skip.
+  const duplicate = nodes.some((n) => {
+    if (n.sProcessType !== 'ABAP') return false;
+    const iv = model.aInlineVariant.find((v: any) => v.sProcessVariant === n.sProcessVariant);
+    const p = (iv?.oDetail?.PROGRAM?.[0]?.key ?? '').toUpperCase();
+    const v = (iv?.oDetail?.VARIANT?.[0]?.key ?? '').toUpperCase();
+    return p === progU && (varU ? v === varU : true);
+  });
+  if (duplicate) {
+    return JSON.stringify(
+      { chain: name, skipped: true, reason: `ABAP step for program '${progU}'${varU ? ` (variant '${varU}')` : ''} already present` },
+      null,
+      2
+    );
+  }
+
+  // ── Step 2: Build the new ABAP node + inline variant (placeholder key) ──────
+  const newIdx = nodes.length;
+  const key = `INLINE_PROG_${newIdx}`;
+  const { node, inlineVariant } = buildAbapProgramVariant(key, params);
+  nodes.push(node);
+  model.aInlineVariant.push(inlineVariant);
+
+  const link = (from: number, to: number) => {
+    edges.push({ iNodeIndexFrom: from, iNodeIndexTo: to, sStatus: 'positive', sSubStatus: '00' });
+    if (edgeMode !== 'success_only') {
+      edges.push({ iNodeIndexFrom: from, iNodeIndexTo: to, sStatus: 'negative', sSubStatus: '00' });
+    }
+  };
+
+  // ── Step 3: Wire the new node into the topology ────────────────────────────
+  let placement: string;
+  if (before) {
+    const targetIdx = findChainNodeIndex(model, nodes, before.toUpperCase());
+    if (targetIdx < 0) throw new Error(`'before' node '${before}' not found in chain '${name}'.`);
+    // Reroute every edge that pointed at the target so it now points at the new node,
+    // preserving each edge's status (e.g. the neutral edge coming from the trigger).
+    let rerouted = 0;
+    for (const e of edges) {
+      if (e.iNodeIndexTo === targetIdx && e.iNodeIndexFrom !== newIdx) {
+        e.iNodeIndexTo = newIdx;
+        rerouted++;
+      }
+    }
+    if (rerouted === 0) {
+      throw new Error(`'before' node '${before}' has no incoming edge to reroute (cannot insert ahead of a start node).`);
+    }
+    link(newIdx, targetIdx);
+    placement = `before ${before.toUpperCase()}`;
+  } else if (after) {
+    const targetIdx = findChainNodeIndex(model, nodes, after.toUpperCase());
+    if (targetIdx < 0) throw new Error(`'after' node '${after}' not found in chain '${name}'.`);
+    // Reroute the target's outgoing edges to leave from the new node instead, then link
+    // target → new, so the program runs between the target and its former successors.
+    for (const e of edges) {
+      if (e.iNodeIndexFrom === targetIdx && e.iNodeIndexTo !== newIdx) {
+        e.iNodeIndexFrom = newIdx;
+      }
+    }
+    link(targetIdx, newIdx);
+    placement = `after ${after.toUpperCase()}`;
+  } else {
+    // Strand-end append (same rule as bw_append_process_chain_dtp).
+    const hasOut = new Set(edges.map((e) => e.iNodeIndexFrom));
+    const predOf = (i: number) => edges.filter((e) => e.iNodeIndexTo === i).map((e) => e.iNodeIndexFrom);
+    const distFromTrigger = (i: number) => {
+      let d = 0, cur = i, guard = 0;
+      while (guard++ < 200) {
+        const ps = predOf(cur).filter((p) => nodes[p].sProcessType !== 'TRIGGER');
+        if (!ps.length) break;
+        cur = ps[0];
+        d++;
+      }
+      return d;
+    };
+    let predIdx: number;
+    if (!predecessor || predecessor === 'strand_end_auto') {
+      const terminals = nodes
+        .map((_n, i) => i)
+        .filter((i) => i !== newIdx && !hasOut.has(i) && nodes[i].sProcessType !== 'TRIGGER');
+      if (!terminals.length) throw new Error('No terminal strand end found to append to.');
+      predIdx = terminals.sort((a, b) => distFromTrigger(a) - distFromTrigger(b))[0];
+    } else {
+      predIdx = findChainNodeIndex(model, nodes, predecessor.toUpperCase());
+      if (predIdx < 0) throw new Error(`Predecessor '${predecessor}' not found in chain '${name}'.`);
+    }
+    link(predIdx, newIdx);
+    placement = predecessor && predecessor !== 'strand_end_auto' ? `after ${predecessor.toUpperCase()}` : 'at strand end';
+  }
+
+  // ── Step 4: PUT the edited model with If-Match and the transport header ─────
+  const csrf = await client.getCsrfToken();
+  const { header: transportHeader, warning: transportWarning } =
+    await resolveTransportHeader(client, `${BASE}/${nameLc}`, csrf, transportRequest);
+  const putCsrf = await client.getCsrfToken();
+  await client
+    .rawPut(`${BASE}/${nameLc}`, JSON.stringify(model), {
+      'Content-Type': JSON_CT,
+      Accept: '*/*',
+      'x-csrf-token': putCsrf,
+      'If-Match': etag,
+      'X-Requested-With': 'XMLHttpRequest',
+      ...transportHeader,
+    })
+    .catch((err: Error) => {
+      const stale = err.message.includes('HTTP 412');
+      throw new Error(
+        stale
+          ? `PUT model failed: ETag is stale (412 Precondition Failed) — the chain was modified between the GET and PUT. Re-read and retry. ${err.message}`
+          : `PUT edited model: ${err.message}`
+      );
+    });
+  refreshCsrf(client);
+
+  // ── Step 5: Result (+ optional activation) ─────────────────────────────────
+  const result: Record<string, unknown> = {
+    chain: name,
+    added: `ABAP program ${progU}${varU ? ` (variant ${varU})` : ''}`,
+    placement,
+    nodes: nodes.length,
+    edges: edges.length,
+    activated: activate,
+  };
+  if (transportWarning) result.transportWarning = transportWarning;
+  if (activate) {
+    attachActivation(result, await activateChain(client, nameLc));
+  }
   return JSON.stringify(result, null, 2);
 }

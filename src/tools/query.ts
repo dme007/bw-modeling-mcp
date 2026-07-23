@@ -73,6 +73,19 @@ export function rkfAccept(): string {
   return discovered ? `${discovered}, ${RKF_ACCEPT}` : RKF_ACCEPT;
 }
 
+// Concrete RKF media type observed in the create/update wire trace. Kept as a
+// static fallback for the RKF write flow when discovery advertises no rkf entry.
+const RKF_V10 = 'application/vnd.sap.bw.modeling.rkf-v1_10_0+xml';
+
+/**
+ * Media type for RKF write requests (create POST body / update PUT). Prefers the
+ * version the backend advertises via discovery so systems on a different SP level
+ * do not reject the write with HTTP 415; falls back to the traced v1_10_0 type.
+ */
+export function rkfWriteMediaType(): string {
+  return MEDIA_TYPES['rkf'] ?? RKF_V10;
+}
+
 // Fallback version range for the reusable structure resource (v1_9_0 is the
 // traced backend type). Kept alongside the other Accept helpers.
 const STRUCTURE_ACCEPT =

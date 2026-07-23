@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.1.0] — 2026-07-23
+
+### Added
+
+- `bw_create_rkf` — create one reusable Restricted Key Figure (RKF, TLOGO ELEM) on an InfoProvider from a base key figure plus one or more characteristic restrictions (built for mass creation, one RKF per call); each restriction value is validated against the InfoProvider and mapped to its internal key, and the RKF is written consistent (no separate activation step). Media-type negotiation follows the working query path and the observed backend behaviour: the CREA lock on the shared `comp/enq` endpoint uses the query media type (that endpoint negotiates the same type for every ELEM component, Query and RKF alike), and the writes on the dedicated `/rkf/<name>/a` resource send `Accept` as a version range (the resource negotiates a lower version than the discovery-advertised collection — verified live: resource speaks `rkf-v1_9_0` while discovery advertises `rkf-v1_10_0`), so a single discovery-derived value is never pinned. Verified live on BW/4HANA
+- `bw_add_process_chain_program` — add an "Execute ABAP Program" step (RSPC process type ABAP) to an existing Process Chain, optionally with a named SE38 selection variant. In-place edit: the program call is stored as an inline process variant inside the chain model (no separate variant object). Positioning via `before` / `after` / `predecessor` (default: strand end closest to the trigger); idempotent (an existing ABAP step for the same program/variant is skipped), with ETag concurrency and transport handling
+
+### Improved
+
+- `bw_create_process_chain` / `bw_update_process_chain` — new `ADSOREM` step type ("Delete Requests from DataStore Object" / DSO request cleanup) with an inline variant; one entry per aDSO carrying its cleanup action and request selection (all requests / keep last N / older than N days / package size)
+
+### Fixed
+
+- `bw_set_dtp_filter_routine` — the routine's inactive version is now syntax-checked before activation. Broken routine code (e.g. `i_r_request->get_dtp( )`, which does not exist on the request interface) is reported with the ABAP error messages and the DTP is left unchanged, instead of being silently reported as "activated". The generated program's EU (ADT) enqueue lock is now released on the error path too (no orphaned SM12 lock), and a genuine activation failure is surfaced instead of returning success
+- Process chain transport check — a `validateobject` HTTP 404 caused by a stale stateful MCP session is now handled softly (the write proceeds without a transport header) instead of aborting. The previous hard abort wrongly blocked follow-up writes to local (`$TMP`) chains, which need no transport at all; a genuinely transportable object is still refused by the PUT with HTTP 403, at which point a transport request must be supplied
+
 ## [1.0.0] — 2026-07-17
 
 The largest feature drop so far, and the release that takes the server to 1.0: a broad

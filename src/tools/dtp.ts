@@ -787,6 +787,70 @@ function spliceRoutineSource(skeleton: string, routineCode: string, globalCode?:
   return out;
 }
 
+interface AbapCheckMessage {
+  type: string; // 'E' | 'W' | 'I'
+  line?: string;
+  column?: string;
+  text: string;
+}
+
+function decodeXmlEntities(s: string): string {
+  return s
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+/**
+ * Run an ADT ABAP syntax check on the generated routine program's INACTIVE version
+ * and return the reported messages. This mirrors exactly what the BW Modeling Tools
+ * do when a filter routine is opened (POST /sap/bc/adt/checkruns?reporters=abapCheckRun
+ * with a checkObjectList referencing the program at version="inactive").
+ *
+ * The generated FORM signature exposes the DTP request as
+ * IF_RSBK_REQUEST_ADMINTAB_VIEW, which has no get_dtp( ) method — patterns copied from
+ * existing DTP routines that call cl_rsbk_dtp=>factory( i_r_request->get_dtp( ) ) fail
+ * the syntax check here rather than silently activating a broken program.
+ */
+async function checkRoutineProgramSyntax(
+  client: BwClient,
+  adtEncoded: string
+): Promise<AbapCheckMessage[]> {
+  const csrf = await client.getCsrfToken();
+  const body =
+    `<?xml version="1.0" encoding="UTF-8"?>\n` +
+    `<chkrun:checkObjectList xmlns:adtcore="http://www.sap.com/adt/core" xmlns:chkrun="http://www.sap.com/adt/checkrun">\n` +
+    `  <chkrun:checkObject adtcore:uri="/sap/bc/adt/programs/programs/${adtEncoded}" chkrun:version="inactive"/>\n` +
+    `</chkrun:checkObjectList>`;
+
+  const resp = await client.rawPost(
+    '/sap/bc/adt/checkruns?reporters=abapCheckRun',
+    body,
+    {
+      'Content-Type': 'application/vnd.sap.adt.checkobjects+xml',
+      'Accept': 'application/vnd.sap.adt.checkmessages+xml',
+      'x-csrf-token': csrf,
+    }
+  );
+
+  const messages: AbapCheckMessage[] = [];
+  for (const m of resp.body.matchAll(/<chkrun:checkMessage\b([^>]*)\/>/g)) {
+    const attrs = m[1];
+    const type = attrs.match(/chkrun:type="([^"]*)"/)?.[1] ?? '';
+    const shortText = attrs.match(/chkrun:shortText="([^"]*)"/)?.[1] ?? '';
+    const start = attrs.match(/#start=(\d+),(\d+)/);
+    messages.push({
+      type,
+      line: start?.[1],
+      column: start?.[2],
+      text: decodeXmlEntities(shortText),
+    });
+  }
+  return messages;
+}
+
 export interface SetDtpFilterRoutineArgs {
   dtp_name: string;
   field_name: string;
@@ -888,19 +952,53 @@ export async function bwSetDtpFilterRoutine(
       throw new Error(`No <LOCK_HANDLE> in program lock response:\n${progLockResp.body}`);
     }
 
-    const putSrcCsrf = await programClient.getCsrfToken();
-    await programClient.rawPut(
-      `/sap/bc/adt/programs/programs/${adtEncoded}/source/main?lockHandle=${progLockHandle}`,
-      splicedSource,
-      { 'Content-Type': 'text/plain; charset=utf-8', 'x-csrf-token': putSrcCsrf }
-    );
+    // The generated program's EU (ADT) enqueue lock must be released on success AND on
+    // any error before activation, otherwise it leaks and can only be cleared via SM12.
+    let syntaxErrors: AbapCheckMessage[] = [];
+    try {
+      const putSrcCsrf = await programClient.getCsrfToken();
+      await programClient.rawPut(
+        `/sap/bc/adt/programs/programs/${adtEncoded}/source/main?lockHandle=${progLockHandle}`,
+        splicedSource,
+        { 'Content-Type': 'text/plain; charset=utf-8', 'x-csrf-token': putSrcCsrf }
+      );
 
-    const unlockCsrf = await programClient.getCsrfToken();
-    await programClient.rawPost(
-      `/sap/bc/adt/programs/programs/${adtEncoded}?_action=UNLOCK&lockHandle=${progLockHandle}`,
-      '',
-      { 'x-csrf-token': unlockCsrf }
-    );
+      // Gate: syntax-check the just-written inactive version before activating. A broken
+      // routine (e.g. i_r_request->get_dtp( ), which does not exist on the request
+      // interface) is caught here instead of being silently reported as "activated".
+      const checkMessages = await checkRoutineProgramSyntax(programClient, adtEncoded);
+      syntaxErrors = checkMessages.filter((m) => m.type === 'E');
+    } finally {
+      const unlockCsrf = await programClient.getCsrfToken();
+      await programClient.rawPost(
+        `/sap/bc/adt/programs/programs/${adtEncoded}?_action=UNLOCK&lockHandle=${progLockHandle}`,
+        '',
+        { 'x-csrf-token': unlockCsrf }
+      ).catch(() => {/* lock may already be gone; never mask the real error/result */});
+    }
+
+    if (syntaxErrors.length > 0) {
+      // Abort before touching the DTP: the routine is broken. Best-effort remove the
+      // orphaned generated program, then leave the DTP exactly as it was.
+      await client.rawDelete(
+        `/sap/bw/modeling/dtpa/${dtpUpper}/${fieldNameEncoded}/routineReports/${encodedProgram}`,
+        { 'Content-Type': MEDIA_TYPES['dtpa'], 'Accept': MEDIA_TYPES['dtpa'] }
+      ).catch(() => {/* orphan cleanup is best-effort */});
+      return JSON.stringify({
+        success: false,
+        dtp_name: dtpUpper,
+        field_name: fieldName,
+        program_name: programName,
+        message:
+          `Filter routine for field '${fieldName}' has ${syntaxErrors.length} ABAP syntax error(s) and was NOT activated. ` +
+          `The DTP was left unchanged. Fix the routine code and call the tool again.`,
+        syntax_errors: syntaxErrors.map((m) => ({
+          line: m.line,
+          column: m.column,
+          text: m.text,
+        })),
+      }, null, 2);
+    }
 
     // Step 3: ADT activate the ABAP program (reuse programClient after the unlock)
     const adtCsrf = await programClient.getCsrfToken();
@@ -999,8 +1097,19 @@ export async function bwSetDtpFilterRoutine(
     const putClient = createClientFromEnv();
     await putClient.put('dtpa', dtpUpper, lockHandle, putXml, timestamp);
 
-    // Step 9: Activate
-    await bwActivate(client, 'dtpa', dtpUpper, lockHandle);
+    // Step 9: Activate — surface any activation error instead of claiming success.
+    const activationResult = await bwActivate(client, 'dtpa', dtpUpper, lockHandle);
+    const activation = JSON.parse(activationResult) as { success?: boolean; messages?: unknown };
+    if (activation.success === false) {
+      return JSON.stringify({
+        success: false,
+        dtp_name: dtpUpper,
+        field_name: fieldName,
+        program_name: programName,
+        message: `Filter routine source was syntactically valid, but DTP activation failed.`,
+        activation_messages: activation.messages ?? [],
+      }, null, 2);
+    }
 
     return JSON.stringify({
       success: true,

@@ -134,7 +134,8 @@ src/
     ├── processchain_write.ts # bw_create_process_chain, bw_update_process_chain,
     │                         # bw_activate_process_chain, bw_append_process_chain_dtp,
     │                         # bw_swap_process_chain_dtp, bw_add_process_chain_error_links,
-    │                         # bw_create_decision_variant — BW4 Cockpit REST API
+    │                         # bw_add_process_chain_program, bw_create_decision_variant — BW4 Cockpit REST API
+    │                         # (create/update support ADSOACT and ADSOREM inline variants)
     ├── processvariant.ts # bw_get_process_variant — generic variant detail reader for all 93 process types
     ├── push.ts           # bw_push_data, bw_get_push_schema
     ├── query.ts          # bw_get_query — full query definition parser (variables, layout, CKFs, RKFs, exceptions);
@@ -144,6 +145,7 @@ src/
     ├── reporting.ts      # bw_query_data, bw_get_filter_values — BICS reporting endpoint (/sap/bw/modeling/comp/reporting)
     ├── repository.ts     # bw_list_contents
     ├── request_monitor.ts # bw_list_requests, bw_get_request, bw_activate_request — RSPM request monitor / data activation via the bw4 manage API
+    ├── rkf_create.ts     # bw_create_rkf — create a reusable Restricted Key Figure (ELEM) via comp/enq + /rkf/<name>/a
     ├── roles.ts          # bw_get_roles, bw_get_role_queries, bw_get_query_roles, bw_set_query_roles
     ├── search.ts         # bw_search, bw_xref
     ├── transport.ts      # bw_create_transport_task — add a task to a workbench transport
@@ -230,6 +232,8 @@ Full endpoint list from BW/4HANA discovery — **47 workspaces, 130+ endpoints**
 |---|---|
 | **Activation** | `POST /sap/bw/modeling/activation` |
 | **Check (pre-activation)** | `POST /sap/bw/modeling/checkruns` |
+| ABAP syntax check (ADT) | `POST /sap/bc/adt/checkruns?reporters=abapCheckRun` (DTP filter routine gate) |
+| ELEM component enqueue (lock/unlock) | `POST /sap/bw/modeling/comp/enq/{compid}?action=lock\|unlock` (RKF/Query create) |
 | Validation | `GET /sap/bw/modeling/validation?objectType=...&objectName=...` |
 | Move objects | `POST /sap/bw/modeling/move_requests` |
 | BW Transport | `/sap/bw/modeling/cto` |
@@ -293,6 +297,7 @@ Full endpoint list from BW/4HANA discovery — **47 workspaces, 130+ endpoints**
 
 | Purpose | Endpoint |
 |---|---|
+| Component value validator | `/sap/bw/modeling/comp/validator` (RKF restriction value → internal key) |
 | InfoObjects | `/sap/bw/modeling/is/values/infoobject` |
 | InfoProviders | `/sap/bw/modeling/is/values/infoprovider` |
 | DataSources | `/sap/bw/modeling/is/values/datasources` |
