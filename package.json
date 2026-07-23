@@ -34,7 +34,7 @@
     "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
-    "@arc-mcp/xsuaa-auth": "^0.1.8",
+    "@arc-mcp/xsuaa-auth": "^1.0.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "axios": "^1.7.0",
     "express": "^5.2.1",
