@@ -21,9 +21,9 @@ applications:
     env:
       NODE_ENV: production
       # BTP destination pointing at the BW system.
-      BW_BTP_DESTINATION: "BW4"
-      BW_CLIENT: "100"
-      BW_LANGUAGE: "EN"
+      BW_BTP_DESTINATION: "BW4_NLB"
+      BW_CLIENT: "001"
+      BW_LANGUAGE: "DE"
       # Per-user identity via Cloud Connector principal propagation. Requires CERTRULE
       # and ICM trust on the ABAP side — see docs/CLOUD-FOUNDRY.md §3.
       # BW_PP_ENABLED: "true"

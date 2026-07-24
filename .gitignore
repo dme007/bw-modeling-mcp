@@ -147,3 +147,7 @@ tests/
 poc/
 .claude/
 CLAUDE.md
+
+# Local test plans and temporary files
+TESTING_BTP_PLAN.md
+json
