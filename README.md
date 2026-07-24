@@ -6,6 +6,20 @@ A Model Context Protocol (MCP) server that enables AI assistants like Claude to 
 
 ---
 
+## ☁️ Running on SAP BTP Cloud Foundry
+
+Besides stdio, the server can run as an HTTP service on SAP BTP Cloud Foundry with XSUAA
+OAuth in front and a BTP destination behind — either a shared technical user
+(`BasicAuthentication`) or **principal propagation**, where each caller reaches BW as
+themselves and BW applies their own authorizations.
+
+Two role collections decide what a user is offered: **BW MCP Reader** (the 41 read tools)
+and **BW MCP Developer** (all 83). Setup: [docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md).
+
+stdio is unchanged — `npm start` behaves exactly as before.
+
+---
+
 ## 📖 Featured Blog Post
 
 **Agentic AI meets SAP BW** — the full story behind this project: why I built it, what's inside, what happens when Claude walks through a complete BW data lineage on its own.

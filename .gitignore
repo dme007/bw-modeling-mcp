@@ -141,6 +141,9 @@ payloads/
 playbooks/
 notes/
 tests/
+# …but track the checked-in test suite. `tests/` stays ignored as a scratch area;
+# only these files are versioned.
+!tests/*.test.mjs
 poc/
 .claude/
 CLAUDE.md
