@@ -6,6 +6,11 @@ users over the network with OAuth at the front and a BTP destination at the back
 
 Nothing here changes stdio. `npm start` behaves exactly as before.
 
+> **Setting this up for the first time?** Follow the step-by-step
+> [Central Hosting Setup Guide](./CENTRAL-HOSTING-SETUP.md) — Cloud Connector, destination,
+> CLI, push, roles, restart — and come back here for the topology, principal-propagation,
+> and troubleshooting reference.
+
 ## Two topologies
 
 Pick by how you configure the BTP destination:

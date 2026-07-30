@@ -26,7 +26,7 @@ applications:
       BW_LANGUAGE: "DE"
       # Per-user identity via Cloud Connector principal propagation. Requires CERTRULE
       # and ICM trust on the ABAP side — see docs/CLOUD-FOUNDRY.md §3.
-      # BW_PP_ENABLED: "true"
+      BW_PP_ENABLED: "true"
       # Only when several Cloud Connectors serve this subaccount.
       # BW_CC_LOCATION_ID: "bw-prod"
       # Public route, if behind a reverse proxy that rewrites Host.

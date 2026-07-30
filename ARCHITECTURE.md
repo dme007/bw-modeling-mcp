@@ -33,6 +33,8 @@ The token is fetched once at startup and reused for all subsequent write operati
 
 **Important:** Lock and write operations on the same object must use separate `BwClient` instances (separate `sap-contextid` session cookies). SAP's internal buffer caches object state per session — reusing the same session for both Lock and PUT causes null pointer crashes in the ABAP backend (`CL_RSTRAN_TRFN=>GET_PROGID`). This is not documented in the API — discovered via ABAP debugging.
 
+**Central hosting (SAP BTP Cloud Foundry):** The HTTP transport (`src/http.ts`) puts XSUAA OAuth in front and a BTP destination behind. XSUAA authenticates each caller and carries the `read` / `write` scopes (`src/scopes.ts`, which also filters `tools/list` per role). The destination (`src/destination.ts`) decides the BW identity: with `BasicAuthentication` all callers share one technical user; with `PrincipalPropagation` each caller reaches BW as themselves via a short-lived X.509 certificate issued by the Cloud Connector and mapped to an ABAP user by CERTRULE. The server is stateless — a fresh `BwClient` per request, held in an `AsyncLocalStorage` (`src/request-context.ts`) so concurrent users never share a session. stdio (`src/stdio.ts`) is unaffected: one process, one user, no auth. Setup: `docs/CENTRAL-HOSTING-SETUP.md` and `docs/CLOUD-FOUNDRY.md`.
+
 ---
 
 ## Lock → Read → Modify → PUT → Activate Pattern
@@ -106,7 +108,12 @@ The Push API uses a separate `axios` client instance independent of the BW Model
 
 ```
 src/
-├── index.ts              # MCP server entry point, tool definitions and dispatch
+├── index.ts              # createServer() — tool definitions and dispatch; a run-as-main guard also makes it a valid stdio entry
+├── stdio.ts              # stdio transport entry point (default bin) — one process, one user, no auth
+├── http.ts               # HTTP transport entry point (SAP BTP Cloud Foundry) — Express + XSUAA OAuth, a fresh per-request BW client
+├── destination.ts        # builds a BwClient from a BTP destination (PrincipalPropagation or BasicAuthentication)
+├── request-context.ts    # AsyncLocalStorage holding the per-request BW client under principal propagation
+├── scopes.ts             # read/write scope classification and tools/list filtering for XSUAA role-based access
 ├── bw-client.ts          # HTTP client (CSRF, session, lock/unlock, GET/PUT/POST/rawGet/rawPost/rawPut)
 └── tools/
     ├── activation.ts     # bw_activate, bw_unlock

@@ -1,6 +1,6 @@
 # bw-modeling-mcp
 
-A Model Context Protocol (MCP) server that enables AI assistants like Claude to work directly inside SAP BW/4HANA systems — reading, creating and modifying BW modeling objects via the internal REST API used by Eclipse BWMT.
+A Model Context Protocol (MCP) server that enables AI assistants like Claude to work directly inside SAP BW/4HANA systems — reading, creating and modifying BW modeling objects via the same internal SAP APIs that Eclipse BWMT and the BW/4HANA Cockpit use: the **BW Modeling REST API** (`/sap/bw/modeling/`) for objects, queries and live data, the **ADT API** (`/sap/bc/adt/`) for ABAP/AMDP routine source, the **BW/4HANA manage API** for the request monitor and runtime, and the **Push API** (`/sap/bw4/`) for data loads.
 
 **This is not a simulation.** Every tool call connects to a live BW system — write operations produce real changes.
 
@@ -13,8 +13,9 @@ OAuth in front and a BTP destination behind — either a shared technical user
 (`BasicAuthentication`) or **principal propagation**, where each caller reaches BW as
 themselves and BW applies their own authorizations.
 
-Two role collections decide what a user is offered: **BW MCP Reader** (the 41 read tools)
-and **BW MCP Developer** (all 83). Setup: [docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md).
+Two role collections decide what a user is offered: **BW MCP Reader** (read-only tools)
+and **BW MCP Developer** (all tools). Setup: [docs/CENTRAL-HOSTING-SETUP.md](docs/CENTRAL-HOSTING-SETUP.md)
+(step-by-step) and [docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md) (reference).
 
 stdio is unchanged — `npm start` behaves exactly as before.
 
@@ -30,60 +31,53 @@ Read the blog (DE + EN): https://www.nextlytics.com/blog/agentic-ai-meets-sap-bw
 
 ---
 
-## 🆕 What's New — v1.1.0
+## 🆕 What's New — v1.2.0
 
-**Two new authoring tools and a safer DTP filter-routine path.**
+**Central hosting on SAP BTP Cloud Foundry with XSUAA OAuth and role-based access control. Game-changer for enterprise deployments.**
 
-**🏆 New tools**
+> **Backwards compatible — local use is unchanged.** Existing stdio setups (`npm start`, Claude Desktop, etc.) keep working exactly as before: no auth, no BTP, no config changes. Upgrading to v1.2.0 is non-breaking — central hosting is purely additive.
 
-- `bw_create_rkf` — create a reusable Restricted Key Figure (ELEM) on an InfoProvider from a base key figure plus characteristic restrictions. Built for mass creation (one RKF per call); each value is validated against the InfoProvider and written consistent, no separate activation
-- `bw_add_process_chain_program` — add an "Execute ABAP Program" step (RSPC type ABAP) to an existing chain, optionally with an SE38 variant; in-place edit with `before` / `after` / `predecessor` positioning, idempotent
+**🚀 The Big Picture**
 
-**➕ Improved**
+- **BTP Cloud Foundry HTTP Server** — the MCP can now run as a central service on enterprise infrastructure (not just locally). `npm run start:http` launches an Express server bound to XSUAA, destination, and connectivity services
+- **XSUAA OAuth Authentication** — **same [@arc-mcp/xsuaa-auth](https://github.com/arc-mcp/xsuaa-auth) module as [ARC-1](https://github.com/arc-mcp/arc-1)** for ecosystem consistency. Stateless Dynamic Client Registration (DCR) + callback proxy. Users log in via BTP identity, the server respects their identity for analytics and auditing (principal propagation ready)
+- **Role-Based Access Control (RBAC)** — `xs-security.json` defines two scopes and **suggested default role collections** that can be customized to your needs:
+  - **`BW MCP Reader`** — read-only metadata and query tools (`read` scope). Ideal for analysts and report consumers
+  - **`BW MCP Developer`** — full access: create/update/delete/activate/push (`write` scope, implies `read`). For modelers and data engineers
+  - Scope enforcement in `src/scopes.ts` is explicit on reads (safe by default), automatic on writes (new write tools require admin to whitelist for read-only)
+  - **Customize for your org:** Extend with `query`, `monitor`, `metadata`, `data_push`, `admin` scopes for finer granularity
+- **Cloud Connector Integration** — on-premise BW systems route through BTP destinations + Cloud Connector
 
-- `ADSOREM` step type (DSO request cleanup) in `bw_create_process_chain` and `bw_update_process_chain` — per-aDSO cleanup action and request selection
+**📋 What This Enables**
 
-**🐛 Fixes**
+| Scenario | Before | Now |
+|----------|--------|-----|
+| **One analyst, one BW system** | stdio on analyst's machine | BTP server, analyst logs in with their own identity |
+| **Many analysts, shared server** | impossible (no central auth) | all log in via BTP, each user's identity flows to BW |
+| **MCP tool permissions** | none — whoever runs it can call every tool | grant tools per role, **independent of BW authorizations**: e.g. a BW developer restricted to read-only in the MCP, or the querying tools withheld from someone who may otherwise view data |
+| **BW authorizations** | always enforced via the user's own credentials | unchanged — still fully enforced; principal propagation means each caller acts as themselves, never a shared identity |
+| **Enterprise audit trail** | limited | XSUAA logs all logins; with principal propagation BW session logs show the true user |
 
-- `bw_set_dtp_filter_routine` — the routine is syntax-checked before activation; broken code is reported instead of falsely marked "activated", the ADT lock is released on error, and real activation failures are surfaced
-- Process chain transport check — a stale-session `validateobject` 404 is handled softly instead of aborting, so it no longer blocks follow-up writes to local (`$TMP`) chains
+**⚙️ Configuration**
 
----
+- `manifest.yml` — Cloud Foundry app manifest (512 MB, 1 GB disk, BW destination + client + language)
+- `xs-security.json` — XSUAA config; extend with `query`, `monitor`, `metadata`, `data_push`, `admin` scopes if finer granularity is needed
+- Transport: stdio via `node dist/stdio.js` (default), HTTP+OAuth via `npm run start:http` (= `node dist/http.js`, as used by `manifest.yml`)
 
-## 🆕 What's New — v1.0.0
+**📖 Documentation**
 
-**The biggest feature drop yet — and the jump to 1.0.** A broad wave of write tools
-rounds out full **read/write BW/4HANA modeling coverage**.
+See [docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md) for the full setup: services, destinations, XSUAA, Cloud Connector, and principal propagation (Stage 2).
 
-**🏆 Query authoring — from read-only to fully writable**
+**🔐 Security Notes**
 
-- `bw_create_query` — create a new query (ELEM) on an InfoProvider; with `copy_from`, clone an existing query in full (layout, filter, variables, key figures)
-- `bw_update_query_layout` / `bw_update_query_filter` / `bw_update_query_key_figures` / `bw_update_query_settings` — edit rows/columns/structures/free characteristics, restrictions, key figures (RKF/CKF references plus local formula members over the full BW operator catalog with operand-count validation), and query properties; all accept an optional `transport` request
-- query deletion via `bw_delete`
-
-**🏆 Process chain authoring, extended**
-
-- `bw_append_process_chain_dtp` — append a DTP load step (optionally with its own DSO activation) to an existing chain
-- `bw_swap_process_chain_dtp` — swap one DTP load variant for another
-- `bw_add_process_chain_error_links` — add on-error (negative) links, mirroring the existing success links
-- `bw_create_decision_variant` — create a DECISION process variant for branch/decision steps
-
-**➕ More new tools & improvements**
-
-- Transport lifecycle: `bw_create_transport_task` (add a user task to a workbench transport), `bw_list_changeable_transports` (list requests and their tasks)
-- DataSource authoring: `bw_change_datasource_delta` (delta process), `bw_set_datasource_fields` (transfer flags + segment language field)
-- `bw_set_transformation_expert_routine` — write Start/End/Expert routine code transport-stably into the transformation master
-- `bw_create_dtp` — `target_object_subtype` (`ATTR` / `TEXT` / `HIER`) reaches InfoObject text and hierarchy targets, not just attributes
-
-**🐛 Stability fixes**
-
-- Fresh-session hardening across all object types: transformation runtime switches are no longer falsely reported as unpersisted or silently reverted, and stale inactive-shadow reads (notably on `bw_get_dtp`) are gone
-- AMDP expert routines on HANA transformations generate a proper AMDP class; global routines without an existing rule group no longer throw
-- `bw_get_request` / `bw_list_requests` — the message log survives a wrong storage code (each section isolated via `allSettled`)
+- Write scope implicitly grants read (one-way: read tools do not grant write)
+- New write tools default to requiring `write`; old read tools explicitly whitelist for `read`
+- Principal propagation requires CERTRULE + ICM trust on BW side (see docs/CLOUD-FOUNDRY.md §3)
+- stdio mode is unchanged and auth-free
 
 ---
 
-**Earlier releases** — the "What's New" notes for v0.9.0 and older are archived in [WHATS_NEW.md](WHATS_NEW.md); the full structured history is in [CHANGELOG.md](CHANGELOG.md).
+**Earlier releases** — the "What's New" notes for v1.1.0 and older are archived in [WHATS_NEW.md](WHATS_NEW.md); the full structured history is in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -248,7 +242,7 @@ rounds out full **read/write BW/4HANA modeling coverage**.
 
 ## Combining with an ADT MCP Server
 
-For tasks involving ABAP or SQLScript (AMDP) logic inside Transformations, **bw-modeling-mcp works best alongside an ADT MCP server** such as [vibing-steampunk](https://github.com/oisee/vibing-steampunk).
+For tasks involving ABAP or SQLScript (AMDP) logic inside Transformations, **bw-modeling-mcp works best alongside an ADT MCP server** such as [vibing-steampunk](https://github.com/oisee/vibing-steampunk) or [ARC-1](https://github.com/arc-mcp/arc-1).
 
 The BW MCP server handles the BW modeling structure — creating the Transformation, setting up routines, activating objects. The ADT MCP server handles reading and writing the actual ABAP class source code that backs the routine. Together, they cover the full development cycle from BW object creation to ABAP logic implementation.
 
@@ -267,13 +261,15 @@ The BW MCP server handles the BW modeling structure — creating the Transformat
 
 ## Requirements
 
-- SAP BW/4HANA system with REST API access (`/sap/bw/modeling/`)
+- SAP BW/4HANA system with the internal SAP APIs enabled
 - Node.js 18 or later
 - An MCP-compatible AI client (Claude Desktop, Claude Code, etc.)
 
 ---
 
 ## Installation
+
+> **Two ways to run.** Locally as a **stdio** server (one user, one machine — the steps below), or **centrally hosted** on SAP BTP Cloud Foundry behind XSUAA OAuth for a whole team → see [docs/CENTRAL-HOSTING-SETUP.md](docs/CENTRAL-HOSTING-SETUP.md). The installation and configuration below cover local stdio use; upgrading an existing local setup is non-breaking.
 
 ```bash
 # Option 1: Install via npm (recommended)
@@ -290,7 +286,7 @@ npm run build
 
 ## Configuration
 
-The server is configured via environment variables:
+For **local (stdio)** use, the server is configured via environment variables. For **central BTP hosting**, connection and credentials come from the BTP destination and service bindings instead — see [docs/CENTRAL-HOSTING-SETUP.md](docs/CENTRAL-HOSTING-SETUP.md).
 
 | Variable | Description | Required |
 |---|---|---|
@@ -301,7 +297,7 @@ The server is configured via environment variables:
 | `BW_LANGUAGE` | Language for object texts (e.g. `EN`, `DE`). Default: `DE` | no |
 | `BW_COOKIE_FILE` | Path to a browser-exported cookie file for SAML-/OAuth-fronted systems (e.g. BW Bridge). Netscape or `name=value` format. When set, `BW_USER` / `BW_PASSWORD` are optional. | no |
 
-**Cookie authentication (BW Bridge / SAP BTP):** For BW systems that sit behind a SAML or OAuth login (such as BW Bridge on the SAP BTP ABAP stack), Basic Auth is not available. Export the authenticated session cookies from your browser into a file and point `BW_COOKIE_FILE` at it. The login/session approach is analogous to [vibing-steampunk](https://github.com/oisee/vibing-steampunk). When the session expires, refresh the cookie file and restart the server.
+**Cookie authentication (BW Bridge / SAP BTP):** For BW systems that sit behind a SAML or OAuth login (such as BW Bridge on the SAP BTP ABAP stack), Basic Auth is not available. Export the authenticated session cookies from your browser into a file and point `BW_COOKIE_FILE` at it. The login/session approach is analogous to [vibing-steampunk](https://github.com/oisee/vibing-steampunk) and [ARC-1](https://github.com/arc-mcp/arc-1). When the session expires, refresh the cookie file and restart the server.
 
 ### Claude Desktop
 
@@ -312,7 +308,7 @@ Add to `claude_desktop_config.json`:
   "mcpServers": {
     "bw-modeling-mcp": {
       "command": "node",
-      "args": ["/path/to/bw-modeling-mcp/dist/index.js"],
+      "args": ["/path/to/bw-modeling-mcp/dist/stdio.js"],
       "env": {
         "BW_URL": "https://your-bw-host:50001",
         "BW_USER": "YOUR_USER",
@@ -325,7 +321,7 @@ Add to `claude_desktop_config.json`:
 }
 ```
 
-### Claude Code
+### Claude Code (VS Code extension)
 
 Add `.mcp.json` to your project root:
 
@@ -334,7 +330,7 @@ Add `.mcp.json` to your project root:
   "mcpServers": {
     "bw-modeling-mcp": {
       "command": "node",
-      "args": ["/path/to/bw-modeling-mcp/dist/index.js"],
+      "args": ["/path/to/bw-modeling-mcp/dist/stdio.js"],
       "env": {
         "BW_URL": "https://your-bw-host:50001",
         "BW_USER": "YOUR_USER",
@@ -672,12 +668,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical architecture and c
 
 ## Roadmap
 
-- **CompositeProvider** — Read: `bw_get_composite_provider` ✅, global components (`bw_get_ckf` / `bw_get_rkf` / `bw_get_structure`) ✅ — Create and modify: planned
-- **BW Queries** — Read: `bw_get_query` ✅ — Create and modify: `bw_create_query` / `bw_update_query_*` ✅
-- **Process Chains** — build and manage Process Chains ✅ (`bw_create_process_chain`, `bw_update_process_chain`, `bw_activate_process_chain`, `bw_append_process_chain_dtp`, `bw_swap_process_chain_dtp`, `bw_add_process_chain_error_links`, `bw_create_decision_variant`)
-- **Open ODS View** — create Open ODS Views
-- **BW/4HANA Cockpit functions** — runtime request monitor and data activation ✅ (`bw_run_dtp`, `bw_list_requests`, `bw_get_request`, `bw_activate_request`) — further runtime operations planned
-- **Further BW/4HANA objects** — additional modeling objects
+- **Tool consolidation** — collapse today's one-tool-per-operation surface into a small set of verb-based tools (`bw_read`, `bw_find`, `bw_write_*`, …) that cover the same operations. Same functionality, a single consistent `name` parameter across all reads, and each new operation then costs one enum value instead of a whole new tool — so coverage keeps growing while the surface stays within MCP clients' tool limits.
+- **More modeling & Cockpit coverage** — integrate and complete further BW modeling and BW/4HANA Cockpit operations, e.g. **CompositeProvider create/modify** (read already supported), Open ODS Views, additional runtime and monitoring operations, and further modeling objects.
 
 ---
 

@@ -8,6 +8,56 @@ For the complete, structured change history see [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
+## What's New — v1.1.0
+
+**Two new authoring tools and a safer DTP filter-routine path.**
+
+**🏆 New tools**
+
+- `bw_create_rkf` — create a reusable Restricted Key Figure (ELEM) on an InfoProvider from a base key figure plus characteristic restrictions. Built for mass creation (one RKF per call); each value is validated against the InfoProvider and written consistent, no separate activation
+- `bw_add_process_chain_program` — add an "Execute ABAP Program" step (RSPC type ABAP) to an existing chain, optionally with an SE38 variant; in-place edit with `before` / `after` / `predecessor` positioning, idempotent
+
+**➕ Improved**
+
+- `ADSOREM` step type (DSO request cleanup) in `bw_create_process_chain` and `bw_update_process_chain` — per-aDSO cleanup action and request selection
+
+**🐛 Fixes**
+
+- `bw_set_dtp_filter_routine` — the routine is syntax-checked before activation; broken code is reported instead of falsely marked "activated", the ADT lock is released on error, and real activation failures are surfaced
+- Process chain transport check — a stale-session `validateobject` 404 is handled softly instead of aborting, so it no longer blocks follow-up writes to local (`$TMP`) chains
+
+---
+
+## What's New — v1.0.0
+
+**The biggest feature drop yet — and the jump to 1.0.** A broad wave of write tools rounds out full **read/write BW/4HANA modeling coverage**.
+
+**🏆 Query authoring — from read-only to fully writable**
+
+- `bw_create_query` — create a new query (ELEM) on an InfoProvider; with `copy_from`, clone an existing query in full (layout, filter, variables, key figures)
+- `bw_update_query_layout` / `bw_update_query_filter` / `bw_update_query_key_figures` / `bw_update_query_settings` — edit rows/columns/structures/free characteristics, restrictions, key figures (RKF/CKF references plus local formula members over the full BW operator catalog with operand-count validation), and query properties; all accept an optional `transport` request
+- query deletion via `bw_delete`
+
+**🏆 Process chain authoring, extended**
+
+- `bw_append_process_chain_dtp` — append a DTP load step (optionally with its own DSO activation) to an existing chain
+- `bw_swap_process_chain_dtp` — swap one DTP load variant for another
+- `bw_add_process_chain_error_links` — add on-error (negative) links, mirroring the existing success links
+- `bw_create_decision_variant` — create a DECISION process variant for branch/decision steps
+
+**➕ More new tools & improvements**
+
+- Transport lifecycle: `bw_create_transport_task` (add a user task to a workbench transport), `bw_list_changeable_transports` (list requests and their tasks)
+- DataSource authoring: `bw_change_datasource_delta` (delta process), `bw_set_datasource_fields` (transfer flags + segment language field)
+- `bw_set_transformation_expert_routine` — write Start/End/Expert routine code transport-stably into the transformation master
+- `bw_create_dtp` — `target_object_subtype` (ATTR / TEXT / HIER) reaches InfoObject text and hierarchy targets, not just attributes
+
+**🐛 Stability fixes**
+
+- Fresh-session hardening across all object types: transformation runtime switches are no longer falsely reported as unpersisted or silently reverted, and stale inactive-shadow reads (notably on `bw_get_dtp`) are gone
+
+---
+
 ## What's New — v0.9.0
 
 **Integrated Planning — complete read-only coverage**

@@ -8,6 +8,8 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
+import { fileURLToPath } from 'node:url';
+import { realpathSync } from 'node:fs';
 
 import { createClientFromEnv, type BwClient } from './bw-client.js';
 import { currentClient } from './request-context.js';
@@ -4537,4 +4539,28 @@ export async function startStdio(): Promise<void> {
   await createServer().connect(transport);
   // Log to stderr only (stdout is used for MCP protocol messages)
   process.stderr.write('bw-modeling-mcp server started\n');
+}
+
+// ── Backward-compatible entrypoint ──────────────────────────────────────────────
+//
+// Historically the stdio server was launched via `node dist/index.js`, and many local
+// MCP client configs still point there. The BTP refactor turned this file into a shared
+// module imported by stdio.ts and http.ts, so it no longer self-started. Restore the old
+// behaviour: start the stdio server when this file is the process entry point. When it is
+// imported (stdio.ts / http.ts), import.meta.url differs from argv[1], so this is a no-op
+// and never double-starts.
+function isRunAsMain(): boolean {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]);
+  } catch {
+    return false;
+  }
+}
+
+if (isRunAsMain()) {
+  startStdio().catch((err) => {
+    process.stderr.write(`Fatal error: ${err}\n`);
+    process.exit(1);
+  });
 }
