@@ -1,4 +1,4 @@
-import { BwClient } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES } from '../bw-client.js';
 
 const BASE = '/sap/bw/modeling/repo/datasourcestructure';
 const BASE_PREFIX = `${BASE}/`;
@@ -569,6 +569,186 @@ export async function bwGetSourceSystem(client: BwClient, sourceSystem: string):
   return JSON.stringify(result, null, 2);
 }
 
+// Full Accept header for the remote-entity value help (multiple supported versions).
+const VALUEHELP_ACCEPT = [
+  'application/vnd.sap-bw-modeling.valuehelp2-v1_0_0+xml',
+  MEDIA_TYPES['valuehelp'],
+  'application/vnd.sap-bw-modeling.isvaluehelp-v1_0_0+xml',
+].join(', ');
+
+interface RemoteEntity {
+  technical_name: string;
+  entity_type: string | null;
+  path_suffix: string | null;
+}
+
+/**
+ * bw_list_remote_entities — read-only discovery of the remote entities (HANA views /
+ * virtual tables) exposed by a source system, as offered on the DataSource proposal page.
+ *
+ * The returned technical_name is exactly what binds into the adapter externalObject when
+ * creating a DataSource via bw_create_datasource.
+ */
+export async function bwListRemoteEntities(
+  client: BwClient,
+  sourceSystem: string,
+  searchPattern: string = '*',
+  resultSize: number = 200,
+): Promise<string> {
+  const ssUpper = sourceSystem.toUpperCase();
+  const url =
+    `/sap/bw/modeling/rsdsint/values/hanaentity` +
+    `?searchPattern=${encodeURIComponent(searchPattern)}` +
+    `&sourcesystem=${encodeURIComponent(ssUpper)}` +
+    `&resultSize=${resultSize}`;
+
+  const { body } = await client.rawGet(url, { Accept: VALUEHELP_ACCEPT });
+
+  // Root <vh:valueHelp size="..." resultComplete="..."> — surface truncation info.
+  const rootAttrs = body.match(/<vh:valueHelp\b([^>]*)>/)?.[1] ?? '';
+  const sizeRaw = rootAttrs.match(/\bsize="([^"]*)"/)?.[1];
+  const size = sizeRaw !== undefined ? parseInt(sizeRaw, 10) : null;
+  const resultComplete = rootAttrs.match(/\bresultComplete="([^"]*)"/)?.[1] === 'true';
+
+  const entities: RemoteEntity[] = [];
+  const rowRe = /<row\b[^>]*>([\s\S]*?)<\/row>/g;
+  let rm: RegExpExecArray | null;
+  while ((rm = rowRe.exec(body)) !== null) {
+    const rowBody = rm[1];
+    const technicalName = rowBody.match(/<technicalName>([^<]*)<\/technicalName>/)?.[1] ?? '';
+
+    let entityType: string | null = null;
+    let pathSuffix: string | null = null;
+    const attrRe = /<attribute\b([^>]*)\/>/g;
+    let am: RegExpExecArray | null;
+    while ((am = attrRe.exec(rowBody)) !== null) {
+      const aAttrs = am[1];
+      const aName = aAttrs.match(/\bname="([^"]*)"/)?.[1] ?? '';
+      const aValue = aAttrs.match(/\bvalue="([^"]*)"/)?.[1] ?? '';
+      if (aName === 'ENTITY_TYPE') entityType = aValue;
+      else if (aName === 'PATH_SUFFIX') pathSuffix = aValue;
+    }
+
+    entities.push({ technical_name: technicalName, entity_type: entityType, path_suffix: pathSuffix });
+  }
+
+  return JSON.stringify({
+    source_system: ssUpper,
+    search_pattern: searchPattern,
+    result_size: size,
+    result_complete: resultComplete,
+    count: entities.length,
+    entities,
+  }, null, 2);
+}
+
+/**
+ * bw_create_datasource — create a DataSource on top of a remote entity, from the server's
+ * field proposal, and leave it inactive. v1: local objects only ($TMP), no field/key/
+ * partitioning editing. Activation is a separate step via bw_activate (object_type "rsds").
+ *
+ * Sequence (lock → create → unlock on the SAME session, via rawPost because the rsds compound
+ * key and the copyFrom query params do not fit client.lock/create/unlock):
+ *   1. POST ?action=lock with activity_context CREA → lockHandle
+ *   2. POST the minimal proposal body to
+ *      ?copyFromObjectName=initial&copyFromObjectType=_proposal&lockHandle=...
+ *      (server derives the full segment + field structure from the remote entity)
+ *   3. POST ?action=unlock
+ *
+ * The remote entity binds via the adapter externalObject attribute, not by name equality —
+ * hanaEntity is its own parameter (defaulting to the DataSource name only as a convenience).
+ */
+export async function bwCreateDatasource(
+  client: BwClient,
+  datasourceName: string,
+  sourceSystem: string,
+  applicationComponent: string,
+  hanaEntity?: string,
+  description?: string,
+): Promise<string> {
+  const dsUpper = datasourceName.toUpperCase();
+  const dsLower = datasourceName.toLowerCase();
+  const ssUpper = sourceSystem.toUpperCase();
+  const apco = applicationComponent.toUpperCase();
+  // externalObject must match the remote entity's technicalName exactly — do NOT transform case.
+  const externalObject = hanaEntity ?? datasourceName;
+  const desc = description ?? externalObject;
+
+  const language = process.env.BW_LANGUAGE ?? 'DE';
+  const masterSystem = new URL(process.env.BW_URL ?? 'http://localhost').hostname.split('.')[0].toUpperCase();
+  const responsible = (process.env.BW_USER ?? '').toUpperCase();
+
+  const lockUrl   = `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}?action=lock`;
+  const unlockUrl = `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}?action=unlock`;
+
+  // Step 1: Lock (CREA) — establishes the enqueue session + CSRF on this client.
+  const csrf = await client.getCsrfToken();
+  const lockResponse = await client.rawPost(lockUrl, '', {
+    'activity_context': 'CREA',
+    'Accept': RSDS_ACCEPT,
+    'x-csrf-token': csrf,
+  });
+  const lockHandle = lockResponse.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1] ?? '';
+  if (!lockHandle) {
+    throw new Error(`No <LOCK_HANDLE> in CREA lock response:\n${lockResponse.body}`);
+  }
+
+  // Step 2: Create from proposal (with lockHandle). Server materialises the full structure.
+  const createUrl =
+    `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}` +
+    `?copyFromObjectName=initial&copyFromObjectType=_proposal&lockHandle=${encodeURIComponent(lockHandle)}`;
+
+  const postBody = `<?xml version="1.0" encoding="UTF-8"?>
+<dataSource:dataSource
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns:adtcore="http://www.sap.com/adt/core"
+  xmlns:dataSource="http://www.sap.com/bw/modeling/DataSource.ecore"
+  applicationComponent="${apco}"
+  name="${dsUpper}"
+  sourceSystemName="${ssUpper}"
+  type="D">
+  <description label="${desc}" textType="3"/>
+  <adapter xsi:type="dataSource:ExtractorHANA" category="E" currentlyUsed="true"
+           name="HANA" externalObject="${externalObject}" pathSuffix=""/>
+  <tlogoProperties adtcore:language="${language}" adtcore:name="${dsUpper}"
+                   adtcore:type="RSDS" adtcore:masterLanguage="${language}"
+                   adtcore:masterSystem="${masterSystem}" adtcore:responsible="${responsible}"/>
+</dataSource:dataSource>`;
+
+  try {
+    await client.rawPost(createUrl, postBody, {
+      'Development-Class': '$TMP',
+      'Content-Type': MEDIA_TYPES['rsds'],
+      'Accept': MEDIA_TYPES['rsds'],
+      'x-csrf-token': csrf,
+    });
+  } finally {
+    // Step 3: Unlock on the same session, even if create failed.
+    await client.rawPost(unlockUrl, '', {
+      'Content-Type': MEDIA_TYPES['rsds'],
+      'Accept': MEDIA_TYPES['rsds'],
+      'x-csrf-token': csrf,
+    });
+  }
+
+  // Read back the derived structure so the caller sees what the proposal produced.
+  const structure = await bwGetDatasource(client, dsLower, ssUpper, 'text');
+
+  const header = [
+    `DataSource created (inactive): ${dsUpper} / ${ssUpper}`,
+    `Package: $TMP (local)`,
+    `Application Component: ${apco}`,
+    `HANA entity bound (adapter externalObject): ${externalObject}`,
+    '',
+    `Next step: activate with bw_activate — object_type "rsds", object_name "${dsUpper}", ` +
+      `source_system "${ssUpper}", lock_handle "".`,
+    '',
+    '── Read-back (GET .../m) ──',
+  ].join('\n');
+
+  return `${header}\n${structure}`;
+}
+
 export async function bwPreviewDatasource(
   client: BwClient,
   datasourceName: string,
@@ -663,4 +843,260 @@ export async function bwPreviewDatasource(
   }
 
   return lines.join('\n');
+}
+
+// ── bwChangeDatasourceDelta ─────────────────────────────────────────────────────
+
+export interface ChangeDatasourceDeltaArgs {
+  datasourceName: string;
+  sourceSystem: string;
+  deltaProcess: string;
+}
+
+/**
+ * bw_change_datasource_delta — change the delta process (deltaProperties@delta) of a
+ * DataSource. Full read-modify-write on the RSDS /m resource. Activation is separate
+ * (bw_activate, object_type "rsds"). See payloads/change_datasource_delta.md.
+ */
+export async function bwChangeDatasourceDelta(
+  client: BwClient,
+  args: ChangeDatasourceDeltaArgs
+): Promise<string> {
+  const dsUpper = args.datasourceName.toUpperCase();
+  const dsLower = args.datasourceName.toLowerCase();
+  const ssUpper = args.sourceSystem.toUpperCase();
+  const mUrl = `/sap/bw/modeling/rsds/${dsUpper}/${ssUpper}/m`;
+
+  // 1. Read current full body (this exact XML is PUT back with one attribute changed).
+  const { body: current } = await client.rawGet(mUrl, { Accept: RSDS_ACCEPT });
+
+  const dpMatch = current.match(/<deltaProperties\b[^>]*\bdelta="([^"]*)"[^>]*>/);
+  if (!dpMatch) {
+    return JSON.stringify({
+      success: false,
+      message: 'No <deltaProperties delta="..."> element found in the DataSource body.',
+    }, null, 2);
+  }
+  const currentDelta = dpMatch[1];
+
+  // Validate against the admissible delta values enumerated in the adapter block.
+  const admBlock = current.match(/<admissibleAttributes>([\s\S]*?)<\/admissibleAttributes>/)?.[1] ?? '';
+  const allowed: string[] = [];
+  const deltaRe = /<delta>([^<]*)<\/delta>/g;
+  let dm: RegExpExecArray | null;
+  while ((dm = deltaRe.exec(admBlock)) !== null) allowed.push(dm[1]);
+  if (allowed.length > 0 && !allowed.includes(args.deltaProcess)) {
+    return JSON.stringify({
+      success: false,
+      current_delta: currentDelta,
+      requested_delta: args.deltaProcess,
+      allowed_deltas: allowed,
+      message: 'Requested delta process is not admissible for this DataSource.',
+    }, null, 2);
+  }
+
+  // 2. Lock; capture LOCK_HANDLE and the timestamp response header for the PUT.
+  // Writing requests (lock, PUT, unlock) must carry a fetched CSRF token — rawPost/rawPut
+  // do not add one automatically. Reuse the same token across the whole sequence, on the
+  // same cookie session (same pattern as bwCreateDatasource).
+  const lockUrl = `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}?action=lock`;
+  const unlockUrl = `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}?action=unlock`;
+  const csrf = await client.getCsrfToken();
+  const lockRes = await client.rawPost(lockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf });
+  const lockHandle = lockRes.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1] ?? '';
+  if (!lockHandle) {
+    return JSON.stringify({
+      success: false,
+      message: `No <LOCK_HANDLE> in lock response:\n${lockRes.body}`,
+    }, null, 2);
+  }
+  const timestamp = (lockRes.headers['timestamp'] as string | undefined) ?? '';
+
+  try {
+    // 3. Replace only deltaProperties@delta (anchored so the adapter's delta="" is untouched).
+    const modified = current.replace(
+      /(<deltaProperties\b[^>]*\bdelta=")[^"]*(")/,
+      `$1${args.deltaProcess}$2`
+    );
+
+    // 4. PUT the full modified body.
+    const putUrl = `${mUrl}?lockHandle=${encodeURIComponent(lockHandle)}`;
+    const putRes = await client.rawPut(putUrl, modified, {
+      'Content-Type': 'application/xml, application/vnd.sap.bw.modeling.rsds-v1_1_0+xml',
+      Accept: 'application/vnd.sap.bw.modeling.rsds-v1_1_0+xml',
+      'x-csrf-token': csrf,
+      ...(timestamp ? { timestamp } : {}),
+    });
+
+    const hasError = putRes.body.includes('messageType="Error"');
+    const title = putRes.body.match(/<atom:title>([^<]*)<\/atom:title>/)?.[1] ?? '';
+
+    const result: Record<string, unknown> = {
+      success: !hasError,
+      datasource: dsUpper,
+      source_system: ssUpper,
+      previous_delta: currentDelta,
+      new_delta: args.deltaProcess,
+    };
+    if (title) result['message'] = title;
+    if (!hasError) {
+      result['next_step'] =
+        'DataSource is inactive. Activate with bw_activate (object_type "rsds", pass source_system).';
+    }
+    return JSON.stringify(result, null, 2);
+  } finally {
+    // 5. Release the enqueue (best-effort, also on failure).
+    try {
+      await client.rawPost(unlockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf });
+    } catch {
+      // ignore unlock failure
+    }
+  }
+}
+
+// ── bwSetDatasourceFields ────────────────────────────────────────────────────────
+
+export interface SetDatasourceFieldsArgs {
+  datasourceName: string;
+  sourceSystem: string;
+  fields?: Array<{ name: string; transfer: boolean }>;
+  languageField?: string;
+  transport?: string;
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * bw_set_datasource_fields — set the transfer flag (fieldProperties@transfer) of one or
+ * more DataSource fields. Full read-modify-write on the RSDS /m resource. Only
+ * fieldProperties@transfer is changed; the adapter fieldMapping is left untouched.
+ * Activation is separate (bw_activate, object_type "rsds"). See payloads/set_datasource_fields.md.
+ */
+export async function bwSetDatasourceFields(
+  client: BwClient,
+  args: SetDatasourceFieldsArgs
+): Promise<string> {
+  const dsUpper = args.datasourceName.toUpperCase();
+  const dsLower = args.datasourceName.toLowerCase();
+  const ssUpper = args.sourceSystem.toUpperCase();
+  const mUrl = `/sap/bw/modeling/rsds/${dsUpper}/${ssUpper}/m`;
+
+  const hasFields = !!args.fields && args.fields.length > 0;
+  if (!hasFields && args.languageField === undefined) {
+    return JSON.stringify({ success: false, message: 'Neither fields nor language_field given.' }, null, 2);
+  }
+
+  // 1. Read current full body.
+  const { body: current } = await client.rawGet(mUrl, { Accept: RSDS_ACCEPT });
+
+  // Resolve each requested field against its <field>/<fieldProperties>.
+  const changed: Array<{ name: string; transfer: boolean; previous: boolean }> = [];
+  const skipped: Array<{ name: string; reason: string }> = [];
+  let modified = current;
+
+  for (const f of args.fields ?? []) {
+    const nameEsc = escapeRegExp(f.name);
+    const fpRe = new RegExp(
+      `<field name="${nameEsc}"[^>]*>[\\s\\S]*?<fieldProperties\\b([^>]*)\\/>`
+    );
+    const fpMatch = modified.match(fpRe);
+    if (!fpMatch) {
+      skipped.push({ name: f.name, reason: 'field not found' });
+      continue;
+    }
+    const fpAttrs = fpMatch[1];
+    const previous = /\btransfer="true"/.test(fpAttrs);
+    const transferNotAllowed = /\btransferNotAllowed="true"/.test(fpAttrs);
+    if (f.transfer && transferNotAllowed) {
+      skipped.push({ name: f.name, reason: 'transfer not allowed for this field' });
+      continue;
+    }
+    // Replace transfer only within this field's fieldProperties element.
+    const replaceRe = new RegExp(
+      `(<field name="${nameEsc}"[^>]*>[\\s\\S]*?<fieldProperties\\b[^>]*\\btransfer=")[^"]*(")`
+    );
+    modified = modified.replace(replaceRe, `$1${f.transfer ? 'true' : 'false'}$2`);
+    changed.push({ name: f.name, transfer: f.transfer, previous });
+  }
+
+  // Segment-level languageField patch (primary segment only). The GET serialization
+  // is round-tripped back with just this one attribute value changed.
+  let segmentChange: { languageField: string; previous: string } | undefined;
+  if (args.languageField !== undefined) {
+    const prev = modified.match(/<segment\b[^>]*\blanguageField="([^"]*)"/)?.[1];
+    if (prev === undefined) {
+      skipped.push({ name: 'languageField', reason: 'no languageField attribute on segment' });
+    } else {
+      modified = modified.replace(
+        /(<segment\b[^>]*\blanguageField=")[^"]*(")/,
+        `$1${args.languageField}$2`
+      );
+      segmentChange = { languageField: args.languageField, previous: prev };
+    }
+  }
+
+  if (changed.length === 0 && segmentChange === undefined) {
+    return JSON.stringify({
+      success: false,
+      datasource: dsUpper,
+      source_system: ssUpper,
+      skipped,
+      message: 'No fields were changed.',
+    }, null, 2);
+  }
+
+  // 2. Lock; capture LOCK_HANDLE and the timestamp response header.
+  const lockUrl = `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}?action=lock`;
+  const unlockUrl = `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}?action=unlock`;
+  const csrf = await client.getCsrfToken();
+  const lockRes = await client.rawPost(lockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf });
+  const lockHandle = lockRes.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1] ?? '';
+  if (!lockHandle) {
+    return JSON.stringify({
+      success: false,
+      message: `No <LOCK_HANDLE> in lock response:\n${lockRes.body}`,
+    }, null, 2);
+  }
+  const timestamp = (lockRes.headers['timestamp'] as string | undefined) ?? '';
+
+  try {
+    // 3. PUT. corrNr (camelCase!) + Transport-Lock-Holder only when a transport is used.
+    const query = args.transport
+      ? `?corrNr=${encodeURIComponent(args.transport)}&lockHandle=${encodeURIComponent(lockHandle)}`
+      : `?lockHandle=${encodeURIComponent(lockHandle)}`;
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/xml, application/vnd.sap.bw.modeling.rsds-v1_1_0+xml',
+      Accept: 'application/vnd.sap.bw.modeling.rsds-v1_1_0+xml',
+    };
+    if (timestamp) headers['timestamp'] = timestamp;
+    if (args.transport) headers['Transport-Lock-Holder'] = args.transport;
+    headers['x-csrf-token'] = csrf;
+
+    const putRes = await client.rawPut(`${mUrl}${query}`, modified, headers);
+    const hasError = putRes.body.includes('messageType="Error"');
+    const title = putRes.body.match(/<atom:title>([^<]*)<\/atom:title>/)?.[1] ?? '';
+
+    const result: Record<string, unknown> = {
+      success: !hasError,
+      datasource: dsUpper,
+      source_system: ssUpper,
+      changed,
+    };
+    if (segmentChange) result['segment_change'] = segmentChange;
+    if (skipped.length > 0) result['skipped'] = skipped;
+    if (title) result['message'] = title;
+    if (!hasError) {
+      result['next_step'] =
+        'DataSource is inactive. Activate with bw_activate (object_type "rsds", pass source_system and, if transportable, transport).';
+    }
+    return JSON.stringify(result, null, 2);
+  } finally {
+    try {
+      await client.rawPost(unlockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf });
+    } catch {
+      // ignore unlock failure
+    }
+  }
 }

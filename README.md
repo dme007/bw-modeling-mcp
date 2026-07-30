@@ -1,8 +1,23 @@
 # bw-modeling-mcp
 
-A Model Context Protocol (MCP) server that enables AI assistants like Claude to work directly inside SAP BW/4HANA systems — reading, creating and modifying BW modeling objects via the internal REST API used by Eclipse BWMT.
+A Model Context Protocol (MCP) server that enables AI assistants like Claude to work directly inside SAP BW/4HANA systems — reading, creating and modifying BW modeling objects via the same internal SAP APIs that Eclipse BWMT and the BW/4HANA Cockpit use: the **BW Modeling REST API** (`/sap/bw/modeling/`) for objects, queries and live data, the **ADT API** (`/sap/bc/adt/`) for ABAP/AMDP routine source, the **BW/4HANA manage API** for the request monitor and runtime, and the **Push API** (`/sap/bw4/`) for data loads.
 
 **This is not a simulation.** Every tool call connects to a live BW system — write operations produce real changes.
+
+---
+
+## ☁️ Running on SAP BTP Cloud Foundry
+
+Besides stdio, the server can run as an HTTP service on SAP BTP Cloud Foundry with XSUAA
+OAuth in front and a BTP destination behind — either a shared technical user
+(`BasicAuthentication`) or **principal propagation**, where each caller reaches BW as
+themselves and BW applies their own authorizations.
+
+Two role collections decide what a user is offered: **BW MCP Reader** (read-only tools)
+and **BW MCP Developer** (all tools). Setup: [docs/CENTRAL-HOSTING-SETUP.md](docs/CENTRAL-HOSTING-SETUP.md)
+(step-by-step) and [docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md) (reference).
+
+stdio is unchanged — `npm start` behaves exactly as before.
 
 ---
 
@@ -16,72 +31,53 @@ Read the blog (DE + EN): https://www.nextlytics.com/blog/agentic-ai-meets-sap-bw
 
 ---
 
-## 🆕 What's New — v0.8.0
+## 🆕 What's New — v1.2.0
 
-**Runtime tools & request monitoring** — the first tools driven by the BW/4HANA `/sap/bc/.../bw4` manage API (the same operations you'd otherwise perform in the BW/4HANA Cockpit), not the `/sap/bw/modeling` tool API:
+**Central hosting on SAP BTP Cloud Foundry with XSUAA OAuth and role-based access control. Game-changer for enterprise deployments.**
 
-- `bw_run_dtp` — start (execute) a DTP load; returns the run request id (RSPM TSN) usable directly with `bw_get_request`
-- `bw_list_requests` / `bw_get_request` — monitor load requests: status, records, DTP info, process steps, message log
-- `bw_activate_request` — activate loaded data (move a finished load from the inbound table into the active data table + change log)
+> **Backwards compatible — local use is unchanged.** Existing stdio setups (`npm start`, Claude Desktop, etc.) keep working exactly as before: no auth, no BTP, no config changes. Upgrading to v1.2.0 is non-breaking — central hosting is purely additive.
 
-**BW Bridge connectivity** — authenticate against BW systems running on the SAP BTP ABAP stack (BW Bridge) via a browser-exported cookie file (`BW_COOKIE_FILE`), in addition to Basic Auth; login/session approach analogous to [vibing-steampunk](https://github.com/oisee/vibing-steampunk).
+**🚀 The Big Picture**
 
-**DataSource (RSDS) across the modeling lifecycle** — create an aDSO from a DataSource template (`bw_create_adso`), use a DataSource as DTP source (`bw_create_dtp`), and activate a DataSource (`bw_activate`).
+- **BTP Cloud Foundry HTTP Server** — the MCP can now run as a central service on enterprise infrastructure (not just locally). `npm run start:http` launches an Express server bound to XSUAA, destination, and connectivity services
+- **XSUAA OAuth Authentication** — **same [@arc-mcp/xsuaa-auth](https://github.com/arc-mcp/xsuaa-auth) module as [ARC-1](https://github.com/arc-mcp/arc-1)** for ecosystem consistency. Stateless Dynamic Client Registration (DCR) + callback proxy. Users log in via BTP identity, the server respects their identity for analytics and auditing (principal propagation ready)
+- **Role-Based Access Control (RBAC)** — `xs-security.json` defines two scopes and **suggested default role collections** that can be customized to your needs:
+  - **`BW MCP Reader`** — read-only metadata and query tools (`read` scope). Ideal for analysts and report consumers
+  - **`BW MCP Developer`** — full access: create/update/delete/activate/push (`write` scope, implies `read`). For modelers and data engineers
+  - Scope enforcement in `src/scopes.ts` is explicit on reads (safe by default), automatic on writes (new write tools require admin to whitelist for read-only)
+  - **Customize for your org:** Extend with `query`, `monitor`, `metadata`, `data_push`, `admin` scopes for finer granularity
+- **Cloud Connector Integration** — on-premise BW systems route through BTP destinations + Cloud Connector
 
-**Fixes** — query reads negotiate the backend content-type version via discovery (fixes HTTP 415 on higher SP levels, #11); DTP activation no longer reports a false "transformation inactive"; field-add works on staging/inbound aDSOs without key elements; DATS date constants survive activation; transformation rule editing picks the correct rule when a start/end routine exists.
+**📋 What This Enables**
 
----
+| Scenario | Before | Now |
+|----------|--------|-----|
+| **One analyst, one BW system** | stdio on analyst's machine | BTP server, analyst logs in with their own identity |
+| **Many analysts, shared server** | impossible (no central auth) | all log in via BTP, each user's identity flows to BW |
+| **MCP tool permissions** | none — whoever runs it can call every tool | grant tools per role, **independent of BW authorizations**: e.g. a BW developer restricted to read-only in the MCP, or the querying tools withheld from someone who may otherwise view data |
+| **BW authorizations** | always enforced via the user's own credentials | unchanged — still fully enforced; principal propagation means each caller acts as themselves, never a shared identity |
+| **Enterprise audit trail** | limited | XSUAA logs all logins; with principal propagation BW session logs show the true user |
 
-## What's New — v0.7.0
+**⚙️ Configuration**
 
-Process Chain support and DataSource data preview:
+- `manifest.yml` — Cloud Foundry app manifest (512 MB, 1 GB disk, BW destination + client + language)
+- `xs-security.json` — XSUAA config; extend with `query`, `monitor`, `metadata`, `data_push`, `admin` scopes if finer granularity is needed
+- Transport: stdio via `node dist/stdio.js` (default), HTTP+OAuth via `npm run start:http` (= `node dist/http.js`, as used by `manifest.yml`)
 
-- `bw_get_process_chain` — reads a complete Process Chain definition including all steps, conditional dependencies, DECISION branch labels, and inline variant configuration; automatically fetches and embeds variant detail (ABAP program + selection variant, TRIGGER scheduling, ADSOACT target aDSO, ADSOREM cleanup settings, PLSWITCHL/P target, DECISION branching formulas) for each step in a single call — deterministic, no additional prompting needed; supports recursive sub-chain expansion by calling the tool again on any referenced chain name
-- `bw_get_process_variant` — reads the configuration detail of any individual process step variant; generic across all 93 BW/4HANA process types; oDetail returned as structured JSON
-- `bw_preview_datasource` — fetches a live data preview from any DataSource; resolves field names automatically from the DataSource structure and renders a formatted table; record count configurable (default 20)
+**📖 Documentation**
 
----
+See [docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md) for the full setup: services, destinations, XSUAA, Cloud Connector, and principal propagation (Stage 2).
 
-## What's New — v0.6.0
+**🔐 Security Notes**
 
-BW Role Management — four new tools for reading and managing query-to-role assignments: `bw_get_roles` (full role hierarchy), `bw_get_role_queries` (all published queries per role), `bw_get_query_roles` (which roles a query is published in), `bw_set_query_roles` (publish or remove a query from a role or folder, including support for nested menu folders).
-
----
-
-## What's New — v0.5.0
-
-Live data querying:
-
-- `bw_query_data` — executes a BEx Query or previews data from any InfoProvider (aDSO, CompositeProvider) via the BICS reporting endpoint; supports variable input, axis layout control (ROWS/COLUMNS/FREE), characteristic filters with include/exclude and range operators, hierarchy drill-down (expand/collapse nodes), pagination, and structure member selection; renders a formatted table with hierarchy indentation
-- `bw_get_filter_values` — looks up valid characteristic values before setting filters or variables; supports wildcard search and optional InfoProvider scoping
-- `bw_get_query` — now returns a compact human-readable summary by default; use `format="raw"` to get the previous full JSON output
-
----
-
-## What's New — v0.4.0
-
-DataSource and source system navigation:
-
-- `bw_get_dataflow` — traces the complete structural data flow graph of any BW object in any direction (upwards / downwards / both); mirrors the Eclipse BWMT Transient Data Flow view
-- `bw_list_source_systems` — lists all logical source systems (LSYS) registered in BW, filterable by type (ODP_SAP, ODP_CDS, ODP_BW, ODP, FILE, HANA_SDA, HANA_LOCAL)
-- `bw_list_datasources` — recursively lists all DataSources under a source system with full APCO hierarchy path
-- `bw_get_source_system` — reads full source system metadata: type, description, connection details (ODP context/destination, HANA remote source, schema)
-- `bw_get_datasource` — reads complete DataSource structure: all fields with types, lengths, transfer flags, key flags, conversion exits, unit/currency references, and adapter configuration
-- `bw_xref` — new `source_system` parameter for `object_type=RSDS`; the correct space-padded objectName is built automatically
+- Write scope implicitly grants read (one-way: read tools do not grant write)
+- New write tools default to requiring `write`; old read tools explicitly whitelist for `read`
+- Principal propagation requires CERTRULE + ICM trust on BW side (see docs/CLOUD-FOUNDRY.md §3)
+- stdio mode is unchanged and auth-free
 
 ---
 
-## What's New — v0.3.0
-
-CompositeProvider read support and BW repository navigation:
-
-- `bw_get_composite_provider` — reads a CompositeProvider structure: view node type (Union/Join), source providers with mapping counts, all fields with dimension classification, join conditions, and temporal join details
-- `bw_get_ckf` — reads a global Calculated Key Figure with recursively resolved human-readable formula and full dependency graph of referenced sub-components
-- `bw_get_rkf` — reads a global Restricted Key Figure: base measure and all characteristic restriction groups
-- `bw_get_structure` — reads a global Structure: all members with Formula/Selection breakdown, characteristic filters, and optional child members
-- `bw_list_contents` — navigates the full BW repository tree (InfoAreas → type folders → objects → sub-folders), mirroring the Eclipse BWMT Project Explorer
-
-> **Work in Progress** — bw-modeling-mcp already covers many typical BW development and analysis scenarios, but not everything yet. More is coming. The server has so far only been tested on our own demo systems — if you are running it against your own BW/4HANA system, feedback and bug reports are very welcome. Please use the [Issue templates](https://github.com/dnic-dev/bw-modeling-mcp/issues/new/choose) — you will be helping shape what gets built next.
+**Earlier releases** — the "What's New" notes for v1.1.0 and older are archived in [WHATS_NEW.md](WHATS_NEW.md); the full structured history is in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -118,16 +114,18 @@ CompositeProvider read support and BW repository navigation:
 
 ### Transformation
 - Read Transformation structure (all sources, all targets)
-- Map source fields to target InfoObjects (StepDirect)
+- Create a Transformation — including InfoObject (IOBJ) sources/targets with an explicit sub-type (text table, attributes/master data, hierarchy)
+- Map source fields to target InfoObjects or plain fields (StepDirect)
 - Set formula rules (StepFormula)
 - Set field routines — ABAP and AMDP (StepRoutine)
 - Set start routines — ABAP and AMDP
 - Set end routines — ABAP and AMDP
+- Set END routine target fields (explicit field list or exclusion list)
 - Switch runtime between ABAP and AMDP
 
 ### DTP (Data Transfer Process)
 - Read DTP structure and settings
-- Create DTPs — including DataSource (RSDS) sources
+- Create DTPs — including DataSource (RSDS) sources and InfoObject targets by sub-type (attributes, texts, hierarchies)
 - Run (execute) a DTP load — returns the run request id for monitoring
 - Update DTP settings and description
 - Switch extraction mode between Full and Delta
@@ -145,6 +143,16 @@ CompositeProvider read support and BW repository navigation:
 - Exceptions with alert levels and thresholds, cell definitions for grid layout queries
 - Active version with automatic fallback to inactive
 
+### BW Query (Authoring)
+- Create a new, consistent Query (ELEM) on an InfoProvider — empty, or as a full copy of an existing query (layout, filter, variables, key figures) via `copy_from`
+- Update the layout — rows, columns, structures, and free characteristics
+- Update the filter — fixed values and restrictions
+- Update key figures — basic key figures, references to global RKFs/CKFs, and local formula members with exception aggregation and display properties
+- Build local formula members from the full BW analytic-engine operator catalog — arithmetic, percentage, data, mathematical, trigonometric, and boolean operators plus ternary `IF`; operand counts are validated before saving
+- Update query settings (properties)
+- Record query edits on a transport request for queries on a transportable package
+- Delete a query
+
 ### Live Data Querying
 - Execute a BEx Query or preview data from any InfoProvider (aDSO, CompositeProvider) — returns a formatted result table
 - Fill query variables, control axis layout (rows / columns / free), apply characteristic filters with include/exclude and range operators
@@ -154,10 +162,11 @@ CompositeProvider read support and BW repository navigation:
 ### CompositeProvider (Read)
 - Read CompositeProvider structure — view node type (Union/Join), source providers (inputs) with mapping count, all fields with dimension classification, join conditions, and temporal join details
 
-### Global CP Components (Read)
+### Global CP Components (Read & Authoring)
 - Read global Calculated Key Figure (CKF) — formula recursively resolved to a human-readable string, full dependency graph of all referenced sub-components
 - Read global Restricted Key Figure (RKF) — base measure, all characteristic restriction groups with field and value details
 - Read global Structure — all members with Formula/Selection breakdown, referenced components, characteristic filters, optional child members
+- Create a reusable Restricted Key Figure (RKF) on an InfoProvider — from a base key figure plus characteristic restrictions (built for mass creation, one per call); each value is validated against the InfoProvider and written consistent, no separate activation
 
 ### Repository Navigation
 - Navigate the full BW repository tree — drill from InfoArea to type folder to object to sub-folder, mirroring the Eclipse BWMT Project Explorer; each entry returns a `children_path` for seamless drill-down
@@ -165,11 +174,15 @@ CompositeProvider read support and BW repository navigation:
 ### Data Flow Navigation
 - Traverse the complete structural data flow graph of any BW object — all connected sources and targets resolved recursively through Transformations, DTPs, InfoSources, aDSOs, DataSources, CompositeProviders, and InfoObjects; mirrors the Eclipse BWMT Transient Data Flow view
 
-### DataSource Navigation
+### DataSource Navigation & Authoring
 - List all source systems connected to the BW system (ODP_SAP, ODP_CDS, ODP_BW, ODP, FILE, HANA_SDA, HANA_LOCAL)
 - Recursively list all DataSources in a source system with full APCO hierarchy path
 - Read full source system metadata including connection details (ODP context/destination, HANA remote source and schema)
 - Read complete DataSource structure: fields with types, lengths, transfer flags, adapter configuration
+- Discover remote entities (HANA views / virtual tables) exposed by a source system
+- Create a DataSource from a remote entity using the server's field proposal (inactive; activate separately)
+- Change the delta process of a DataSource (`deltaProperties`)
+- Set the transfer flag of DataSource fields and/or the segment language field
 
 ### BW Role Management
 - Read the full role hierarchy (ROLE + FOLDER structure)
@@ -183,17 +196,33 @@ CompositeProvider read support and BW repository navigation:
 - Get JSON push schema for a write-interface aDSO
 - Push JSON record arrays directly into an aDSO
 
-### Process Chain Navigation
+### Process Chain Navigation, Authoring & Monitoring
 - Read complete Process Chain definitions — all steps with type, variant, description, and last execution status
 - Conditional flow semantics fully resolved: DECISION branch labels (including ABAP formula expressions), OR/AND join nodes, positive/negative/neutral edge conditions
 - Automatic variant detail per step: ABAP program and selection variant, TRIGGER scheduling parameters, ADSOACT/ADSOREM aDSO targets and cleanup settings, PLSWITCHL/P target aDSO, DECISION branching formulas — all embedded inline in a single tool call
 - Recursive sub-chain expansion: CHAIN-type steps reference other Process Chains — call `bw_get_process_chain` again on any referenced chain name to expand the full hierarchy
 - Generic process variant reader: covers all 93 BW/4HANA process types including custom Z-types; unknown types return oDetail as raw JSON
+- Create a Process Chain from a step and edge list — supported types: `DTP_LOAD`, `ADSOACT`, `ADSOREM` (DSO request cleanup), `CHAIN`, collectors `AND` / `OR` / `XOR`
+- Replace the step model of an existing chain; activate a chain
+- Incrementally edit an existing chain — append a DTP load step (optionally with its own DSO activation), swap one DTP load variant for another, add on-error (negative) links mirroring the existing success links, add an "Execute ABAP Program" step (optionally with an SE38 variant) positioned before/after any step
+- Create a DECISION process variant for use as a branch/decision step
+- Monitor execution runs: history with status and timestamps, step-level and message-level run detail, last status per chain across the entire system
 
 ### DataSource Data Preview
 - Fetch a live data preview from any DataSource (RSDS) directly from the source system
 - Field names resolved automatically from the DataSource structure; configurable record count (default 20)
 - Rendered as a padded plain-text table with column alignment
+
+### Open Hub Destination (Read)
+- Read an Open Hub Destination (DEST): destination type, source object, DB table, InfoArea, package, and status
+- Complete output field list with types, InfoObject binding, conversion routine, compounding, and key flag
+- File properties for FILE-type destinations
+
+### Integrated Planning (Read)
+- Read Aggregation Levels (ALVL) — the planning-enabled view on top of an InfoProvider; characteristics and key figures with full type and semantic detail
+- Read Planning Functions (PLSE) — function type, characteristic usage roles, and parameter tree; FOX code surfaced for FORMULA functions
+- Read Planning Sequences (PLSQ) — ordered step list with aggregation level, planning function, and filter references
+- Read Planning Properties (PLCR) — key-date mode, maximum characteristic combinations, and save strategy for plan-enabled InfoProviders
 
 ### Request Monitor & Runtime
 - List load requests for a target InfoProvider — status, last process status/action, record count, timestamp, user, TSN
@@ -203,16 +232,17 @@ CompositeProvider read support and BW repository navigation:
 
 ### General
 - Search & Where-Used (xref)
-- Activate BW objects (aDSO, InfoObject, Transformation, DTP, DataSource)
+- Activate BW objects (aDSO, InfoObject, Transformation, DTP, DataSource, CompositeProvider)
 - Release locks without activating (discard changes)
 - Delete BW objects
-- Transport request assignment
+- Transport request assignment — add a user task (sub-request) to a workbench transport, list changeable transport requests and their tasks
+- Reassign an object to a different package (Development Class) on a transport request
 
 ---
 
 ## Combining with an ADT MCP Server
 
-For tasks involving ABAP or SQLScript (AMDP) logic inside Transformations, **bw-modeling-mcp works best alongside an ADT MCP server** such as [vibing-steampunk](https://github.com/oisee/vibing-steampunk).
+For tasks involving ABAP or SQLScript (AMDP) logic inside Transformations, **bw-modeling-mcp works best alongside an ADT MCP server** such as [vibing-steampunk](https://github.com/oisee/vibing-steampunk) or [ARC-1](https://github.com/arc-mcp/arc-1).
 
 The BW MCP server handles the BW modeling structure — creating the Transformation, setting up routines, activating objects. The ADT MCP server handles reading and writing the actual ABAP class source code that backs the routine. Together, they cover the full development cycle from BW object creation to ABAP logic implementation.
 
@@ -231,13 +261,15 @@ The BW MCP server handles the BW modeling structure — creating the Transformat
 
 ## Requirements
 
-- SAP BW/4HANA system with REST API access (`/sap/bw/modeling/`)
+- SAP BW/4HANA system with the internal SAP APIs enabled
 - Node.js 18 or later
 - An MCP-compatible AI client (Claude Desktop, Claude Code, etc.)
 
 ---
 
 ## Installation
+
+> **Two ways to run.** Locally as a **stdio** server (one user, one machine — the steps below), or **centrally hosted** on SAP BTP Cloud Foundry behind XSUAA OAuth for a whole team → see [docs/CENTRAL-HOSTING-SETUP.md](docs/CENTRAL-HOSTING-SETUP.md). The installation and configuration below cover local stdio use; upgrading an existing local setup is non-breaking.
 
 ```bash
 # Option 1: Install via npm (recommended)
@@ -254,7 +286,7 @@ npm run build
 
 ## Configuration
 
-The server is configured via environment variables:
+For **local (stdio)** use, the server is configured via environment variables. For **central BTP hosting**, connection and credentials come from the BTP destination and service bindings instead — see [docs/CENTRAL-HOSTING-SETUP.md](docs/CENTRAL-HOSTING-SETUP.md).
 
 | Variable | Description | Required |
 |---|---|---|
@@ -265,7 +297,7 @@ The server is configured via environment variables:
 | `BW_LANGUAGE` | Language for object texts (e.g. `EN`, `DE`). Default: `DE` | no |
 | `BW_COOKIE_FILE` | Path to a browser-exported cookie file for SAML-/OAuth-fronted systems (e.g. BW Bridge). Netscape or `name=value` format. When set, `BW_USER` / `BW_PASSWORD` are optional. | no |
 
-**Cookie authentication (BW Bridge / SAP BTP):** For BW systems that sit behind a SAML or OAuth login (such as BW Bridge on the SAP BTP ABAP stack), Basic Auth is not available. Export the authenticated session cookies from your browser into a file and point `BW_COOKIE_FILE` at it. The login/session approach is analogous to [vibing-steampunk](https://github.com/oisee/vibing-steampunk). When the session expires, refresh the cookie file and restart the server.
+**Cookie authentication (BW Bridge / SAP BTP):** For BW systems that sit behind a SAML or OAuth login (such as BW Bridge on the SAP BTP ABAP stack), Basic Auth is not available. Export the authenticated session cookies from your browser into a file and point `BW_COOKIE_FILE` at it. The login/session approach is analogous to [vibing-steampunk](https://github.com/oisee/vibing-steampunk) and [ARC-1](https://github.com/arc-mcp/arc-1). When the session expires, refresh the cookie file and restart the server.
 
 ### Claude Desktop
 
@@ -276,7 +308,7 @@ Add to `claude_desktop_config.json`:
   "mcpServers": {
     "bw-modeling-mcp": {
       "command": "node",
-      "args": ["/path/to/bw-modeling-mcp/dist/index.js"],
+      "args": ["/path/to/bw-modeling-mcp/dist/stdio.js"],
       "env": {
         "BW_URL": "https://your-bw-host:50001",
         "BW_USER": "YOUR_USER",
@@ -289,7 +321,7 @@ Add to `claude_desktop_config.json`:
 }
 ```
 
-### Claude Code
+### Claude Code (VS Code extension)
 
 Add `.mcp.json` to your project root:
 
@@ -298,7 +330,7 @@ Add `.mcp.json` to your project root:
   "mcpServers": {
     "bw-modeling-mcp": {
       "command": "node",
-      "args": ["/path/to/bw-modeling-mcp/dist/index.js"],
+      "args": ["/path/to/bw-modeling-mcp/dist/stdio.js"],
       "env": {
         "BW_URL": "https://your-bw-host:50001",
         "BW_USER": "YOUR_USER",
@@ -360,6 +392,15 @@ Create a new InfoArea. Immediately active after creation, no activation step nee
 ### `bw_move_object`
 Move any BW object (aDSO, InfoObject, InfoArea, etc.) to a different InfoArea.
 
+### `bw_change_package`
+Reassign an existing BW object to a different package (Development Class) and record the change on a transport request via the CTO write endpoint. A single write, no activation — afterwards the object is inactive and must be re-activated with `bw_activate` (passing the same transport). For DataSources (`object_type="RSDS"`) `source_system` is mandatory (compound key) and the applied package is verified by re-reading the DataSource. Verified for `TRFN` and `RSDS`; other TLOGO types use the same mechanism but are not trace-verified.
+
+### `bw_create_transport_task`
+Add a task (sub-request) for a user to an existing workbench transport request.
+
+### `bw_list_changeable_transports`
+List transport requests and their tasks via the BW transport state (`cto/check`).
+
 ### `bw_get_infosource`
 Read an InfoSource (TRCS) structure — fields, key fields, label, InfoArea, version status.
 
@@ -373,7 +414,7 @@ Update an existing InfoSource — fields and description.
 Read a Transformation structure including all field mapping rules, routines, source, and target. Transformation names are UUID-like keys — use `bw_xref` on the target aDSO to find them.
 
 ### `bw_create_transformation`
-Create a new Transformation. Supports all source types (aDSO, InfoSource, DataSource/RSDS) and all target types (aDSO). Can copy structure from an existing Transformation.
+Create a new Transformation. Supports all source types (aDSO, InfoSource, DataSource/RSDS) and all target types (aDSO). For InfoObject (`IOBJ`) sources or targets, set `source_object_subtype` / `target_object_subtype` to select the facet — `TEXT` (text table), `ATTR` (attributes / master data), or `HIER` (hierarchy). Can copy structure from an existing Transformation.
 
 ### `bw_update_transformation`
 Modify field mappings in an existing Transformation:
@@ -383,11 +424,14 @@ Modify field mappings in an existing Transformation:
 ### `bw_set_transformation_routine`
 Set a field routine, start routine, or end routine on a Transformation. Supports both ABAP and AMDP (SQLScript). The routine code is written in combination with an ADT MCP server.
 
+### `bw_set_transformation_expert_routine`
+Write the code of an existing Start/End/Expert routine into the Transformation master so it survives activation and transport. Unlike a raw `WriteSource` on the generated class, this re-saves the master and keeps the routine code transport-stable.
+
 ### `bw_delete_transformation_routine`
 Remove an existing routine from a Transformation field.
 
 ### `bw_set_transformation_runtime`
-Switch the Transformation runtime between ABAP and AMDP.
+Switch the Transformation runtime between ABAP and HANA (AMDP). The current runtime is read from the active version, the change is activated automatically, and the result is verified against the active version — no separate `bw_activate` call is needed. If the switch does not persist (e.g. the server refuses HANA runtime for this transformation), the tool returns an error instead of a false-positive success.
 
 ### `bw_get_dtp`
 Read the full definition of a single DTP — source, target, transformation reference, extraction settings (mode, package size), and all filter fields including value selections and routine code. DTP names are UUID-like keys — use `bw_xref` or `bw_get_dtps` to find them.
@@ -396,7 +440,7 @@ Read the full definition of a single DTP — source, target, transformation refe
 List all DTPs that depend on a given BW object or Transformation.
 
 ### `bw_create_dtp`
-Create a new DTP on a Transformation. Source and target are derived from the Transformation automatically. For a DataSource source, set `source_type="RSDS"` and pass `source_system`.
+Create a new DTP on a Transformation. Source and target are derived from the Transformation automatically. For a DataSource source, set `source_type="RSDS"` and pass `source_system`. For an InfoObject target (`target_type="IOBJ"`), select the loaded sub-object with `target_object_subtype` — `ATTR` (attributes / master data, default), `TEXT` (texts), or `HIER` (hierarchies).
 
 ### `bw_run_dtp`
 Start (execute) a run of an existing, active DTP. Returns the new run request id (an RSPM TSN) that can be passed directly to `bw_get_request` for monitoring.
@@ -405,7 +449,7 @@ Start (execute) a run of an existing, active DTP. Returns the new run request id
 Update a DTP — description, value filters on fields, and extraction mode (`extraction_mode` = `full` / `delta`). Note: switching between Delta and Full has BW delta-init implications — a later delta load may require re-initialization.
 
 ### `bw_set_dtp_filter_routine`
-Set an ABAP routine filter on a DTP field.
+Set an ABAP routine filter on a DTP field. The generated routine's inactive version is syntax-checked before activation — broken code is reported with the ABAP messages and the DTP is left unchanged, instead of being falsely reported as activated.
 
 ### `bw_get_push_schema`
 Get the expected JSON schema for pushing data into a write-interface aDSO.
@@ -426,11 +470,50 @@ Always call `bw_get_query` or `bw_get_adso` first to discover the axis layout an
 ### `bw_get_filter_values` _(Read only)_
 Look up valid values for a characteristic — required before setting any filter or variable. Returns `CHAVL_EXT` (use for state filters) and `CHAVL_INT` (use for variable inputs); formats differ for date-type characteristics. Supports wildcard search (`*` for all values, prefix match e.g. `2022*`). Optionally scope results to a specific InfoProvider.
 
+### `bw_create_query`
+Create a new, consistent Query (TLOGO ELEM) on an InfoProvider in package `$TMP`. Without `copy_from` the query is created empty and consistent (no rows, columns, or key figures yet). With `copy_from` it is created as a full copy of an existing query (layout, filter, variables, key figures); when no `infoprovider` is given it defaults to the source query's provider.
+
+### `bw_update_query_layout`
+Edit the query layout — add/remove rows, columns, structures, and free characteristics. Accepts an optional `transport` request number for queries on a transportable package.
+
+### `bw_update_query_filter`
+Edit the query filter — fixed value restrictions on characteristics. Accepts an optional `transport` request number.
+
+### `bw_update_query_key_figures`
+Edit the query key figures — add basic key figures, references to global RKFs/CKFs, and local formula members; set exception aggregation and display properties (decimals, hidden, sign inversion); remove members. Formula members accept a recursive operator/operand tree covering the full BW operator catalog (basic, percentage, data, mathematical, trigonometric, and boolean operators plus ternary `IF`); operator codes are case-insensitive and their operand counts are validated before saving. Accepts an optional `transport` request number.
+
+### `bw_update_query_settings`
+Edit query properties (settings). Accepts an optional `transport` request number.
+
 ### `bw_get_process_chain` _(Read only)_
 Read a Process Chain (RSPC) definition — header metadata, scheduling and monitoring settings, all steps with type, variant, last execution status, conditional dependencies with DECISION branch labels, and automatically embedded variant configuration per step. Set `include_variant_details=false` for a fast structural overview. Output format: `text` (default) or `raw` (full JSON).
 
 ### `bw_get_process_variant` _(Read only)_
 Read the detail configuration of a single Process Chain step variant. Generic across all process types — oDetail rendered as indented JSON. Use process_type and variant_name from `bw_get_process_chain` output.
+
+### `bw_create_process_chain`
+Create a Process Chain (RSPC) from a step and edge list — builds the model, creates a trigger-only skeleton, then updates it with the full model in one operation; optionally activates. Supported step types: `DTP_LOAD`, `ADSOACT`, `ADSOREM` (DSO request cleanup), `CHAIN` (local sub-chain start), collectors `AND` / `OR` / `XOR`.
+
+### `bw_update_process_chain`
+Replace the step model (nodes and edges) of an existing Process Chain, preserving the existing trigger node and scheduling. Optionally overrides description and InfoArea.
+
+### `bw_activate_process_chain`
+Activate an existing Process Chain. Returns the top-level activation message, severity, and full log.
+
+### `bw_append_process_chain_dtp`
+Append one DTP load step (optionally followed by its own DSO activation step) to an existing Process Chain, wiring it after a given predecessor step.
+
+### `bw_swap_process_chain_dtp`
+Swap one DTP load variant for another in an existing Process Chain, keeping the surrounding edges intact.
+
+### `bw_add_process_chain_error_links`
+Add on-error (negative) links to an existing Process Chain by mirroring the existing success links.
+
+### `bw_create_decision_variant`
+Create a DECISION process variant (a standalone TLOGO object) for use as a branch/decision step in a Process Chain.
+
+### `bw_add_process_chain_program`
+Add an "Execute ABAP Program" step (RSPC process type ABAP) to an existing Process Chain, optionally with a named SE38 selection variant. In-place edit — the program call is stored as an inline process variant inside the chain model (no separate variant object). Positioning via `before` / `after` / `predecessor` (default: strand end closest to the trigger); idempotent (a matching ABAP step is skipped), with ETag concurrency and transport handling.
 
 ### `bw_preview_datasource` _(Read only)_
 Fetch a live data preview from a DataSource. Resolves field names automatically and renders a formatted table. Parameters: `datasource_name`, `source_system`, `records` (default 20).
@@ -459,6 +542,9 @@ Read a global Restricted Key Figure — base measure, all characteristic restric
 ### `bw_get_structure` _(Read only)_
 Read a global Structure — all members with type (Formula/Selection), referenced components, characteristic filters, optional child members, and metadata.
 
+### `bw_create_rkf`
+Create one reusable Restricted Key Figure (TLOGO ELEM) on an InfoProvider from a base key figure plus one or more characteristic restrictions. Built for mass creation (one RKF per call); each restriction value is validated against the InfoProvider and mapped to its internal key before the write, and the RKF is written consistent (no separate activation step). Supports `Equal` / `Between` / `LessThan` / `GreaterThan` / `LessEqual` / `GreaterEqual` / `Contains` operators and exclusions, an optional InfoArea, and a transport request for transportable packages.
+
 ### `bw_list_contents` _(Read only)_
 Navigate the BW repository tree. Pass a path such as `""` (all InfoAreas), `"area/MYAREA"` (InfoArea contents), `"hcpr/CP_NAME"` (CP sub-folders), or `"adso/ADSO_NAME/trfn"` (Transformations on an aDSO). Each entry includes `children_path` to drill down further.
 
@@ -473,6 +559,12 @@ Read the metadata of a single logical source system — type, description, and c
 
 ### `bw_get_datasource` _(Read only)_
 Read the complete structure of a DataSource (RSDS): metadata (status, delta type, direct access, application component, package, timestamps), all fields with type, length, transfer flag, key flag, position, selection options, conversion exit, and unit/currency reference, plus active adapter configuration (ODP, HANA, File, CSV). Output format: `text` (default human-readable summary) or `raw` (XML from BW).
+
+### `bw_change_datasource_delta`
+Change the delta process of a DataSource (`deltaProperties`). Full read-modify-write; leaves the object inactive for a separate `bw_activate`.
+
+### `bw_set_datasource_fields`
+Set the transfer flag of one or more DataSource fields (`fieldProperties@transfer`) and/or the segment `language_field`. At least one of `fields` / `language_field` must be given.
 
 ### `bw_get_dataflow` _(Read only)_
 Read the complete structural data flow of a BW object — all connected sources and targets resolved recursively through Transformations, DTPs, InfoSources, aDSOs, DataSources, CompositeProviders, and InfoObjects. Mirrors the Eclipse BWMT Transient Data Flow view. Supports direction (`upwards` / `downwards` / `both`) and configurable depth. Note: routine-based lookups (ABAP/SQLScript) are not reflected — only structural BW dependencies.
@@ -576,12 +668,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical architecture and c
 
 ## Roadmap
 
-- **CompositeProvider** — Read: `bw_get_composite_provider` ✅, global components (`bw_get_ckf` / `bw_get_rkf` / `bw_get_structure`) ✅ — Create and modify: planned
-- **BW Queries** — Read: `bw_get_query` ✅ — Create and modify: planned
-- **Process Chains** — build and manage Process Chains
-- **Open ODS View** — create Open ODS Views
-- **BW/4HANA Cockpit functions** — runtime request monitor and data activation ✅ (`bw_run_dtp`, `bw_list_requests`, `bw_get_request`, `bw_activate_request`) — further runtime operations planned
-- **Further BW/4HANA objects** — additional modeling objects
+- **Tool consolidation** — collapse today's one-tool-per-operation surface into a small set of verb-based tools (`bw_read`, `bw_find`, `bw_write_*`, …) that cover the same operations. Same functionality, a single consistent `name` parameter across all reads, and each new operation then costs one enum value instead of a whole new tool — so coverage keeps growing while the surface stays within MCP clients' tool limits.
+- **More modeling & Cockpit coverage** — integrate and complete further BW modeling and BW/4HANA Cockpit operations, e.g. **CompositeProvider create/modify** (read already supported), Open ODS Views, additional runtime and monitoring operations, and further modeling objects.
 
 ---
 

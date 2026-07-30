@@ -55,10 +55,10 @@ export async function bwActivate(
   const typeLower = objectType.toLowerCase();
 
   // Validate object type
-  if (!['adso', 'trfn', 'dtpa', 'iobj', 'trcs', 'rsds'].includes(typeLower)) {
+  if (!['adso', 'trfn', 'dtpa', 'iobj', 'trcs', 'rsds', 'hcpr'].includes(typeLower)) {
     return JSON.stringify({
       success: false,
-      message: `Unknown object type: ${objectType}. Supported: adso, trfn, dtpa, iobj, trcs, rsds`,
+      message: `Unknown object type: ${objectType}. Supported: adso, trfn, dtpa, iobj, trcs, rsds, hcpr`,
     });
   }
 
@@ -79,15 +79,17 @@ export async function bwActivate(
     ? createClientFromEnv()
     : client;
 
-  // Step 1: For trfn/dtpa, GET the object first to prime SAP's internal HANA cache refresh.
-  // This mirrors Eclipse's behavior of GETting before activating. For dtpa the priming GET must
-  // run in the SAME fresh session as the activation POST, otherwise the buffer it refreshes is
-  // not the one performing the activation. trfn keeps its historical throwaway-GET behavior.
+  // Step 1: For trfn/dtpa, GET the object with forceCacheUpdate=true before activating.
+  // This mirrors Eclipse, which always issues GET /m?forceCacheUpdate=true right before the
+  // activation POST. The parameter forces the server-side model cache to sync the just-PUT
+  // inactive (/m) version; without it the activation can pick up a stale cached /m and activate
+  // the OLD content (e.g. a runtime switch to HANA silently activates the previous ABAP version,
+  // so the active version never flips). The priming GET must run in the SAME session that
+  // performs the activation, otherwise it refreshes a buffer other than the one activating.
   if (typeLower === 'trfn' || typeLower === 'dtpa') {
     const mediaKey = typeLower as keyof typeof MEDIA_TYPES;
-    const primingClient = typeLower === 'dtpa' ? activationClient : createClientFromEnv();
-    await primingClient.get(
-      `/sap/bw/modeling/${typeLower}/${objectName.toLowerCase()}/m`,
+    await activationClient.get(
+      `/sap/bw/modeling/${typeLower}/${objectName.toLowerCase()}/m?forceCacheUpdate=true`,
       MEDIA_TYPES[mediaKey]
     );
   }

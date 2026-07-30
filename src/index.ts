@@ -7,46 +7,63 @@ import {
   ListToolsRequestSchema,
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
+import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
+import { fileURLToPath } from 'node:url';
+import { realpathSync } from 'node:fs';
 
-import { createClientFromEnv } from './bw-client.js';
+import { createClientFromEnv, type BwClient } from './bw-client.js';
+import { currentClient } from './request-context.js';
+import { filterToolsByScope, hasScope, requiredScope } from './scopes.js';
 import { bwGetAdso, bwCreateAdso, FieldDef, bwUpdateAdso, bwUpdateAdsoAddPureField, bwUpdateAdsoSettings, AdsoSettings, bwUpdateAdsoManageKeys, bwUpdateAdsoFieldProperties, FieldProperties } from './tools/adso.js';
 import { bwGetInfoObject, bwCreateInfoObject, bwUpdateInfoObject, AttributeDef } from './tools/infoobject.js';
-import { bwGetTransformation, bwUpdateTransformation, bwCreateTransformation, bwSetTransformationRuntime, bwSetTransformationRoutine, bwDeleteTransformationRoutine } from './tools/transformation.js';
+import { bwGetTransformation, bwUpdateTransformation, bwCreateTransformation, bwSetTransformationRuntime, bwSetTransformationRoutine, bwDeleteTransformationRoutine, bwSetTransformationRoutineFields, bwSetTransformationExpertRoutine } from './tools/transformation.js';
 import { bwActivate } from './tools/activation.js';
-import { bwGetDtps, bwGetDtp, bwCreateDtp, bwRunDtp, bwUpdateDtp, bwSetDtpFilterRoutine } from './tools/dtp.js';
+import { bwGetDtps, bwGetDtp, bwCreateDtp, bwRunDtp, bwUpdateDtp, bwSetDtpFilterRoutine, bwUnlockDtp } from './tools/dtp.js';
 import { bwSearch, bwXref } from './tools/search.js';
 import { bwDelete } from './tools/delete.js';
 import { bwCreateInfoArea, bwMoveObject, bwGetInfoarea } from './tools/infoarea.js';
+import { bwChangePackage, bwListChangeableTransports } from './tools/cto.js';
 import { bwCreateInfosource, bwUpdateInfosource, bwGetInfosource, InfosourceField } from './tools/infosource.js';
 import { bwPushData, bwGetPushSchema } from './tools/push.js';
-import { bwGetQuery } from './tools/query.js';
+import { bwGetQuery, bwCreateQuery } from './tools/query.js';
+import { bwUpdateQueryLayout, bwUpdateQueryFilter, bwUpdateQueryKeyFigures, bwUpdateQuerySettings, LayoutOperation, FilterOperation, KeyFigureOperation, UpdateQuerySettingsArgs } from './tools/query_update.js';
 import { bwGetCompositeProvider } from './tools/composite_provider.js';
 import { bwGetCkf, bwGetRkf, bwGetStructure } from './tools/cp_components.js';
+import { bwCreateRkf, CreateRkfArgs } from './tools/rkf_create.js';
 import { bwListContents } from './tools/repository.js';
-import { bwListSourceSystems, bwListDatasources, bwGetSourceSystem, bwGetDatasource, bwPreviewDatasource } from './tools/datasource.js';
+import { bwListSourceSystems, bwListDatasources, bwGetSourceSystem, bwGetDatasource, bwPreviewDatasource, bwListRemoteEntities, bwCreateDatasource, bwChangeDatasourceDelta, bwSetDatasourceFields } from './tools/datasource.js';
 import { bwGetDataflow } from './tools/dataflow.js';
 import { bwQueryData, bwGetFilterValues, InfoObjectState, VariableInput, DrillOperation } from './tools/reporting.js';
 import { bwGetRoles, bwGetQueryRoles, bwSetQueryRoles, bwGetRoleQueries } from './tools/roles.js';
 import { bwGetProcessChain } from './tools/processchain.js';
 import { bwGetProcessVariant } from './tools/processvariant.js';
 import { bwListRequests, bwGetRequest, bwActivateRequest } from './tools/request_monitor.js';
+import { bwGetOpenHub } from './tools/openhub.js';
+import { bwGetAggregationLevel, bwGetPlanningProperties, bwGetPlanningSequence, bwGetPlanningFunction } from './tools/planning.js';
+import { bwListProcessChainRuns, bwGetProcessChainRunDetail, bwListProcessChainLastStatus } from './tools/process_chain_monitor.js';
+import { bwCreateProcessChain, bwUpdateProcessChain, bwActivateProcessChain, bwAddProcessChainErrorLinks, bwSwapProcessChainDtp, bwAppendProcessChainDtp, bwAddProcessChainProgram, bwCreateDecisionVariant, CreateProcessChainParams, UpdateProcessChainParams, EdgeDef, TriggerEventConfig } from './tools/processchain_write.js';
+import { bwCreateTransportTask } from './tools/transport.js';
 
-// Single shared client instance (CSRF token + session cookies are reused)
-const client = createClientFromEnv();
-
-const server = new Server(
-  { name: 'bw-modeling-mcp', version: '0.1.0' },
-  { capabilities: { tools: {} } }
-);
+// Map the snake_case trigger_event tool argument to the TriggerEventConfig shape.
+function mapTriggerEvent(raw: unknown): TriggerEventConfig | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const e = raw as Record<string, unknown>;
+  if (e['event_id'] === undefined) return undefined;
+  return {
+    eventId: e['event_id'] as string,
+    eventParameter: e['event_parameter'] as string | undefined,
+    eventType: e['event_type'] as string | undefined,
+    onlyOnce: e['only_once'] as boolean | undefined,
+  };
+}
 
 // ── Tool definitions ─────────────────────────────────────────────────────────
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
+const TOOL_DEFINITIONS = [
     {
       name: 'bw_search',
       description:
-        'Universal search for BW objects by name or description. Use this whenever the user wants to find, list, or look up any BW object — aDSOs, queries (ELEM), transformations (TRFN), DTPs (DTPA), InfoObjects (IOBJ), InfoSources (ISFS), CompositeProviders (HCPR), DataSources (RSDS), InfoAreas (AREA), process chains (PRCH), and any other TLOGO type. ' +
+        'Universal search for BW objects by name or description. Use this whenever the user wants to find, list, or look up any BW object — aDSOs, queries (ELEM), transformations (TRFN), DTPs (DTPA), InfoObjects (IOBJ), InfoSources (TRCS), CompositeProviders (HCPR), DataSources (RSDS), InfoAreas (AREA), process chains (RSPC), and any other TLOGO type. ' +
         'Supports wildcards (e.g. "Z*" to find all objects starting with Z). ' +
         'Pass object_type to restrict results to a single type; omit it to search across all types. ' +
         'Prefer this tool over type-specific get/list tools whenever the object name is unknown or a pattern is given.',
@@ -60,7 +77,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           object_type: {
             type: 'string',
             description:
-              'Optional TLOGO filter to restrict results to one object type. Common values: ADSO (aDSO), ELEM (BEx/BW query), TRFN (transformation), DTPA (DTP), IOBJ (InfoObject), ISFS (InfoSource), HCPR (CompositeProvider), RSDS (DataSource), AREA (InfoArea), PRCH (process chain). Leave empty to search all types.',
+              'Optional TLOGO filter to restrict results to one object type. Common values: ADSO (aDSO), ELEM (BEx/BW query), TRFN (transformation), DTPA (DTP), IOBJ (InfoObject), TRCS (InfoSource), HCPR (CompositeProvider), RSDS (DataSource), AREA (InfoArea), RSPC (process chain). Leave empty to search all types.',
           },
         },
         required: ['search_term'],
@@ -178,7 +195,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         'action "add_pure_field": add one or more pure (non-InfoObject) fields — pass fields array with name, label, data_type, optional length/precision/scale/aggregation_behavior/is_key. ' +
         'action "update_settings": change aDSO type preset and/or individual boolean flags — no infoobject_name needed. ' +
         'action "manage_keys": replace the complete key field list — pass key_fields array (empty = no key fields). ' +
-        'action "update_field_properties": modify sidDeterminationMode, aggregationBehavior, fixedCurrency/Unit, or descriptions of a single field — pass field_name and properties. ' +
+        'action "update_field_properties": modify sidDeterminationMode, aggregationBehavior, fixedCurrency/Unit, a unit/currency field reference (unit_currency_field), or descriptions of a single field — pass field_name and properties. ' +
         'Returns a lock_handle that must be passed to bw_activate to complete the operation. ' +
         'Sequence: bw_update_adso → bw_activate (adso) → bw_activate (trfn) → bw_activate (each dtpa).',
       inputSchema: {
@@ -207,8 +224,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                 label: { type: 'string', description: 'Field description.' },
                 data_type: { type: 'string', description: 'Data type (user-facing names). Fixed length, do not pass length: INT1, INT2, INT4, INT8, FLTP, DATS, TIMS, LANG, CUKY, UNIT, DF16_RAW. No length: CURR, QUAN, STRING, RAWSTRING. User-defined length: CHAR, NUMC, RAW, SSTRING. User-defined length+precision: DEC. Precision only: DF16_DEC, DF34_DEC. Fixed length: D16N (16), D34N (34).' },
                 length: { type: 'number', description: 'Length for character types (CHAR, NUMC).' },
-                precision: { type: 'number', description: 'Precision (total digits) for DEC. For CURR/QUAN use scale instead.' },
-                scale: { type: 'number', description: 'Decimal places for CURR, QUAN, DEC (maps to XML precision attribute for CURR/QUAN).' },
+                precision: { type: 'number', description: 'Total digits. For DEC (required) and, optionally, for CURR/QUAN (total length, default 17 when only scale is given).' },
+                scale: { type: 'number', description: 'Decimal places. Required for CURR/QUAN (> 0 — BW rejects scale 0) and used for DEC. Emitted as the XML scale attribute.' },
                 aggregation_behavior: { type: 'string', enum: ['SUM', 'MIN', 'MAX', 'AVG', 'LAST', 'NONE'], description: 'Aggregation (default SUM for numeric types). Use NONE for no aggregation.' },
                 is_key: { type: 'boolean', description: 'If true, also injects a <keyElement> entry.' },
               },
@@ -241,6 +258,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
               },
               fixed_unit: {
                 description: 'Fixed unit of measure (pure QUAN fields). String to set, null to switch to dynamic unit.',
+              },
+              unit_currency_field: {
+                description:
+                  'Unit/currency FIELD reference for a pure QUAN/CURR field: the name of another field in the same aDSO ' +
+                  'that supplies the unit or currency (sets <unitCurrencyElement>#///FIELD</unitCurrencyElement>). ' +
+                  'Use this instead of fixed_unit/fixed_currency to fill the unit/currency dynamically from a field ' +
+                  '(the referenced field must be a UNIT or CUKY field). Any fixed_unit/fixed_currency is removed. ' +
+                  'null removes the reference. Example: on "QUANTITY" set unit_currency_field="QUANTITYUNIT".',
               },
               description: {
                 type: 'string',
@@ -431,6 +456,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             description: 'Technical name of an existing Transformation to copy rules from.',
           },
+          source_object_subtype: {
+            type: 'string',
+            description: 'InfoObject sub-type of the source. Only applies when source_object_type is IOBJ. Valid values: TEXT (text table), ATTR (attributes / master data), HIER (hierarchy).',
+          },
+          target_object_subtype: {
+            type: 'string',
+            description: 'InfoObject sub-type of the target. Only applies when target_object_type is IOBJ. Valid values: TEXT (text table), ATTR (attributes / master data), HIER (hierarchy).',
+          },
         },
         required: ['source_object_type', 'source_object_name', 'target_object_type', 'target_object_name'],
       },
@@ -457,6 +490,63 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['object_type', 'object_name', 'target_info_area'],
+      },
+    },
+    {
+      name: 'bw_change_package',
+      description:
+        'Assign an existing BW object to a different package (Development Class) and record the change on a transport request. ' +
+        'Single write, no activation and no version change: this is a pure TADIR/transport assignment, so an active object stays active and no re-activation is required (verified for ADSO, TRFN, DTPA). Do not re-activate a TRFN afterwards — an activation with a stale lock can regenerate the AMDP method body. ' +
+        'For object_type "RSDS" (DataSource) source_system is mandatory — the key is compound and the package change is verified by re-reading the DataSource. ' +
+        'Verified for TRFN and RSDS; other TLOGO types use the same mechanism but are not trace-verified.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          object_name: {
+            type: 'string',
+            description: 'Technical name of the object to reassign (e.g. "OBJECT_NAME").',
+          },
+          object_type: {
+            type: 'string',
+            description: 'BW object type / TLOGO, e.g. "TRFN", "ADSO", "IOBJ", "TRCS", "RSDS", "HCPR".',
+          },
+          package: {
+            type: 'string',
+            description: 'Target package / Development Class (e.g. "Z_PACKAGE").',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number (e.g. DEVK900123). Required on systems with transport obligation.',
+          },
+          source_system: {
+            type: 'string',
+            description: 'Source system — required only for object_type "RSDS" (a DataSource is identified by DataSource name plus source system).',
+          },
+        },
+        required: ['object_name', 'object_type', 'package'],
+      },
+    },
+    {
+      name: 'bw_list_changeable_transports',
+      description:
+        'List transport requests and their tasks via the BW transport state (cto/check). ' +
+        'Defaults to the caller\'s modifiable requests. Use this to find an open request to assign an object to.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          own_only: {
+            type: 'boolean',
+            description: 'Only the caller\'s own requests (default true). false widens to all users.',
+          },
+          modifiable_only: {
+            type: 'boolean',
+            description: 'Only modifiable requests, i.e. status "D" (default true). false also returns released requests.',
+          },
+          include_objects: {
+            type: 'boolean',
+            description: 'Include the objects contained in each task (default false).',
+          },
+        },
       },
     },
     {
@@ -556,6 +646,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         'For routine/formula on StepNoUpdate rules, source_field is required. ' +
         'For routine/formula on StepDirect/StepInitial rules, source_field is ignored (field is already mapped). ' +
         'source_field is always ignored for rule_type="constant". ' +
+        'rule_type="direct" with unit_source_field set: creates a COMBINED key-figure + unit/currency ' +
+        'direct rule (multi-source/target) — maps a quantity together with its unit (or an amount with ' +
+        'its currency) in one rule, as the Eclipse rule editor shows it. ' +
         'Returns a lock_handle for bw_activate.',
       inputSchema: {
         type: 'object',
@@ -621,6 +714,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
               'Combined with source_field, all listed fields are registered as inputs on the StepFormula rule. ' +
               'Example: ["QUANTITY_SOLD", "COST_PER_UNIT"].',
           },
+          unit_source_field: {
+            type: 'string',
+            description:
+              'Source unit/currency field for a COMBINED key-figure + unit/currency direct rule (rule_type="direct"). ' +
+              'When set, target_infoobject is the key figure and this is the source field that fills its unit or currency. ' +
+              'The target unit/currency field is derived automatically from the key figure\'s unit reference in the aDSO ' +
+              '(the target key figure must reference a unit/currency field). The standalone unit/currency rule is folded ' +
+              'into the combined rule and the transformation\'s currency/unit handling is switched on. ' +
+              'Example: target_infoobject="QUANTITY", unit_source_field="QUANTITYUNIT".',
+          },
           transport: {
             type: 'string',
             description: 'Transport request number (e.g. DEVK900123). Only required if the BW system requires transport assignment.',
@@ -633,7 +736,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: 'bw_delete_transformation_routine',
       description:
         'Remove a Start, End, or Expert routine from a Transformation. ' +
-        'Deletes the matching rule from group id="0". If no rules remain, removes the entire group. ' +
+        "Removes the matching routine rule from the transformation's global routine group. " +
+        'If no rules remain, removes the entire group. ' +
         'Returns lock_handle for bw_activate.',
       inputSchema: {
         type: 'object',
@@ -678,12 +782,108 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'bw_set_transformation_expert_routine',
+      description:
+        'Write the CODE of an existing Start/End/Expert routine into the Transformation MASTER so it ' +
+        'survives TLOGO regeneration — a full bw_activate(trfn) AND a transport import — then activate. ' +
+        'Use this instead of abap-adt WriteSource on the generated /BIC/<uuid>_M class: WriteSource ' +
+        'updates only the generated class body, which BW re-generates from the old master on the next ' +
+        'trfn activation or transport import (symptom: "return type mismatch … OUTTAB[…]"). ' +
+        'This tool replicates the Eclipse editor: it writes the class, then re-saves the transformation ' +
+        'master and runs a TLOGO activation via the BW modeling endpoints. ' +
+        'The routine must already exist (create it first with bw_set_transformation_routine). ' +
+        'Activates automatically — no separate bw_activate needed.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          transformation_name: {
+            type: 'string',
+            description: 'Transformation name (UUID-like key).',
+          },
+          source: {
+            type: 'string',
+            description:
+              'The complete routine method block: "METHOD <NAME> BY DATABASE PROCEDURE … ENDMETHOD." ' +
+              'for AMDP (HANA) routines, or "METHOD <NAME> … ENDMETHOD." for ABAP routines — the same ' +
+              'block shape abap-adt WriteSource(method=…) expects. AMDP SQLSCRIPT must be 7-bit ASCII ' +
+              '(no umlauts / no <=). If omitted, the generated class is left untouched and only the ' +
+              'master re-save + activation runs (to commit code already edited on the class).',
+          },
+          routine_type: {
+            type: 'string',
+            enum: ['start', 'end', 'expert'],
+            description:
+              '"expert" → GLOBAL_EXPERT (default), "start" → GLOBAL_START, "end" → GLOBAL_END. ' +
+              'Selects the generated method name.',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number (e.g. DEVK900123). Required if the BW system requires transport assignment.',
+          },
+          class_name: {
+            type: 'string',
+            description:
+              'Optional override for the generated class name (e.g. "/BIC/<uuid>_M"). ' +
+              'Defaults to the class derived from the transformation. Use for non-standard/field routines.',
+          },
+          method_name: {
+            type: 'string',
+            description:
+              'Optional override for the routine method name (e.g. a field-routine method). ' +
+              'Defaults to GLOBAL_<ROUTINE_TYPE>. When set, the routine-exists guard is skipped.',
+          },
+        },
+        required: ['transformation_name'],
+      },
+    },
+    {
+      name: 'bw_set_transformation_routine_fields',
+      description:
+        'Edit the list of target fields the global END routine writes ("Felder setzen" in SAP GUI). ' +
+        'Requires an existing END routine — use bw_set_transformation_routine to create one first. ' +
+        'Provide exactly one of: fields (explicit complete set of target fields the END routine should write) ' +
+        'or exclude_fields (all target fields minus these). ' +
+        'Rejected if neither or both are given, if any field name does not exist in the target segment, ' +
+        'or if the resolved field set is empty. ' +
+        'Does not activate. Returns lock_handle for bw_activate.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          transformation_name: {
+            type: 'string',
+            description: 'Transformation name (UUID-like key).',
+          },
+          fields: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'Explicit complete set of target field names the END routine should write ' +
+              '(e.g. ["FIELD_A", "FIELD_B"]). Case-insensitive. ' +
+              'Mutually exclusive with exclude_fields.',
+          },
+          exclude_fields: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'Target fields to exclude from the END routine — all other target fields are written. ' +
+              'Case-insensitive. Mutually exclusive with fields.',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number (e.g. DEVK900123). Only required if the BW system requires transport assignment.',
+          },
+        },
+        required: ['transformation_name'],
+      },
+    },
+    {
       name: 'bw_set_transformation_runtime',
       description:
         'Switch a Transformation between HANA and ABAP runtime. ' +
         'Only changes the HANARuntime attribute — no rule changes. ' +
-        'If the runtime already matches the target value, returns early without a PUT. ' +
-        'Returns a lock_handle for bw_activate.',
+        'The current runtime is read from the active version; if it already matches, returns early. ' +
+        'Activates automatically and verifies the change landed in the active version — no separate bw_activate needed. ' +
+        'Returns an error (not success) if the switch does not persist, e.g. when the server refuses HANA runtime for this transformation.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -707,7 +907,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'bw_activate',
       description:
-        'Activate one BW object (aDSO, Transformation, DTP, InfoObject, InfoSource, or DataSource). ' +
+        'Activate one BW object (aDSO, Transformation, DTP, InfoObject, InfoSource, DataSource, or CompositeProvider). ' +
         'Pass the lock_handle from bw_update_adso or bw_update_transformation. ' +
         'For DTP and DataSource (rsds) activation use lock_handle="" (no lock needed — standalone activation). ' +
         'For object_type "rsds" also pass source_system (a DataSource is identified by DataSource name plus source system). ' +
@@ -718,8 +918,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           object_type: {
             type: 'string',
-            enum: ['adso', 'trfn', 'dtpa', 'iobj', 'trcs', 'rsds'],
-            description: 'Object type: adso, trfn, dtpa, iobj, trcs, or rsds (DataSource).',
+            enum: ['adso', 'trfn', 'dtpa', 'iobj', 'trcs', 'rsds', 'hcpr'],
+            description: 'Object type: adso, trfn, dtpa, iobj, trcs, rsds (DataSource), or hcpr (CompositeProvider).',
           },
           object_name: {
             type: 'string',
@@ -746,15 +946,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'bw_delete',
       description:
-        'Delete a BW object permanently (aDSO, InfoObject, Transformation, DTP, etc.). ' +
+        'Delete a BW object permanently (aDSO, InfoObject, Transformation, DTP, Query, etc.). ' +
         'Sequence: lock (with /m) → DELETE → unlock. No activation needed — deletion is immediate. ' +
+        'Queries (object_type "query", alias "elem") use a dedicated delete sequence; deleting a query ' +
+        'does NOT delete the reusable components (variables, CKFs, RKFs) it references — only the query itself. ' +
         'Dependency note: delete aDSOs before their InfoObjects, not the other way around.',
       inputSchema: {
         type: 'object',
         properties: {
           object_type: {
             type: 'string',
-            description: 'BW object type: adso, iobj, trfn, dtpa, etc.',
+            description: 'BW object type: adso, iobj, trfn, dtpa, query (alias elem), etc.',
           },
           object_name: {
             type: 'string',
@@ -769,14 +971,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description:
         'Release a lock on a BW object without activating it. ' +
         'Use this to discard changes and free the lock, e.g. after an aborted create or update. ' +
-        'DTPs do not need unlocking.',
+        'For DTPs (dtpa) this releases the DTP framework enqueue lock (SM12: RSBKDTP) that can ' +
+        'otherwise linger and block the next run or edit of the same DTP.',
       inputSchema: {
         type: 'object',
         properties: {
           object_type: {
             type: 'string',
-            enum: ['adso', 'trfn', 'trcs', 'iobj', 'area'],
-            description: 'Object type: adso, trfn, trcs, iobj, or area (InfoArea).',
+            enum: ['adso', 'trfn', 'trcs', 'iobj', 'area', 'dtpa'],
+            description: 'Object type: adso, trfn, trcs, iobj, area (InfoArea), or dtpa (DTP).',
           },
           object_name: {
             type: 'string',
@@ -865,8 +1068,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'bw_update_infosource',
       description:
-        'Update an InfoSource — change description and/or replace the complete field list. ' +
-        'Provide fields as an array; the entire existing field list is replaced. ' +
+        'Update an InfoSource — change description, add/remove fields, and update labels. ' +
+        'Provide fields as an array of the fields to add, and remove_fields as an array of field names to delete; ' +
+        'other existing fields are always preserved verbatim. ' +
         'Each field can reference an InfoObject (set infoobject_name) or be a local field (omit infoobject_name). ' +
         'Returns a lock_handle for bw_activate.',
       inputSchema: {
@@ -882,7 +1086,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           fields: {
             type: 'array',
-            description: 'Complete list of fields. Replaces all existing fields. Omit to leave fields unchanged.',
+            description: 'Fields to add (or whose label to update). Existing fields are preserved; omit to leave fields unchanged.',
             items: {
               type: 'object',
               properties: {
@@ -900,6 +1104,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
               },
               required: ['name', 'type', 'length', 'label'],
             },
+          },
+          remove_fields: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Field names to remove from the InfoSource (e.g. FIELD_NAME). Other existing fields are preserved.',
           },
           transport: {
             type: 'string',
@@ -959,7 +1168,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         'Steps without variant detail (DTP_LOAD, OR, AND, EXOR, CHAIN) are shown without extra detail — ' +
         'for DTP_LOAD use bw_get_dtp, for CHAIN use bw_get_process_chain recursively. ' +
         'Set include_variant_details=false for a faster structural overview without variant detail. ' +
-        'Use bw_search with object_type=PRCH to find chain names first.',
+        'Use bw_search with object_type=RSPC to find chain names first.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1074,7 +1283,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           storage: {
             type: 'string',
-            description: 'Storage area code (default "AQ").',
+            description:
+              'Storage area code (default "AQ"). Take it from the "Storage" line of the ' +
+              'bw_list_requests output — the code differs by target type (e.g. AQ inbound, ' +
+              'AT/AX active data aDSO, ATTE active text table InfoObject). A wrong code 404s ' +
+              'the header/DTP/process sections, but the message log is still returned.',
           },
           format: {
             type: 'string',
@@ -1154,7 +1367,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           target_type: {
             type: 'string',
-            description: 'Target object type (e.g. "ADSO").',
+            description: 'Target object type (e.g. "ADSO"). Use "IOBJ" to load into an InfoObject; ' +
+              'the loaded sub-object (attributes / texts / hierarchies) is selected with ' +
+              'target_object_subtype.',
+          },
+          target_object_subtype: {
+            type: 'string',
+            enum: ['ATTR', 'TEXT', 'HIER'],
+            description: 'InfoObject sub-object to load into. Only applies when target_type is "IOBJ". ' +
+              'ATTR (default) = attributes/master data (IOBJA), TEXT = texts (IOBJT), ' +
+              'HIER = hierarchies (IOBJH). Must match the sub-object the transformation chain targets.',
           },
           description: {
             type: 'string',
@@ -1348,6 +1570,435 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'bw_create_query',
+      description:
+        'Create a new BW Query (TLOGO ELEM) on an InfoProvider in package $TMP. ' +
+        'Without copy_from the query is created empty and consistent (no rows, columns, or key figures yet). ' +
+        'With copy_from the new query is created as a full copy of an existing query (layout, filter, ' +
+        'variables, key figures); the description parameter still applies to the copy, and infoprovider ' +
+        'may be omitted (it is derived from the source query). ' +
+        'Support for transportable packages is not yet available; only package $TMP is supported.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query_name: {
+            type: 'string',
+            description: 'Technical name of the query to create (e.g. "QUERY_NAME").',
+          },
+          infoprovider: {
+            type: 'string',
+            description:
+              'Technical name of the InfoProvider the query is built on (e.g. "PROVIDER_NAME"). ' +
+              'Required unless copy_from is given, in which case it defaults to the source query\'s provider.',
+          },
+          description: {
+            type: 'string',
+            description: 'Query description. Defaults to query_name if omitted.',
+          },
+          copy_from: {
+            type: 'string',
+            description:
+              'Technical name of an existing query to copy (e.g. "QUERY_NAME"). The new query is created ' +
+              'as a full copy of its content.',
+          },
+        },
+        required: ['query_name'],
+      },
+    },
+    {
+      name: 'bw_update_query_layout',
+      description:
+        'Modify an existing BW Query layout: add or remove characteristics in the rows, columns, or ' +
+        'free-characteristics area, and add or remove references to reusable structures (a structure is a ' +
+        'layout container). All operations are applied in a single save. ' +
+        'All names must be technical names (e.g. "IOBJ_NAME", "STRUCTURE_NAME", "QUERY_NAME").',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query_name: {
+            type: 'string',
+            description: 'Technical name of the query to modify (e.g. "QUERY_NAME").',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number (e.g. DEVK900123). Only needed when the query lives on a transportable package; omit for $TMP queries.',
+          },
+          operations: {
+            type: 'array',
+            description: 'Layout changes to apply in one save cycle.',
+            items: {
+              type: 'object',
+              properties: {
+                action: {
+                  type: 'string',
+                  enum: ['add', 'remove', 'add_structure', 'remove_structure'],
+                  description:
+                    'add / remove: add a characteristic to a container or remove it from the layout. ' +
+                    'add_structure: add a reference to a reusable structure into rows or columns. ' +
+                    'remove_structure: remove a referenced reusable structure.',
+                },
+                target: {
+                  type: 'string',
+                  enum: ['rows', 'columns', 'free'],
+                  description:
+                    'Target container. Required for "add" (rows, columns, or free) and "add_structure" ' +
+                    '(rows or columns).',
+                },
+                infoobject: {
+                  type: 'string',
+                  description: 'Technical name of the characteristic (required for "add" / "remove", e.g. "IOBJ_NAME").',
+                },
+                structure_name: {
+                  type: 'string',
+                  description:
+                    'Technical name of the reusable structure (required for "add_structure" / ' +
+                    '"remove_structure", e.g. "STRUCTURE_NAME").',
+                },
+                description: {
+                  type: 'string',
+                  description: 'Optional display description for "add". Defaults to the InfoObject name.',
+                },
+              },
+              required: ['action'],
+            },
+          },
+        },
+        required: ['query_name', 'operations'],
+      },
+    },
+    {
+      name: 'bw_update_query_filter',
+      description:
+        'Modify an existing BW Query filter. Supported restrictions: fixed values — single values, ' +
+        'intervals (via "high"), and exclusions (via "exclude") — and reusable variable references ' +
+        '(via "set_variable"). All operations are applied in a single save. ' +
+        'Key figure members are not yet supported. ' +
+        'All names must be technical names (e.g. "IOBJ_NAME", "QUERY_NAME", "VAR_NAME").',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query_name: {
+            type: 'string',
+            description: 'Technical name of the query to modify (e.g. "QUERY_NAME").',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number (e.g. DEVK900123). Only needed when the query lives on a transportable package; omit for $TMP queries.',
+          },
+          operations: {
+            type: 'array',
+            description: 'Filter changes to apply in one save cycle.',
+            items: {
+              type: 'object',
+              properties: {
+                action: {
+                  type: 'string',
+                  enum: ['set_values', 'set_variable', 'remove'],
+                  description:
+                    'set_values: set the fixed restriction (single values, intervals, exclusions) for the ' +
+                    'characteristic, replacing any existing filter on it. set_variable: restrict the ' +
+                    'characteristic with a reusable variable (variable_name). remove: delete the filter entirely.',
+                },
+                infoobject: {
+                  type: 'string',
+                  description:
+                    'Technical name of the characteristic (e.g. "IOBJ_NAME"). Required for set_values and ' +
+                    'remove; for set_variable it is derived from the variable definition and may be omitted.',
+                },
+                variable_name: {
+                  type: 'string',
+                  description: 'Technical name of the reusable variable (required for "set_variable", e.g. "VAR_NAME").',
+                },
+                values: {
+                  type: 'array',
+                  description: 'Filter values (required for "set_values").',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      value: {
+                        type: 'string',
+                        description: 'External (display) value to filter on (lower bound of an interval).',
+                      },
+                      internal_value: {
+                        type: 'string',
+                        description: 'Internal value for "value". Defaults to value if omitted.',
+                      },
+                      description: {
+                        type: 'string',
+                        description: 'Optional description for "value".',
+                      },
+                      high: {
+                        type: 'string',
+                        description: 'Upper bound (external value) of an interval. When set, the restriction becomes "Between".',
+                      },
+                      high_internal_value: {
+                        type: 'string',
+                        description: 'Internal value for "high". Defaults to high if omitted.',
+                      },
+                      high_description: {
+                        type: 'string',
+                        description: 'Optional description for "high".',
+                      },
+                      exclude: {
+                        type: 'boolean',
+                        description: 'If true, this restriction is an exclusion ("not equal"). Include and exclude entries may be mixed on one characteristic.',
+                      },
+                    },
+                    required: ['value'],
+                  },
+                },
+              },
+              required: ['action'],
+            },
+          },
+        },
+        required: ['query_name', 'operations'],
+      },
+    },
+    {
+      name: 'bw_update_query_key_figures',
+      description:
+        'Manage the key figure structure of an existing BW Query: add basic key figures, add references ' +
+        'to reusable CKFs/RKFs (with optional local restrictions), add local formula members (recursive ' +
+        'operator/operand tree), set member display properties (decimals, hidden, sign inversion) and ' +
+        'exception aggregation, and remove members. All operations are applied in a single save. ' +
+        'Member operations also apply to a reusable key figure structure referenced via ' +
+        'bw_update_query_layout add_structure. ' +
+        'All names must be technical names (e.g. "IOBJ_NAME", "CKF_NAME", "QUERY_NAME").',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query_name: {
+            type: 'string',
+            description: 'Technical name of the query to modify (e.g. "QUERY_NAME").',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number (e.g. DEVK900123). Only needed when the query lives on a transportable package; omit for $TMP queries.',
+          },
+          structure_target: {
+            type: 'string',
+            enum: ['rows', 'columns'],
+            description:
+              'Container for the key figure structure when it is created by the first add operation ' +
+              '(default "columns"). Ignored once a structure already exists.',
+          },
+          operations: {
+            type: 'array',
+            description: 'Key figure changes to apply in one save cycle.',
+            items: {
+              type: 'object',
+              properties: {
+                action: {
+                  type: 'string',
+                  enum: ['add_key_figure', 'add_ckf', 'add_rkf', 'add_formula', 'remove_member', 'set_member_properties'],
+                  description:
+                    'add_key_figure: add a basic key figure (infoobject). add_ckf / add_rkf: add a reference ' +
+                    'to a reusable calculated / restricted key figure (component_name). add_formula: add a local ' +
+                    'formula member (description + formula). remove_member: remove a member matched by member_id, ' +
+                    'description, and/or component_name. set_member_properties: change display properties / ' +
+                    'exception aggregation of a matched member.',
+                },
+                infoobject: {
+                  type: 'string',
+                  description: 'Basic key figure technical name (required for "add_key_figure", e.g. "IOBJ_NAME").',
+                },
+                component_name: {
+                  type: 'string',
+                  description:
+                    'Reusable CKF/RKF technical name (required for "add_ckf" / "add_rkf"; optional matcher for ' +
+                    '"remove_member" / "set_member_properties", e.g. "CKF_NAME").',
+                },
+                description: {
+                  type: 'string',
+                  description:
+                    'Member description. Defaults to the key figure / component name on add; required for ' +
+                    '"add_formula"; matches the member description on "remove_member" / "set_member_properties".',
+                },
+                member_id: {
+                  type: 'string',
+                  description:
+                    'Member id matcher for "remove_member" / "set_member_properties". Takes precedence over ' +
+                    'description and component_name; use it to disambiguate when those match more than one member.',
+                },
+                formula: {
+                  type: 'object',
+                  description:
+                    'Formula tree for "add_formula" (recursive). Node forms: ' +
+                    '{ "type": "operator", "code": "+|-|*|/|MAX|...", "operands": [node, ...] } ' +
+                    '(codes +,-,*,/ are infix, any other code is a prefix function); ' +
+                    '{ "type": "member", "description": "..." } or { "type": "member", "member_id": "..." } ' +
+                    '(references another structure member); ' +
+                    '{ "type": "component", "component_name": "CKF_NAME" } (references the structure member that ' +
+                    'wraps that CKF/RKF — the component must already be added as a structure member; a query ' +
+                    'formula cannot reference a component id directly); ' +
+                    '{ "type": "key_figure", "name": "IOBJ_NAME" }; { "type": "constant", "value": "5" }. ' +
+                    'Operator codes (BW analytic engine, operand counts enforced): ' +
+                    'basic +,- (1-2), *,/ (2); ** power, DIV, MOD (2). ' +
+                    'math ABS, CEIL, FLOOR, FRAC, TRUNC, SIGN, SQRT, EXP, LOG, LOG10, MAX0, MIN0 (1); MAX, MIN (2). ' +
+                    'percentage %, %A, %_A (2); %CT, %GT, %RT, %XT, %YT (1). ' +
+                    'data COUNT, DELTA, NDIV0, NODIM, NOERR, FIX, DATE, TIME, CMR, SUMCT, SUMGT, SUMRT, SUMXT, SUMYT (1). ' +
+                    'trig SIN, COS, TAN, SINH, COSH, TANH, ASIN, ACOS, ATAN (1). ' +
+                    'boolean NOT (1); AND, OR, XOR and relational <, <=, <>, ==, >, >= (2); IF cond;true;false (3). ' +
+                    '(LEAF is not supported — BW needs a dedicated nullary token this tool does not emit.) ' +
+                    'The infix/prefix XML encoding does not matter: BW stores formulas as an execution tree and normalizes ' +
+                    'the display, so binary operators (%, **, MOD, relational, boolean) are accepted when emitted as prefix ' +
+                    '— tested and confirmed. Only +,-,*,/ are emitted as XML infix.',
+                },
+                exception_aggregation: {
+                  type: 'object',
+                  description:
+                    'Exception aggregation for the member (add_key_figure / add_ckf / add_rkf / add_formula). ' +
+                    'Shape: { "type": "AVG", "reference_characteristic": "IOBJ_NAME" }.',
+                  properties: {
+                    type: { type: 'string', description: 'Aggregation type (e.g. "AVG", "MAX", "LAS").' },
+                    reference_characteristic: { type: 'string', description: 'Reference characteristic technical name (e.g. "IOBJ_NAME").' },
+                  },
+                  required: ['type', 'reference_characteristic'],
+                },
+                properties: {
+                  type: 'object',
+                  description:
+                    'Member display properties (for "set_member_properties"; also allowed on "add_formula"). ' +
+                    'Only the provided fields are changed.',
+                  properties: {
+                    decimals: { type: 'integer', minimum: 0, maximum: 9, description: 'Number of decimal places (0-9).' },
+                    hidden: {
+                      description: 'Visibility: "hide", "showAlways", "showNever", or false to restore the default.',
+                    },
+                    sign_inversion: { type: 'boolean', description: 'Invert the +/- sign.' },
+                    exception_aggregation: {
+                      description:
+                        'Exception aggregation { "type": "AVG", "reference_characteristic": "IOBJ_NAME" }, or false to reset it.',
+                    },
+                    description: { type: 'string', description: 'New member description text.' },
+                  },
+                },
+                restrictions: {
+                  type: 'array',
+                  description:
+                    'Optional local restrictions on the member. Each entry restricts one characteristic; the ' +
+                    'value schema matches bw_update_query_filter set_values.',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      infoobject: {
+                        type: 'string',
+                        description: 'Characteristic technical name to restrict (e.g. "IOBJ_NAME").',
+                      },
+                      values: {
+                        type: 'array',
+                        description: 'Restriction values (single values, intervals via "high", exclusions via "exclude").',
+                        items: {
+                          type: 'object',
+                          properties: {
+                            value: {
+                              type: 'string',
+                              description: 'External (display) value (lower bound of an interval).',
+                            },
+                            internal_value: {
+                              type: 'string',
+                              description: 'Internal value for "value". Defaults to value if omitted.',
+                            },
+                            description: {
+                              type: 'string',
+                              description: 'Optional description for "value".',
+                            },
+                            high: {
+                              type: 'string',
+                              description: 'Upper bound (external value) of an interval. When set, the restriction becomes "Between".',
+                            },
+                            high_internal_value: {
+                              type: 'string',
+                              description: 'Internal value for "high". Defaults to high if omitted.',
+                            },
+                            high_description: {
+                              type: 'string',
+                              description: 'Optional description for "high".',
+                            },
+                            exclude: {
+                              type: 'boolean',
+                              description: 'If true, this restriction is an exclusion ("not equal").',
+                            },
+                          },
+                          required: ['value'],
+                        },
+                      },
+                    },
+                    required: ['infoobject', 'values'],
+                  },
+                },
+              },
+              required: ['action'],
+            },
+          },
+        },
+        required: ['query_name', 'operations'],
+      },
+    },
+    {
+      name: 'bw_update_query_settings',
+      description:
+        'Change query-level display and behaviour settings of an existing BW Query (description, zero ' +
+        'suppression, result position, sign presentation, zero presentation, universal display hierarchy, ' +
+        'document links, and related flags). Only the provided settings are applied in a single save. ' +
+        'The InfoProvider, technical name, and package cannot be changed. ' +
+        'All names must be technical names (e.g. "QUERY_NAME").',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query_name: {
+            type: 'string',
+            description: 'Technical name of the query to modify (e.g. "QUERY_NAME").',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number (e.g. DEVK900123). Only needed when the query lives on a transportable package; omit for $TMP queries.',
+          },
+          description: { type: 'string', description: 'Query description text.' },
+          zero_suppression_rows: { type: 'boolean', description: 'Suppress zero-value rows.' },
+          zero_suppression_columns: { type: 'boolean', description: 'Suppress zero-value columns.' },
+          result_position_top: { type: 'boolean', description: 'Place the result row on top.' },
+          result_position_left: { type: 'boolean', description: 'Place the result column on the left.' },
+          sign_presentation: {
+            type: 'string',
+            description: 'Sign presentation (e.g. "inFrontOf", "after").',
+          },
+          suppress_repeated_key_values: { type: 'boolean', description: 'Suppress repeated key values.' },
+          show_scaling_factor: { type: 'boolean', description: 'Show the scaling factor.' },
+          adjust_formatting: { type: 'boolean', description: 'Adjust formatting.' },
+          zero_presentation_kind: { type: 'string', description: 'Zero presentation kind (e.g. "withCurrency").' },
+          zero_presentation_custom_value: { type: 'string', description: 'Custom value shown for zeros.' },
+          hierarchy_display_rows: {
+            type: 'object',
+            description: 'Universal display hierarchy for rows.',
+            properties: {
+              active: { type: 'boolean', description: 'Whether the display hierarchy is active.' },
+              level: { type: 'integer', minimum: 0, description: 'Display level (written two-digit).' },
+            },
+          },
+          hierarchy_display_columns: {
+            type: 'object',
+            description: 'Universal display hierarchy for columns.',
+            properties: {
+              active: { type: 'boolean', description: 'Whether the display hierarchy is active.' },
+              level: { type: 'integer', minimum: 0, description: 'Display level (written two-digit).' },
+            },
+          },
+          document_links: {
+            type: 'object',
+            description: 'Document link visibility.',
+            properties: {
+              info_provider: { type: 'boolean', description: 'Show InfoProvider document links.' },
+              master_data: { type: 'boolean', description: 'Show master data document links.' },
+              meta_data: { type: 'boolean', description: 'Show metadata document links.' },
+            },
+          },
+        },
+        required: ['query_name'],
+      },
+    },
+    {
       name: 'bw_get_composite_provider',
       description:
         'Read a CompositeProvider (HCPR) structure — general info, view node type (Union/Join), ' +
@@ -1483,6 +2134,81 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'bw_change_datasource_delta',
+      description:
+        'Change the delta process of a DataSource (RSDS deltaProperties). Full read-modify-write; ' +
+        'the requested value is validated against the DataSource\'s admissible delta values. ' +
+        'Leaves the DataSource inactive — activate separately with bw_activate (object_type "rsds"). ' +
+        'Pass delta_process as an empty string to remove the delta process.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          datasource_name: {
+            type: 'string',
+            description: 'Technical name of the DataSource (e.g. "DATASOURCE_NAME").',
+          },
+          source_system: {
+            type: 'string',
+            description: 'Source system of the DataSource (compound key), e.g. "SOURCE_SYSTEM".',
+          },
+          delta_process: {
+            type: 'string',
+            description: 'Target delta process code (e.g. "FIL0"), or empty string for no delta.',
+          },
+        },
+        required: ['datasource_name', 'source_system', 'delta_process'],
+      },
+    },
+    {
+      name: 'bw_set_datasource_fields',
+      description:
+        'Set the transfer flag of one or more DataSource fields (fieldProperties@transfer) ' +
+        'and/or the segment language field designation. ' +
+        'Full read-modify-write; only the field transfer flags and/or the segment languageField change. ' +
+        'Fields marked transferNotAllowed are skipped when enabling transfer. ' +
+        'At least one of fields / language_field must be given. ' +
+        'Leaves the DataSource inactive — activate separately with bw_activate (object_type "rsds"). ' +
+        'Pass transport for a transportable DataSource so the change is recorded on that request.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          datasource_name: {
+            type: 'string',
+            description: 'Technical name of the DataSource (e.g. "DATASOURCE_NAME").',
+          },
+          source_system: {
+            type: 'string',
+            description: 'Source system of the DataSource (compound key), e.g. "SOURCE_SYSTEM".',
+          },
+          fields: {
+            type: 'array',
+            description: 'Fields to change and their target transfer flag.',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string', description: 'Field name (e.g. "FIELD_NAME").' },
+                transfer: { type: 'boolean', description: 'true to transfer the field, false to exclude it.' },
+              },
+              required: ['name', 'transfer'],
+            },
+          },
+          language_field: {
+            type: 'string',
+            description:
+              'Set to a field name (e.g. "FIELD_NAME") to designate the segment language field, ' +
+              'set to "" to clear the designation. Clearing it fixes ODP text loads that abort with ' +
+              '"Filter condition cannot be interpreted by DataSource" (RODPS_SAPI004). ' +
+              'After the change, activate the DataSource with bw_activate (object_type "rsds").',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request (e.g. DEVK900123). Required for a transportable DataSource; omit for local ($TMP).',
+          },
+        },
+        required: ['datasource_name', 'source_system'],
+      },
+    },
+    {
       name: 'bw_preview_datasource',
       description:
         'Fetch a live data preview / sample rows from a DataSource (RSDS) — ' +
@@ -1509,6 +2235,72 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['datasource_name', 'source_system'],
+      },
+    },
+    {
+      name: 'bw_list_remote_entities',
+      description:
+        'List the remote entities (HANA views / virtual tables) a source system exposes as a ' +
+        'DataSource basis — read-only discovery (the value help Eclipse shows on the DataSource ' +
+        'proposal page). Each entity\'s technical_name is exactly what binds into bw_create_datasource ' +
+        'as the HANA entity. Use this to find a valid hana_entity before creating a DataSource.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          source_system: {
+            type: 'string',
+            description: 'Logical source system name (e.g. "LSYS_NAME"). A HANA/SDA/SDI source system.',
+          },
+          search_pattern: {
+            type: 'string',
+            description: 'Wildcard pattern filtering on technicalName (default "*" for all).',
+          },
+          result_size: {
+            type: 'number',
+            description: 'Maximum number of rows to return (default 200). Check result_complete to see if truncated.',
+          },
+        },
+        required: ['source_system'],
+      },
+    },
+    {
+      name: 'bw_create_datasource',
+      description:
+        'Create a DataSource (RSDS) on top of a remote entity from the server\'s field proposal, ' +
+        'leaving it inactive. The server derives the complete field/segment structure from the ' +
+        'remote entity — no field, key, or partitioning editing is supported (v1). ' +
+        'Local objects only (Development-Class $TMP); no transport handling. ' +
+        'The HANA entity binds via the adapter externalObject attribute, not by name equality — ' +
+        'use bw_list_remote_entities to find a valid hana_entity. ' +
+        'After creation, activate separately with bw_activate (object_type "rsds", the same ' +
+        'source_system, lock_handle "").',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          datasource_name: {
+            type: 'string',
+            description: 'Technical name for the new DataSource (e.g. "DS_NAME").',
+          },
+          source_system: {
+            type: 'string',
+            description: 'Logical source system name (e.g. "LSYS_NAME"). A HANA/SDA/SDI source system.',
+          },
+          application_component: {
+            type: 'string',
+            description: 'Application component (APCO) to file the DataSource under (e.g. "APCO_NAME").',
+          },
+          hana_entity: {
+            type: 'string',
+            description: 'Remote entity technical name (technicalName from bw_list_remote_entities), bound as the ' +
+              'adapter externalObject. Defaults to datasource_name as a convenience; set independently when they differ. ' +
+              'Case-sensitive — passed to the source as-is.',
+          },
+          description: {
+            type: 'string',
+            description: 'DataSource description (default: the hana_entity value).',
+          },
+        },
+        required: ['datasource_name', 'source_system', 'application_component'],
       },
     },
     {
@@ -1560,6 +2352,91 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['component_name'],
+      },
+    },
+    {
+      name: 'bw_create_rkf',
+      description:
+        'Create one reusable Restricted Key Figure (RKF, TLOGO ELEM) on an InfoProvider. ' +
+        'Built for mass creation: one RKF per call — the agent loops. The RKF is created from a ' +
+        'base key figure plus one or more characteristic restrictions; each restriction value is ' +
+        'validated against the InfoProvider and mapped to its internal key before the write. ' +
+        'The RKF is written consistent (no separate activation step). ' +
+        'All names must be technical names (e.g. "PROVIDER_NAME", "RKF_NAME", "KYF_NAME", "IOBJ_NAME").',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          provider_name: {
+            type: 'string',
+            description: 'Technical name of the InfoProvider the RKF is built on (e.g. "PROVIDER_NAME").',
+          },
+          technical_name: {
+            type: 'string',
+            description:
+              'Technical name of the RKF to create (e.g. "RKF_NAME"). Convention is typically ' +
+              'PROVIDER_SUFFIX, but the name is free.',
+          },
+          description: {
+            type: 'string',
+            description: 'RKF description text.',
+          },
+          base_key_figure: {
+            type: 'string',
+            description: 'Technical name of the base key figure to restrict (e.g. an amount key figure "KYF_NAME").',
+          },
+          restrictions: {
+            type: 'array',
+            description: 'Characteristic restrictions applied to the base key figure. At least one is required.',
+            items: {
+              type: 'object',
+              properties: {
+                characteristic: {
+                  type: 'string',
+                  description: 'Technical name of the characteristic to restrict (e.g. "IOBJ_NAME").',
+                },
+                operator: {
+                  type: 'string',
+                  enum: ['Equal', 'Between', 'LessThan', 'GreaterThan', 'LessEqual', 'GreaterEqual', 'Contains'],
+                  description: 'Comparison operator. Defaults to "Equal".',
+                },
+                values: {
+                  type: 'array',
+                  description:
+                    'Restriction values. For "Equal" several values may be given (multiple tokens in the ' +
+                    'same group). For "Between" every value needs both "low" and "high".',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      low: { type: 'string', description: 'The (external) value, or the interval lower bound for "Between".' },
+                      high: { type: 'string', description: 'Interval upper bound; only for operator "Between".' },
+                    },
+                    required: ['low'],
+                  },
+                },
+                exclude: {
+                  type: 'boolean',
+                  description: 'When true, the restriction is an exclusion ("not equal to"). Defaults to false.',
+                },
+              },
+              required: ['characteristic', 'values'],
+            },
+          },
+          info_area: {
+            type: 'string',
+            description: 'Optional InfoArea (technical name). When omitted, no InfoArea is set.',
+          },
+          package: {
+            type: 'string',
+            description: 'Development package. Defaults to the local package (e.g. "$TMP").',
+          },
+          transport_request: {
+            type: 'string',
+            description:
+              'Transport request number (e.g. DEVK900123). Only needed when package is transportable; ' +
+              'omit for the local package.',
+          },
+        },
+        required: ['provider_name', 'technical_name', 'description', 'base_key_figure', 'restrictions'],
       },
     },
     {
@@ -1903,15 +2780,790 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['object_name', 'object_type'],
       },
     },
-  ],
-}));
+    {
+      name: 'bw_get_open_hub',
+      description:
+        'Read an Open Hub Destination (TLOGO DEST) definition — destination type, source, ' +
+        'DB table, InfoArea, package, status, the complete output field list with type/length, ' +
+        'InfoObject binding, conversion routine, compounding, and key flag, ' +
+        'plus file properties when the destination type is FILE.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          open_hub_name: {
+            type: 'string',
+            description: 'Technical name of the Open Hub Destination (e.g. "OBJECT_NAME").',
+          },
+        },
+        required: ['open_hub_name'],
+      },
+    },
+    {
+      name: 'bw_get_aggregation_level',
+      description:
+        'Read an Aggregation Level (TLOGO ALVL) definition — the planning-enabled view on top of ' +
+        'an InfoProvider (aDSO or CompositeProvider) used for Integrated Planning / embedded BPC. ' +
+        'Returns name, description, status, InfoArea, package, the underlying InfoProvider, ' +
+        'and the full element list split into characteristics and key figures. ' +
+        'Characteristics include type, length, conversion routine, base InfoObject, compounding, and dimension group. ' +
+        'Key figures additionally include aggregation behavior, semantics (AMO/QUA/NUM), ' +
+        'and the unit/currency reference (unit characteristic, fixed unit, or fixed currency).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          aggregation_level_name: {
+            type: 'string',
+            description: 'Technical name of the Aggregation Level (e.g. "OBJECT_NAME").',
+          },
+        },
+        required: ['aggregation_level_name'],
+      },
+    },
+    {
+      name: 'bw_get_planning_function',
+      description:
+        'Read a Planning Function (TLOGO PLSE) definition — a planning operation ' +
+        '(formula/FOX, copy, delete, repost, distribution, currency translation, custom exit, …) ' +
+        'tied to an aggregation level for Integrated Planning / embedded BPC. ' +
+        'Returns name, description, function type (planningServiceType), aggregation level, ' +
+        'documentation, status, InfoArea, package, the characteristic usage list ' +
+        '(role of each characteristic in the function), and the full parameter tree ' +
+        'with nested structure and values. For FORMULA functions the FOX code surfaces ' +
+        'as the value of the FLINE parameter.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          planning_function_name: {
+            type: 'string',
+            description: 'Technical name of the Planning Function (e.g. "OBJECT_NAME").',
+          },
+        },
+        required: ['planning_function_name'],
+      },
+    },
+    {
+      name: 'bw_get_planning_sequence',
+      description:
+        'Read a Planning Sequence (TLOGO PLSQ) definition — an ordered list of planning steps ' +
+        'for Integrated Planning / embedded BPC. Returns name, description, InfoArea, package, ' +
+        'status, and the ordered step list. Each step shows its type code, the aggregation level, ' +
+        'the planning function (planning service), and the filter name.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          planning_sequence_name: {
+            type: 'string',
+            description: 'Technical name of the Planning Sequence (e.g. "OBJECT_NAME").',
+          },
+        },
+        required: ['planning_sequence_name'],
+      },
+    },
+    {
+      name: 'bw_get_planning_properties',
+      description:
+        'Read the Planning Properties (TLOGO PLCR) of a plan-enabled InfoProvider (real-time aDSO or ' +
+        'CompositeProvider). Returns the provider name, underlying provider resource and media type, ' +
+        'InfoArea, package, status, and the general planning settings: key-date mode, maximum number ' +
+        'of characteristic combinations, and the save strategy (planning sequence and delta-read flag). ' +
+        'The PLCR shares its technical name with the InfoProvider it belongs to.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          plan_provider_name: {
+            type: 'string',
+            description: 'Technical name of the plan-enabled InfoProvider (e.g. "OBJECT_NAME"). ' +
+              'The PLCR object shares this name.',
+          },
+        },
+        required: ['plan_provider_name'],
+      },
+    },
+    {
+      name: 'bw_list_process_chain_runs',
+      description:
+        'List execution runs of one or all process chains from the process chain monitoring log. ' +
+        'Each row represents one chain run with overall status, runtime deviation, start/end timestamps, and duration. ' +
+        'Optionally filter by chain technical name, start date range, and status code. ' +
+        'Returns the log_id of each run — pass chain_id + log_id into bw_get_process_chain_run_detail for step-level details. ' +
+        'Ordered by start time descending. Default limit 20 runs.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chain_name: {
+            type: 'string',
+            description: 'Optional process chain technical name to restrict to runs of a single chain (e.g. "CHAIN_NAME"). Omit for system-wide results.',
+          },
+          date_from: {
+            type: 'string',
+            description: 'Optional lower bound for run start date (ISO format, e.g. "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM:SS"). Maps to startDate ge datetime filter.',
+          },
+          date_to: {
+            type: 'string',
+            description: 'Optional upper bound for run start date (ISO format). Maps to startDate le datetime filter.',
+          },
+          status: {
+            type: 'string',
+            description: 'Optional status code filter (e.g. as returned by the status field of previous runs). Resolves to eq filter on the status field.',
+          },
+          limit: {
+            type: 'number',
+            description: 'Maximum number of runs to return (default 20).',
+          },
+        },
+        required: [],
+      },
+    },
+    {
+      name: 'bw_get_process_chain_run_detail',
+      description:
+        'Read the execution detail of one process chain run — all process steps with type, variant, status, ' +
+        'timestamps, and parent/child relationships (predecessor graph edges), plus the full message log. ' +
+        'chain_id and log_id come from bw_list_process_chain_runs or bw_list_process_chain_last_status output. ' +
+        'Use this to diagnose a failed run: the message log contains the actual error messages.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chain_id: {
+            type: 'string',
+            description: 'Process chain technical name (e.g. "CHAIN_NAME").',
+          },
+          log_id: {
+            type: 'string',
+            description: 'Run log ID from bw_list_process_chain_runs or bw_list_process_chain_last_status (logId field).',
+          },
+        },
+        required: ['chain_id', 'log_id'],
+      },
+    },
+    {
+      name: 'bw_list_process_chain_last_status',
+      description:
+        'Read the latest execution status and scheduling state for every process chain in the system — ' +
+        'one row per chain. Includes last run status, runtime deviation, scheduling status, next scheduled start, ' +
+        'and the log_id of the most recent run (pass into bw_get_process_chain_run_detail to drill down). ' +
+        'Chains that have never run appear here too. ' +
+        'Optionally filter to chains whose last run has a specific status or whose last start date falls in a range.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          status: {
+            type: 'string',
+            description: 'Optional filter on last run status code. Returns only chains whose most recent run matches this status.',
+          },
+          last_start_from: {
+            type: 'string',
+            description: 'Optional lower bound for last run start date (ISO format, e.g. "YYYY-MM-DD"). Maps to lastStartDate ge datetime filter.',
+          },
+          last_start_to: {
+            type: 'string',
+            description: 'Optional upper bound for last run start date (ISO format). Maps to lastStartDate le datetime filter.',
+          },
+          limit: {
+            type: 'number',
+            description: 'Optional maximum number of chains to return. Omit to return all.',
+          },
+        },
+        required: [],
+      },
+    },
+    {
+      name: 'bw_create_process_chain',
+      description:
+        'Create a Process Chain (RSPC) via the BW/4HANA Cockpit REST API. ' +
+        'Builds the chain model from a list of steps and edges, creates it with a trigger-only skeleton, ' +
+        'then updates it with the full model in a single operation. Optionally activates after creation. ' +
+        'The TRIGGER (Start) node is implicit (node index 0) and must not be listed in steps. ' +
+        'DTP_LOAD and generic referenced steps use bIsReference=true; ADSOACT and ADSOREM use inline variants. ' +
+        'Collectors (AND, OR, XOR) require no extra fields beyond their type. ' +
+        'Edge status defaults: neutral for edges whose source is TRIGGER or a collector; positive for all others. ' +
+        'For two-step DTP loading always use bw_create_dtp first; this tool builds the process chain around existing DTPs. ' +
+        'Supported step types: DTP_LOAD (DTP load), ADSOACT (DSO data activation), ADSOREM (DSO request cleanup), CHAIN (start a local sub-chain, verified), DECISION (branch on a decision variant, requires the variant field), and collectors AND / OR / XOR; the start trigger is implicit. ' +
+        'A generic referenced-step path (any process type string plus an object name, bIsReference=true) is available and verified for DTP_LOAD and CHAIN; for other types it may work but is untested. ' +
+        'Other inline-configuration process types (for example program execution, OS command, attribute change run) are not supported in this version. ' +
+        'Edges support on-success (positive) and unconditional (neutral) links; on-error (negative) links are accepted in the schema but not emitted by default. ' +
+        'DECISION branch edges: set sub_status to the branch EVENTNO ("01"=THEN/JA, "02"=ELSE/NEIN) — such edges are always positive. Create the referenced decision variant first with bw_create_decision_variant. ' +
+        'To start the chain on an event instead of immediately, pass trigger_event (start type "E").',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: {
+            type: 'string',
+            description: 'Process chain technical name, uppercase, max 30 characters (e.g. "CHAIN_NAME").',
+          },
+          infoarea: {
+            type: 'string',
+            description: 'InfoArea to file the chain under (e.g. "AREA_NAME").',
+          },
+          description: {
+            type: 'string',
+            description: 'Short description / label for the process chain.',
+          },
+          steps: {
+            type: 'array',
+            description:
+              'Ordered list of steps. The TRIGGER (Start) node is implicit at index 0 — do not include it here. ' +
+              'Each step has a caller-chosen id used for edge wiring. ' +
+              'Step types: DTP_LOAD (requires dtp field), ADSOACT (requires datastores array), ADSOREM (requires remDatastores array), ' +
+              'CHAIN (requires object = sub-chain name), DECISION (requires variant = decision variant name), AND / OR / XOR (collector, no extra fields), or any other BW process type (requires object field).',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', description: 'Caller-chosen identifier used to reference this step in edges (e.g. "step1").' },
+                type: {
+                  type: 'string',
+                  description: 'Process type: "DTP_LOAD", "ADSOACT", "ADSOREM", "CHAIN", "DECISION", "AND", "OR", "XOR", or any BW process type string.',
+                },
+                dtp: { type: 'string', description: 'DTP technical name. Required when type is "DTP_LOAD" (e.g. "DTP_...").' },
+                variant: { type: 'string', description: 'Decision variant technical name to reference. Required when type is "DECISION". Create it first with bw_create_decision_variant.' },
+                description: { type: 'string', description: 'Step display description (used for DTP_LOAD, CHAIN, DECISION, and generic referenced steps).' },
+                datastores: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: 'List of aDSO technical names to activate. Required when type is "ADSOACT".',
+                },
+                requestsSequential: {
+                  type: 'boolean',
+                  description: 'ADSOACT only. Activate requests sequentially (NOCONDENSE). Default false.',
+                },
+                errorOnNonActivation: {
+                  type: 'boolean',
+                  description: 'ADSOACT only. Error on non-activation of loaded requests (NOREQACTWARN). Default false.',
+                },
+                remDatastores: {
+                  type: 'array',
+                  description: 'Required when type is "ADSOREM" (DSO request cleanup). One entry per aDSO whose requests to clean up, each with its own cleanup action and request selection.',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      datastore: { type: 'string', description: 'aDSO technical name (e.g. "ADSO_NAME").' },
+                      action: { type: 'string', description: 'Cleanup action code from the cockpit "Bereinigungsaktion" dropdown (single character). Observed: "A" = activate requests, "C" = remove old requests from the change log. The valid action depends on the aDSO type; an unsuitable action is rejected at activation.' },
+                      allRequests: { type: 'boolean', description: 'Clean up all requests (ALL_REQUESTS). When true, the count/age selectors are ignored. Default false.' },
+                      numberRequests: { type: 'number', description: 'Keep the last N requests (NUMBER_REQUESTS); older ones are removed. Default 0.' },
+                      numberDays: { type: 'number', description: 'Remove requests older than N days (NUMBER_DAYS). Default 0.' },
+                      packageSize: { type: 'number', description: 'Processing package size (PACKAGE_SIZE); 0 = server default.' },
+                    },
+                  },
+                },
+                object: {
+                  type: 'string',
+                  description: 'Technical name of the referenced BW object. Required for CHAIN (sub-chain name) and other generic referenced step types (any type other than DTP_LOAD, ADSOACT, ADSOREM, AND, OR, XOR).',
+                },
+              },
+              required: ['id', 'type'],
+            },
+          },
+          edges: {
+            type: 'array',
+            description:
+              'Directed edges connecting steps. Use the step id or the literal "TRIGGER" for the start node. ' +
+              'Status defaults: "neutral" when the source is "TRIGGER" or a collector (AND/OR/XOR); "positive" otherwise. ' +
+              'For a branch edge out of a DECISION node, set sub_status to the branch EVENTNO ("01"/"02"); such edges are forced to "positive".',
+            items: {
+              type: 'object',
+              properties: {
+                from: { type: 'string', description: 'Source step id or "TRIGGER".' },
+                to: { type: 'string', description: 'Target step id or "TRIGGER".' },
+                status: {
+                  type: 'string',
+                  enum: ['neutral', 'positive', 'negative'],
+                  description: 'Edge condition. Omit to use the default (see above).',
+                },
+                sub_status: {
+                  type: 'string',
+                  description: 'Branch condition (DECISION out-edges only): the branch EVENTNO, e.g. "01" (THEN/JA) or "02" (ELSE/NEIN). Defaults to "00" (normal edge).',
+                },
+              },
+              required: ['from', 'to'],
+            },
+          },
+          trigger_event: {
+            type: 'object',
+            description:
+              'Optional event start-condition for the trigger (start type "E"). Omit for the default immediate start (start type "I").',
+            properties: {
+              event_id: { type: 'string', description: 'Event id, e.g. "SAP_TEST".' },
+              event_parameter: { type: 'string', description: 'Event parameter. Defaults to the chain name when omitted.' },
+              event_type: { type: 'string', description: 'Event type. Defaults to "OtherEvent".' },
+              only_once: { type: 'boolean', description: 'Start only once. Default false.' },
+            },
+            required: ['event_id'],
+          },
+          activate: {
+            type: 'boolean',
+            description: 'If true, activate the chain immediately after creation. Default false.',
+          },
+        },
+        required: ['name', 'infoarea', 'description', 'steps', 'edges'],
+      },
+    },
+    {
+      name: 'bw_update_process_chain',
+      description:
+        'Replace the step model (nodes and edges) of an existing Process Chain (RSPC) via the BW/4HANA Cockpit REST API. ' +
+        'Reads the current chain to obtain the ETag and preserve the existing trigger node (with its scheduling configuration) ' +
+        'and the current header. Replaces only the steps and edges; the trigger is always preserved as-is. ' +
+        'Optionally overrides description and infoarea in the header. ' +
+        'Optionally activates after the update. ' +
+        'A 412 on the PUT means the ETag was stale (chain modified between read and write); the error reports this explicitly. ' +
+        'Use bw_create_process_chain to create a new chain; use this tool to update an existing one. ' +
+        'Supported step types: DTP_LOAD (DTP load), ADSOACT (DSO data activation), ADSOREM (DSO request cleanup), CHAIN (start a local sub-chain, verified), DECISION (branch on a decision variant, requires the variant field), and collectors AND / OR / XOR; the start trigger is implicit. ' +
+        'A generic referenced-step path (any process type string plus an object name, bIsReference=true) is available and verified for DTP_LOAD and CHAIN; for other types it may work but is untested. ' +
+        'Other inline-configuration process types (for example program execution, OS command, attribute change run) are not supported in this version. ' +
+        'Edges support on-success (positive) and unconditional (neutral) links; on-error (negative) links are accepted in the schema but not emitted by default. ' +
+        'DECISION branch edges: set sub_status to the branch EVENTNO ("01"/"02"); such edges are always positive. ' +
+        'The trigger is preserved as-is unless trigger_event is passed (which sets an event start-condition); an existing event start-condition is preserved across updates.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: {
+            type: 'string',
+            description: 'Process chain technical name (e.g. "CHAIN_NAME"). Case-insensitive.',
+          },
+          description: {
+            type: 'string',
+            description: 'Optional new description. If omitted, the existing chain description is kept.',
+          },
+          infoarea: {
+            type: 'string',
+            description: 'Optional new InfoArea. If omitted, the existing InfoArea is kept.',
+          },
+          steps: {
+            type: 'array',
+            description:
+              'Complete replacement step list. The TRIGGER (Start) node is implicit at index 0 — do not include it here. ' +
+              'Same shape as in bw_create_process_chain.',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', description: 'Caller-chosen identifier used to reference this step in edges.' },
+                type: {
+                  type: 'string',
+                  description: 'Process type: "DTP_LOAD", "ADSOACT", "ADSOREM", "CHAIN", "DECISION", "AND", "OR", "XOR", or any BW process type string.',
+                },
+                dtp: { type: 'string', description: 'DTP technical name. Required when type is "DTP_LOAD".' },
+                variant: { type: 'string', description: 'Decision variant technical name to reference. Required when type is "DECISION".' },
+                description: { type: 'string', description: 'Step display description (DTP_LOAD, CHAIN, DECISION, and generic referenced steps).' },
+                datastores: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: 'aDSO technical names to activate. Required when type is "ADSOACT".',
+                },
+                requestsSequential: {
+                  type: 'boolean',
+                  description: 'ADSOACT only. Activate requests sequentially (NOCONDENSE). Default false.',
+                },
+                errorOnNonActivation: {
+                  type: 'boolean',
+                  description: 'ADSOACT only. Error on non-activation of loaded requests (NOREQACTWARN). Default false.',
+                },
+                remDatastores: {
+                  type: 'array',
+                  description: 'Required when type is "ADSOREM" (DSO request cleanup). One entry per aDSO whose requests to clean up, each with its own cleanup action and request selection.',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      datastore: { type: 'string', description: 'aDSO technical name (e.g. "ADSO_NAME").' },
+                      action: { type: 'string', description: 'Cleanup action code from the cockpit "Bereinigungsaktion" dropdown (single character). Observed: "A" = activate requests, "C" = remove old requests from the change log. The valid action depends on the aDSO type; an unsuitable action is rejected at activation.' },
+                      allRequests: { type: 'boolean', description: 'Clean up all requests (ALL_REQUESTS). When true, the count/age selectors are ignored. Default false.' },
+                      numberRequests: { type: 'number', description: 'Keep the last N requests (NUMBER_REQUESTS); older ones are removed. Default 0.' },
+                      numberDays: { type: 'number', description: 'Remove requests older than N days (NUMBER_DAYS). Default 0.' },
+                      packageSize: { type: 'number', description: 'Processing package size (PACKAGE_SIZE); 0 = server default.' },
+                    },
+                  },
+                },
+                object: {
+                  type: 'string',
+                  description: 'Technical name of the referenced BW object. Required for generic referenced step types.',
+                },
+              },
+              required: ['id', 'type'],
+            },
+          },
+          edges: {
+            type: 'array',
+            description:
+              'Complete replacement edge list. Use the step id or the literal "TRIGGER" for the start node. ' +
+              'Status defaults: "neutral" when the source is "TRIGGER" or a collector (AND/OR/XOR); "positive" otherwise. ' +
+              'For a branch edge out of a DECISION node, set sub_status to the branch EVENTNO ("01"/"02"); such edges are forced to "positive".',
+            items: {
+              type: 'object',
+              properties: {
+                from: { type: 'string', description: 'Source step id or "TRIGGER".' },
+                to: { type: 'string', description: 'Target step id or "TRIGGER".' },
+                status: {
+                  type: 'string',
+                  enum: ['neutral', 'positive', 'negative'],
+                  description: 'Edge condition. Omit to use the default.',
+                },
+                sub_status: {
+                  type: 'string',
+                  description: 'Branch condition (DECISION out-edges only): the branch EVENTNO, e.g. "01" (THEN/JA) or "02" (ELSE/NEIN). Defaults to "00" (normal edge).',
+                },
+              },
+              required: ['from', 'to'],
+            },
+          },
+          trigger_event: {
+            type: 'object',
+            description:
+              'Optional event start-condition for the trigger (start type "E"). When omitted, an existing event start-condition is preserved and a non-event trigger stays immediate.',
+            properties: {
+              event_id: { type: 'string', description: 'Event id, e.g. "SAP_TEST".' },
+              event_parameter: { type: 'string', description: 'Event parameter. Defaults to the chain name when omitted.' },
+              event_type: { type: 'string', description: 'Event type. Defaults to "OtherEvent".' },
+              only_once: { type: 'boolean', description: 'Start only once. Default false.' },
+            },
+            required: ['event_id'],
+          },
+          activate: {
+            type: 'boolean',
+            description: 'If true, activate the chain immediately after the update. Default false.',
+          },
+          transport_request: {
+            type: 'string',
+            description:
+              'Optional transport request to record the change into. Only relevant when the chain is in a transportable package (not $TMP). ' +
+              'If the chain is transportable and exactly one request is available, it is chosen automatically; pass this to disambiguate when several are available. ' +
+              'Ignored for $TMP (local) chains.',
+          },
+        },
+        required: ['name', 'steps', 'edges'],
+      },
+    },
+    {
+      name: 'bw_activate_process_chain',
+      description:
+        'Activate an existing Process Chain (RSPC) via the BW/4HANA Cockpit REST API. ' +
+        'Use this after bw_create_process_chain (with activate=false) or to re-activate a modified chain. ' +
+        'Returns the top-level activation message, severity, and full log entries. ' +
+        'Surfaces any log entries with severity "error" in a dedicated errors field.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: {
+            type: 'string',
+            description: 'Process chain technical name (e.g. "CHAIN_NAME"). Case-insensitive.',
+          },
+        },
+        required: ['name'],
+      },
+    },
+    {
+      name: 'bw_create_decision_variant',
+      description:
+        'Create a DECISION process variant (a standalone TLOGO object) for use as a branch/decision step in a Process Chain, via the BW/4HANA Cockpit REST API. ' +
+        'The variant holds two branches indexed by position: THEN/first (EVENTNO "01" by default, label "JA") and ELSE/second (EVENTNO "02", label "NEIN"). ' +
+        'The formula is the branch condition (e.g. "GET_SEGMENT( ) = \' 3\'"); it is evaluated for the THEN branch, the ELSE branch is its complement. ' +
+        'The variant is created AND activated (activation is mandatory — an inactive variant is not selectable in the chain variant picker). ' +
+        'After creation, reference the variant from a DECISION step in bw_create_process_chain / bw_update_process_chain (variant=<this name>), and branch its out-edges with sub_status "01"/"02". ' +
+        'Package/transport: $TMP is fine for visibility and picker selection; pass a transportable package (NOT $TMP) only if you need to transport the variant. ' +
+        'For a transportable package a transport_request is used (auto-selected when exactly one changeable request is available; pass it to disambiguate).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: {
+            type: 'string',
+            description: 'Decision variant technical name, uppercase (e.g. "VARIANT_NAME"). This is the name a chain DECISION step references.',
+          },
+          description: {
+            type: 'string',
+            description: 'Variant description / label.',
+          },
+          formula: {
+            type: 'string',
+            description: 'Branch condition formula (BW decision formula syntax), e.g. "GET_SEGMENT( ) = \' 3\'".',
+          },
+          package: {
+            type: 'string',
+            description: 'Target package. Defaults to $TMP, which is fine for visibility/picker selection. Pass a transportable package only if the variant must be transportable.',
+          },
+          transport_request: {
+            type: 'string',
+            description: 'Transport request to record the new variant into. Used only for a transportable package (auto-selected when exactly one changeable request is available; pass to disambiguate).',
+          },
+          then_label: {
+            type: 'string',
+            description: 'Label of the THEN/first branch. Default "JA".',
+          },
+          else_label: {
+            type: 'string',
+            description: 'Label of the ELSE/second branch. Default "NEIN".',
+          },
+          then_event_no: {
+            type: 'string',
+            description: 'EVENTNO of the THEN branch (referenced by chain branch edges via sub_status). Default "01".',
+          },
+          else_event_no: {
+            type: 'string',
+            description: 'EVENTNO of the ELSE branch. Default "02".',
+          },
+        },
+        required: ['name', 'description', 'formula'],
+      },
+    },
+    {
+      name: 'bw_add_process_chain_error_links',
+      description:
+        'Add on-error (negative) links to an existing Process Chain (RSPC) by mirroring the existing ' +
+        'on-success (positive) out-edges of its DTP load steps, via the BW/4HANA Cockpit REST API. ' +
+        'In-place edit: reads the current model, appends the negative edges (skipping any that already exist), and PUTs it back. ' +
+        'Optionally activates afterwards. ' +
+        'Use dtps to restrict to specific steps; omit it to apply to every DTP load step. ' +
+        'A 412 on the PUT means the ETag was stale (chain modified between read and write); the error reports this explicitly.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: {
+            type: 'string',
+            description: 'Process chain technical name (e.g. "CHAIN_NAME"). Case-insensitive.',
+          },
+          dtps: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'Optional. Restrict to these steps. Each entry is matched against a step\'s DTP name (exact) ' +
+              'or as a substring of its step description (which contains the target object name). ' +
+              'Omit to apply to all DTP load steps.',
+          },
+          activate: {
+            type: 'boolean',
+            description: 'If true, activate the chain immediately after the edit. Default false.',
+          },
+          transport_request: {
+            type: 'string',
+            description:
+              'Optional transport request to record the change into. Only relevant when the chain is in a transportable package (not $TMP). ' +
+              'If the chain is transportable and exactly one request is available, it is chosen automatically; pass this to disambiguate when several are available. ' +
+              'Ignored for $TMP (local) chains.',
+          },
+        },
+        required: ['name'],
+      },
+    },
+    {
+      name: 'bw_swap_process_chain_dtp',
+      description:
+        'Swap one DTP load variant for another in an existing Process Chain (RSPC), via the BW/4HANA Cockpit REST API. ' +
+        'In-place edit: reads the current model, replaces the matching DTP_LOAD node\'s variant, and PUTs it back — ' +
+        'edges and all other nodes are preserved unchanged. Prefer this over bw_update_process_chain for a single-variant swap, ' +
+        'since it does not require re-specifying the whole chain. ' +
+        'Optionally activates afterwards. ' +
+        'A 412 on the PUT means the ETag was stale (chain modified between read and write); the error reports this explicitly.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: {
+            type: 'string',
+            description: 'Process chain technical name (e.g. "CHAIN_NAME"). Case-insensitive.',
+          },
+          old_dtp: {
+            type: 'string',
+            description: 'DTP variant name currently in the chain (e.g. "DTP_NAME_OLD").',
+          },
+          new_dtp: {
+            type: 'string',
+            description: 'DTP variant name to set instead (e.g. "DTP_NAME_NEW").',
+          },
+          refresh_description: {
+            type: 'boolean',
+            description: 'If true (default), pull the new variant\'s step description from its metadata. Cosmetic; the existing description is kept if metadata is unavailable.',
+          },
+          activate: {
+            type: 'boolean',
+            description: 'If true, activate the chain immediately after the edit. Default false.',
+          },
+          transport_request: {
+            type: 'string',
+            description:
+              'Optional transport request to record the change into. Only relevant when the chain is in a transportable package (not $TMP). ' +
+              'If the chain is transportable and exactly one request is available, it is chosen automatically; pass this to disambiguate when several are available. ' +
+              'Ignored for $TMP (local) chains.',
+          },
+        },
+        required: ['name', 'old_dtp', 'new_dtp'],
+      },
+    },
+    {
+      name: 'bw_append_process_chain_dtp',
+      description:
+        'Append one DTP load step (optionally followed by its own DSO activation step) to an existing Process Chain (RSPC), ' +
+        'via the BW/4HANA Cockpit REST API. In-place edit: reads the current model, appends the node(s)/edge(s)/inline variant, ' +
+        'and PUTs it back — the caller does not supply the full model. ' +
+        'By default it appends behind the strand end closest to the trigger (to keep strands balanced); pass predecessor to choose a node. ' +
+        'edge_mode "both" (default) adds an on-success and an on-error edge per link ("always continue"); "success_only" adds only the on-success edge. ' +
+        'Idempotent: if the DTP is already a node in the chain, it is skipped without writing. ' +
+        'Optionally activates afterwards and then verifies that no collector was inserted and no extra strand appeared. ' +
+        'A 412 on the PUT means the ETag was stale (chain modified between read and write); the error reports this explicitly.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: {
+            type: 'string',
+            description: 'Process chain technical name (e.g. "CHAIN_NAME"). Case-insensitive.',
+          },
+          dtp: {
+            type: 'string',
+            description: 'DTP variant name to append (e.g. "DTP_NAME").',
+          },
+          adsoact: {
+            type: 'string',
+            description: 'Optional aDSO name (e.g. "ADSO_NAME"). When given, an ADSOACT step activating this aDSO is added right after the DTP (per-DTP activation).',
+          },
+          predecessor: {
+            type: 'string',
+            description:
+              'Node to append behind: a DTP variant name, an aDSO whose ADSOACT node holds it, or the literal "strand_end_auto" (default). ' +
+              'For "strand_end_auto" the terminal node closest to the trigger is chosen (ties → first).',
+          },
+          edge_mode: {
+            type: 'string',
+            enum: ['both', 'success_only'],
+            description: '"both" (default): add an on-success and an on-error edge per link. "success_only": add only the on-success edge.',
+          },
+          activate: {
+            type: 'boolean',
+            description: 'If true, activate the chain immediately after the edit. Default false.',
+          },
+          transport_request: {
+            type: 'string',
+            description:
+              'Optional transport request to record the change into. Only relevant when the chain is in a transportable package (not $TMP). ' +
+              'If the chain is transportable and exactly one request is available, it is chosen automatically; pass this to disambiguate when several are available. ' +
+              'Ignored for $TMP (local) chains.',
+          },
+        },
+        required: ['name', 'dtp'],
+      },
+    },
+    {
+      name: 'bw_add_process_chain_program',
+      description:
+        'Add an "Execute ABAP Program" step (RSPC process type ABAP, "Programm ausführen") to an existing Process Chain (RSPC), via the BW/4HANA Cockpit REST API. ' +
+        'Runs an ABAP report, optionally with a named SE38 selection variant. ' +
+        'In-place edit: reads the current model, inserts the node + its INLINE process variant (the program call is stored inline in the chain — there is no separate variant object), and PUTs it back. ' +
+        'Positioning: pass "before" to run the program ahead of an existing step (the target\'s incoming edges are rerouted through the new step, e.g. Start → PROGRAM → DTP); pass "after" to run it between a step and its successors; pass neither (optionally with predecessor) to append behind the strand end closest to the trigger. ' +
+        'edge_mode "both" (default) adds an on-success and an on-error edge per new link; "success_only" adds only the on-success edge. ' +
+        'Idempotent: if an ABAP step already calls the same program (and variant), it is skipped without writing. ' +
+        'Only the synchronous/local/program call configuration is verified; keep the defaults. ' +
+        'A 412 on the PUT means the ETag was stale (chain modified between read and write); the error reports this explicitly.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: {
+            type: 'string',
+            description: 'Process chain technical name (e.g. "CHAIN_NAME"). Case-insensitive.',
+          },
+          program: {
+            type: 'string',
+            description: 'ABAP program / report to execute (e.g. "REPORT_NAME").',
+          },
+          variant: {
+            type: 'string',
+            description: 'Optional ABAP report (SE38) selection variant name (e.g. "VARIANT_NAME"). Omit to run the report without a variant.',
+          },
+          description: {
+            type: 'string',
+            description: 'Optional step description (cosmetic).',
+          },
+          before: {
+            type: 'string',
+            description:
+              'Insert the program step BEFORE this node (its DTP/variant name, or an aDSO held by an ADSOACT node). ' +
+              'The target\'s incoming edges are rerouted through the new step. Mutually exclusive with "after".',
+          },
+          after: {
+            type: 'string',
+            description:
+              'Insert the program step AFTER this node — it runs between the target and its former successors. Mutually exclusive with "before".',
+          },
+          predecessor: {
+            type: 'string',
+            description:
+              'Used only when neither before nor after is given. Node to append behind (a DTP/variant name, an aDSO held by an ADSOACT node) or the literal "strand_end_auto" (default = terminal node closest to the trigger).',
+          },
+          edge_mode: {
+            type: 'string',
+            enum: ['both', 'success_only'],
+            description: '"both" (default): add an on-success and an on-error edge per new link. "success_only": add only the on-success edge.',
+          },
+          program_package: {
+            type: 'string',
+            description: 'Optional package of the report (cosmetic value-help enrichment; the server re-derives it when omitted).',
+          },
+          program_description: {
+            type: 'string',
+            description: 'Optional report description (cosmetic).',
+          },
+          variant_description: {
+            type: 'string',
+            description: 'Optional variant description (cosmetic).',
+          },
+          synchronous: {
+            type: 'boolean',
+            description: 'Call mode. true (default) runs the program synchronously (X_SYNCHRON). Only the default is verified.',
+          },
+          local: {
+            type: 'boolean',
+            description: 'Call location. true (default) runs the program on this system (X_LOCAL). Only the default is verified.',
+          },
+          activate: {
+            type: 'boolean',
+            description: 'If true, activate the chain immediately after the edit. Default false.',
+          },
+          transport_request: {
+            type: 'string',
+            description:
+              'Optional transport request to record the change into. Only relevant when the chain is in a transportable package (not $TMP). ' +
+              'If the chain is transportable and exactly one request is available, it is chosen automatically; pass this to disambiguate when several are available. ' +
+              'Ignored for $TMP (local) chains.',
+          },
+        },
+        required: ['name', 'program'],
+      },
+    },
+    {
+      name: 'bw_create_transport_task',
+      description:
+        'Add a task (sub-request) for a user to an existing workbench transport request. ' +
+        'Single ADT call, no lock or activation. The parent request must be modifiable. ' +
+        'Returns the created task number.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          transport_request: {
+            type: 'string',
+            description: 'Parent workbench transport request number (e.g. DEVK900123).',
+          },
+          user: {
+            type: 'string',
+            description: 'Target user the task is created for (task owner), e.g. "USERNAME".',
+          },
+        },
+        required: ['transport_request', 'user'],
+      },
+    },
+];
 
 // ── Tool handlers ─────────────────────────────────────────────────────────────
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+async function handleToolCall(
+  request: { params: { name: string; arguments?: Record<string, unknown> } },
+  extra: { authInfo?: AuthInfo },
+): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
   const { name, arguments: args } = request.params;
 
+  // Deny before doing any work. stdio has no authInfo and nothing to check.
+  if (!hasScope(extra.authInfo, requiredScope(name))) {
+    throw new McpError(ErrorCode.InvalidRequest, `Tool '${name}' requires the '${requiredScope(name)}' scope.`);
+  }
+
+  // HTTP: the per-request client, whose identity came from XSUAA and the destination.
+  // stdio: no request context, so read the environment exactly as before.
+  const client = currentClient() ?? createClientFromEnv();
+
   try {
+    await ensureMediaTypes(client);
     let text: string;
 
     switch (name) {
@@ -2002,6 +3654,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           if (p['aggregation_behavior'] !== undefined) fp.aggregationBehavior = p['aggregation_behavior'] as FieldProperties['aggregationBehavior'];
           if ('fixed_currency' in p) fp.fixedCurrency = p['fixed_currency'] as string | null;
           if ('fixed_unit' in p) fp.fixedUnit = p['fixed_unit'] as string | null;
+          if ('unit_currency_field' in p) fp.unitCurrencyField = p['unit_currency_field'] as string | null;
           if (p['description'] !== undefined) fp.description = p['description'] as string;
           fp.transport = args?.transport as string | undefined;
           text = await bwUpdateAdsoFieldProperties(
@@ -2061,6 +3714,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           package: args?.package as string | undefined,
           source_system: args?.source_system as string | undefined,
           copy_from_transformation: args?.copy_from_transformation as string | undefined,
+          source_object_subtype: args?.source_object_subtype as string | undefined,
+          target_object_subtype: args?.target_object_subtype as string | undefined,
         });
         break;
 
@@ -2069,6 +3724,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           objectType: args?.object_type as string,
           objectName: args?.object_name as string,
           targetInfoArea: args?.target_info_area as string,
+        });
+        break;
+
+      case 'bw_change_package':
+        text = await bwChangePackage(client, {
+          objectName: args?.object_name as string,
+          objectType: args?.object_type as string,
+          package: args?.package as string,
+          transport: args?.transport as string | undefined,
+          sourceSystem: args?.source_system as string | undefined,
+        });
+        break;
+
+      case 'bw_list_changeable_transports':
+        text = await bwListChangeableTransports(client, {
+          ownOnly: args?.own_only as boolean ?? true,
+          modifiableOnly: args?.modifiable_only as boolean ?? true,
+          includeObjects: args?.include_objects as boolean ?? false,
         });
         break;
 
@@ -2117,6 +3790,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           args?.lookup_object_type as string | undefined,
           args?.transport as string | undefined,
           args?.additional_source_fields as string[] | undefined,
+          args?.unit_source_field as string | undefined,
         );
         break;
 
@@ -2133,6 +3807,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           client,
           args?.transformation_name as string,
           args?.routine_type as 'start' | 'end' | 'expert',
+          args?.transport as string | undefined
+        );
+        break;
+
+      case 'bw_set_transformation_expert_routine':
+        text = await bwSetTransformationExpertRoutine(
+          client,
+          args?.transformation_name as string,
+          args?.source as string | undefined,
+          (args?.routine_type as 'start' | 'end' | 'expert' | undefined) ?? 'expert',
+          args?.transport as string | undefined,
+          args?.class_name as string | undefined,
+          args?.method_name as string | undefined,
+        );
+        break;
+
+      case 'bw_set_transformation_routine_fields':
+        text = await bwSetTransformationRoutineFields(
+          client,
+          args?.transformation_name as string,
+          args?.fields as string[] | undefined,
+          args?.exclude_fields as string[] | undefined,
           args?.transport as string | undefined
         );
         break;
@@ -2165,13 +3861,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
         break;
 
-      case 'bw_unlock':
-        await client.unlock(
-          args?.object_type as string,
-          args?.object_name as string
-        );
-        text = JSON.stringify({ success: true, message: `Lock on ${(args?.object_type as string).toUpperCase()} '${args?.object_name}' released.` });
+      case 'bw_unlock': {
+        const unlockType = (args?.object_type as string) ?? '';
+        const unlockName = args?.object_name as string;
+        // DTPs use the DTP-framework enqueue (RSBKDTP); client.unlock treats dtpa as
+        // no-op, so route it to the explicit action=unlock endpoint.
+        if (unlockType.toLowerCase() === 'dtpa') {
+          await bwUnlockDtp(client, unlockName);
+        } else {
+          await client.unlock(unlockType, unlockName);
+        }
+        text = JSON.stringify({ success: true, message: `Lock on ${unlockType.toUpperCase()} '${unlockName}' released.` });
         break;
+      }
 
       case 'bw_get_infosource':
         text = await bwGetInfosource(client, args?.name as string);
@@ -2211,7 +3913,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           args?.name as string,
           args?.description as string | undefined,
           fieldDefs,
-          args?.transport as string | undefined
+          args?.transport as string | undefined,
+          args?.remove_fields as string[] | undefined
         );
         break;
       }
@@ -2283,6 +3986,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           source_system: args?.source_system as string | undefined,
           target_name: args?.target_name as string,
           target_type: args?.target_type as string,
+          target_object_subtype: args?.target_object_subtype as string | undefined,
           description: args?.description as string | undefined,
           package: args?.package as string | undefined,
           filter_field: args?.filter_field as string | undefined,
@@ -2338,6 +4042,44 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
         break;
 
+      case 'bw_create_query':
+        text = await bwCreateQuery(client, {
+          query_name: args?.query_name as string,
+          infoprovider: args?.infoprovider as string | undefined,
+          description: args?.description as string | undefined,
+          copy_from: args?.copy_from as string | undefined,
+        });
+        break;
+
+      case 'bw_update_query_layout':
+        text = await bwUpdateQueryLayout(client, {
+          query_name: args?.query_name as string,
+          operations: args?.operations as LayoutOperation[],
+          transport: args?.transport as string | undefined,
+        });
+        break;
+
+      case 'bw_update_query_filter':
+        text = await bwUpdateQueryFilter(client, {
+          query_name: args?.query_name as string,
+          operations: args?.operations as FilterOperation[],
+          transport: args?.transport as string | undefined,
+        });
+        break;
+
+      case 'bw_update_query_key_figures':
+        text = await bwUpdateQueryKeyFigures(client, {
+          query_name: args?.query_name as string,
+          structure_target: args?.structure_target as 'rows' | 'columns' | undefined,
+          operations: args?.operations as KeyFigureOperation[],
+          transport: args?.transport as string | undefined,
+        });
+        break;
+
+      case 'bw_update_query_settings':
+        text = await bwUpdateQuerySettings(client, args as unknown as UpdateQuerySettingsArgs);
+        break;
+
       case 'bw_list_contents':
         text = await bwListContents(client, args?.path as string);
         break;
@@ -2368,12 +4110,50 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
         break;
 
+      case 'bw_change_datasource_delta':
+        text = await bwChangeDatasourceDelta(client, {
+          datasourceName: args?.datasource_name as string,
+          sourceSystem: args?.source_system as string,
+          deltaProcess: args?.delta_process as string,
+        });
+        break;
+
+      case 'bw_set_datasource_fields':
+        text = await bwSetDatasourceFields(client, {
+          datasourceName: args?.datasource_name as string,
+          sourceSystem: args?.source_system as string,
+          fields: args?.fields as Array<{ name: string; transfer: boolean }> | undefined,
+          languageField: args?.language_field as string | undefined,
+          transport: args?.transport as string | undefined,
+        });
+        break;
+
       case 'bw_preview_datasource':
         text = await bwPreviewDatasource(
           client,
           args?.datasource_name as string,
           args?.source_system as string,
           (args?.records as number | undefined) ?? 20,
+        );
+        break;
+
+      case 'bw_list_remote_entities':
+        text = await bwListRemoteEntities(
+          client,
+          args?.source_system as string,
+          (args?.search_pattern as string | undefined) ?? '*',
+          (args?.result_size as number | undefined) ?? 200,
+        );
+        break;
+
+      case 'bw_create_datasource':
+        text = await bwCreateDatasource(
+          client,
+          args?.datasource_name as string,
+          args?.source_system as string,
+          args?.application_component as string,
+          args?.hana_entity as string | undefined,
+          args?.description as string | undefined,
         );
         break;
 
@@ -2391,6 +4171,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'bw_get_structure':
         text = await bwGetStructure(client, args?.component_name as string);
+        break;
+
+      case 'bw_create_rkf':
+        text = await bwCreateRkf(client, args as unknown as CreateRkfArgs);
         break;
 
       case 'bw_query_data': {
@@ -2493,6 +4277,199 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
         break;
 
+      case 'bw_get_open_hub':
+        text = await bwGetOpenHub(client, args?.open_hub_name as string);
+        break;
+
+      case 'bw_get_aggregation_level':
+        text = await bwGetAggregationLevel(client, args?.aggregation_level_name as string);
+        break;
+
+      case 'bw_get_planning_function':
+        text = await bwGetPlanningFunction(client, args?.planning_function_name as string);
+        break;
+
+      case 'bw_get_planning_sequence':
+        text = await bwGetPlanningSequence(client, args?.planning_sequence_name as string);
+        break;
+
+      case 'bw_get_planning_properties':
+        text = await bwGetPlanningProperties(client, args?.plan_provider_name as string);
+        break;
+
+      case 'bw_list_process_chain_runs':
+        text = await bwListProcessChainRuns(
+          client,
+          args?.chain_name as string | undefined,
+          args?.date_from as string | undefined,
+          args?.date_to as string | undefined,
+          args?.status as string | undefined,
+          (args?.limit as number | undefined) ?? 20,
+        );
+        break;
+
+      case 'bw_get_process_chain_run_detail':
+        text = await bwGetProcessChainRunDetail(
+          client,
+          args?.chain_id as string,
+          args?.log_id as string,
+        );
+        break;
+
+      case 'bw_list_process_chain_last_status':
+        text = await bwListProcessChainLastStatus(
+          client,
+          args?.status as string | undefined,
+          args?.last_start_from as string | undefined,
+          args?.last_start_to as string | undefined,
+          args?.limit as number | undefined,
+        );
+        break;
+
+      case 'bw_create_process_chain': {
+        const rawSteps = (args?.steps as Array<Record<string, unknown>>) ?? [];
+        const steps = rawSteps.map((s) => {
+          const base: Record<string, unknown> = { id: s['id'], type: s['type'] };
+          if (s['dtp'] !== undefined) base['dtp'] = s['dtp'];
+          if (s['variant'] !== undefined) base['variant'] = s['variant'];
+          if (s['description'] !== undefined) base['description'] = s['description'];
+          if (s['datastores'] !== undefined) base['datastores'] = s['datastores'];
+          if (s['requestsSequential'] !== undefined) base['requestsSequential'] = s['requestsSequential'];
+          if (s['errorOnNonActivation'] !== undefined) base['errorOnNonActivation'] = s['errorOnNonActivation'];
+          if (s['remDatastores'] !== undefined) base['remDatastores'] = s['remDatastores'];
+          if (s['object'] !== undefined) base['object'] = s['object'];
+          return base;
+        });
+        const rawEdges = (args?.edges as Array<Record<string, unknown>>) ?? [];
+        const edges: EdgeDef[] = rawEdges.map((e) => ({
+          from: e['from'] as string,
+          to: e['to'] as string,
+          status: e['status'] as 'neutral' | 'positive' | 'negative' | undefined,
+          subStatus: e['sub_status'] as string | undefined,
+        }));
+        text = await bwCreateProcessChain(client, {
+          name: args?.name as string,
+          infoarea: args?.infoarea as string,
+          description: args?.description as string,
+          steps: steps as unknown as CreateProcessChainParams['steps'],
+          edges,
+          activate: (args?.activate as boolean) ?? false,
+          triggerEvent: mapTriggerEvent(args?.trigger_event),
+        });
+        break;
+      }
+
+      case 'bw_update_process_chain': {
+        const rawSteps2 = (args?.steps as Array<Record<string, unknown>>) ?? [];
+        const steps2 = rawSteps2.map((s) => {
+          const base: Record<string, unknown> = { id: s['id'], type: s['type'] };
+          if (s['dtp'] !== undefined) base['dtp'] = s['dtp'];
+          if (s['variant'] !== undefined) base['variant'] = s['variant'];
+          if (s['description'] !== undefined) base['description'] = s['description'];
+          if (s['datastores'] !== undefined) base['datastores'] = s['datastores'];
+          if (s['requestsSequential'] !== undefined) base['requestsSequential'] = s['requestsSequential'];
+          if (s['errorOnNonActivation'] !== undefined) base['errorOnNonActivation'] = s['errorOnNonActivation'];
+          if (s['remDatastores'] !== undefined) base['remDatastores'] = s['remDatastores'];
+          if (s['object'] !== undefined) base['object'] = s['object'];
+          return base;
+        });
+        const rawEdges2 = (args?.edges as Array<Record<string, unknown>>) ?? [];
+        const edges2: EdgeDef[] = rawEdges2.map((e) => ({
+          from: e['from'] as string,
+          to: e['to'] as string,
+          status: e['status'] as 'neutral' | 'positive' | 'negative' | undefined,
+          subStatus: e['sub_status'] as string | undefined,
+        }));
+        text = await bwUpdateProcessChain(client, {
+          name: args?.name as string,
+          description: args?.description as string | undefined,
+          infoarea: args?.infoarea as string | undefined,
+          steps: steps2 as unknown as UpdateProcessChainParams['steps'],
+          edges: edges2,
+          activate: (args?.activate as boolean) ?? false,
+          transportRequest: args?.transport_request as string | undefined,
+          triggerEvent: mapTriggerEvent(args?.trigger_event),
+        });
+        break;
+      }
+
+      case 'bw_create_decision_variant':
+        text = await bwCreateDecisionVariant(client, {
+          name: args?.name as string,
+          description: args?.description as string,
+          formula: args?.formula as string,
+          package: args?.package as string | undefined,
+          transportRequest: args?.transport_request as string | undefined,
+          thenLabel: args?.then_label as string | undefined,
+          elseLabel: args?.else_label as string | undefined,
+          thenEventNo: args?.then_event_no as string | undefined,
+          elseEventNo: args?.else_event_no as string | undefined,
+        });
+        break;
+
+      case 'bw_activate_process_chain':
+        text = await bwActivateProcessChain(client, args?.name as string);
+        break;
+
+      case 'bw_add_process_chain_error_links':
+        text = await bwAddProcessChainErrorLinks(client, {
+          name: args?.name as string,
+          dtps: args?.dtps as string[] | undefined,
+          activate: (args?.activate as boolean) ?? false,
+          transportRequest: args?.transport_request as string | undefined,
+        });
+        break;
+
+      case 'bw_swap_process_chain_dtp':
+        text = await bwSwapProcessChainDtp(client, {
+          name: args?.name as string,
+          oldDtp: args?.old_dtp as string,
+          newDtp: args?.new_dtp as string,
+          refreshDescription: (args?.refresh_description as boolean | undefined) ?? true,
+          activate: (args?.activate as boolean) ?? false,
+          transportRequest: args?.transport_request as string | undefined,
+        });
+        break;
+
+      case 'bw_append_process_chain_dtp':
+        text = await bwAppendProcessChainDtp(client, {
+          name: args?.name as string,
+          dtp: args?.dtp as string,
+          adsoact: args?.adsoact as string | undefined,
+          predecessor: args?.predecessor as string | undefined,
+          edgeMode: args?.edge_mode as 'both' | 'success_only' | undefined,
+          activate: (args?.activate as boolean) ?? false,
+          transportRequest: args?.transport_request as string | undefined,
+        });
+        break;
+
+      case 'bw_add_process_chain_program':
+        text = await bwAddProcessChainProgram(client, {
+          name: args?.name as string,
+          program: args?.program as string,
+          variant: args?.variant as string | undefined,
+          description: args?.description as string | undefined,
+          before: args?.before as string | undefined,
+          after: args?.after as string | undefined,
+          predecessor: args?.predecessor as string | undefined,
+          edgeMode: args?.edge_mode as 'both' | 'success_only' | undefined,
+          programPackage: args?.program_package as string | undefined,
+          programDescription: args?.program_description as string | undefined,
+          variantDescription: args?.variant_description as string | undefined,
+          synchronous: args?.synchronous as boolean | undefined,
+          local: args?.local as boolean | undefined,
+          activate: (args?.activate as boolean) ?? false,
+          transportRequest: args?.transport_request as string | undefined,
+        });
+        break;
+
+      case 'bw_create_transport_task':
+        text = await bwCreateTransportTask(client, {
+          transportRequest: args?.transport_request as string,
+          user: args?.user as string,
+        });
+        break;
+
       default:
         throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
     }
@@ -2506,23 +4483,84 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       isError: true,
     };
   }
-});
+}
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+// ── Server ────────────────────────────────────────────────────────────────────
 
-async function main(): Promise<void> {
-  try {
-    await client.loadMediaTypes();
-  } catch (err) {
-    process.stderr.write(`[bw-modeling-mcp] Warning: discovery failed, using hardcoded media type fallbacks (${err})\n`);
+/**
+ * Build an MCP server with every tool registered.
+ *
+ * A factory rather than a module-level instance: the SDK binds a Server to exactly one
+ * transport for its lifetime, so the stateless HTTP transport needs a fresh one per
+ * request. stdio calls this once.
+ */
+export function createServer(): Server {
+  const server = new Server(
+    { name: 'bw-modeling-mcp', version: '0.1.0' },
+    { capabilities: { tools: {} } }
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, async (_request, extra) => ({
+    // Hide what the caller may not invoke, so a model never proposes a denied call.
+    tools: filterToolsByScope(TOOL_DEFINITIONS, extra.authInfo),
+  }));
+
+  server.setRequestHandler(CallToolRequestSchema, handleToolCall);
+
+  return server;
+}
+
+/**
+ * Populate MEDIA_TYPES on first use rather than at startup.
+ *
+ * The HTTP transport has no credentials at boot — they arrive with the request — so
+ * discovery cannot run there. The type->MIME map is system metadata, identical for every
+ * caller, so one process-wide cache is correct.
+ *
+ * Cleared on failure: otherwise one transient error during the very first request would
+ * leave the fallbacks in place for the life of the process, and later reads would fail
+ * with a misleading "object type not supported on this system".
+ */
+let discovery: Promise<void> | null = null;
+export function ensureMediaTypes(client: BwClient): Promise<void> {
+  if (!discovery) {
+    discovery = client.loadMediaTypes().catch((err) => {
+      discovery = null;
+      process.stderr.write(`[bw-modeling-mcp] Warning: discovery failed, using hardcoded media type fallbacks (${err})\n`);
+    });
   }
+  return discovery;
+}
+
+// ── Start (stdio) ─────────────────────────────────────────────────────────────
+
+export async function startStdio(): Promise<void> {
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await createServer().connect(transport);
   // Log to stderr only (stdout is used for MCP protocol messages)
   process.stderr.write('bw-modeling-mcp server started\n');
 }
 
-main().catch((err) => {
-  process.stderr.write(`Fatal error: ${err}\n`);
-  process.exit(1);
-});
+// ── Backward-compatible entrypoint ──────────────────────────────────────────────
+//
+// Historically the stdio server was launched via `node dist/index.js`, and many local
+// MCP client configs still point there. The BTP refactor turned this file into a shared
+// module imported by stdio.ts and http.ts, so it no longer self-started. Restore the old
+// behaviour: start the stdio server when this file is the process entry point. When it is
+// imported (stdio.ts / http.ts), import.meta.url differs from argv[1], so this is a no-op
+// and never double-starts.
+function isRunAsMain(): boolean {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]);
+  } catch {
+    return false;
+  }
+}
+
+if (isRunAsMain()) {
+  startStdio().catch((err) => {
+    process.stderr.write(`Fatal error: ${err}\n`);
+    process.exit(1);
+  });
+}

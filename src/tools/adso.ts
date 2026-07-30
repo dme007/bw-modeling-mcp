@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead } from '../bw-client.js';
 import { parseInfoObjectProps } from './infoobject.js';
 
 // ── aDSO type presets ────────────────────────────────────────────────────────
@@ -93,7 +93,7 @@ export async function bwUpdateAdsoSettings(
   const adsoPath = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
 
   // 1. Read current XML
-  const adsoResult = await client.get(adsoPath, ADSO_ACCEPT);
+  const adsoResult = await freshRead(adsoPath, ADSO_ACCEPT);
   const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
   let xml = adsoResult.body;
 
@@ -161,7 +161,7 @@ export async function bwGetAdso(
   format: 'text' | 'raw' = 'text',
 ): Promise<string> {
   const path = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
-  const result = await client.get(path, ADSO_ACCEPT);
+  const result = await freshRead(path, ADSO_ACCEPT);
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
   const ts = result.headers['timestamp'] ?? '';
   const rawOutput = `aDSO: ${adsoName.toUpperCase()}\nStatus: ${status}\nTimestamp: ${ts}\n\n${result.body}`;
@@ -446,7 +446,7 @@ export async function bwUpdateAdsoManageKeys(
   const adsoPath = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
 
   // 1. Read current XML
-  const adsoResult = await client.get(adsoPath, ADSO_ACCEPT);
+  const adsoResult = await freshRead(adsoPath, ADSO_ACCEPT);
   const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
   let xml = adsoResult.body;
 
@@ -492,6 +492,10 @@ export interface FieldProperties {
   aggregationBehavior?: 'SUM' | 'MIN' | 'MAX' | 'AVG' | 'LAST' | 'NONE';
   fixedCurrency?: string | null;      // null = remove element (dynamic currency)
   fixedUnit?: string | null;          // null = remove element (dynamic unit)
+  // Unit/currency FIELD reference for a QUAN/CURR field: sets <unitCurrencyElement>#///FIELD</unitCurrencyElement>
+  // so the key figure's unit/currency is taken from another field in the same aDSO (instead of a fixed value).
+  // null = remove the reference. Mutually exclusive with fixedUnit/fixedCurrency (those are removed when set).
+  unitCurrencyField?: string | null;
   description?: string;               // <localProperties><descriptions label="..."/>
   transport?: string;
 }
@@ -514,7 +518,7 @@ export async function bwUpdateAdsoFieldProperties(
 
   // 1. GET full XML
   const adsoPath = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
-  const adsoResult = await client.get(adsoPath, ADSO_ACCEPT);
+  const adsoResult = await freshRead(adsoPath, ADSO_ACCEPT);
   const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
   const fullXml = adsoResult.body;
 
@@ -592,6 +596,22 @@ export async function bwUpdateAdsoFieldProperties(
       elem = elem.replace(/<fixedUnit>[^<]*<\/fixedUnit>/, `<fixedUnit>${properties.fixedUnit}</fixedUnit>`);
     } else {
       elem = elem.replace(/(<inlineType[^>]*\/>)/, `$1\n  <fixedUnit>${properties.fixedUnit}</fixedUnit>`);
+    }
+  }
+
+  if (properties.unitCurrencyField !== undefined) {
+    // Always drop any existing reference and fixed value first — they are mutually exclusive.
+    elem = elem.replace(/[ \t]*<unitCurrencyElement>[^<]*<\/unitCurrencyElement>\n?/, '');
+    if (properties.unitCurrencyField === null) {
+      // Removal only — dynamic unit/currency without a field is invalid; the caller must
+      // then set a fixed value or another reference before activation.
+    } else {
+      const refField = properties.unitCurrencyField.trim().toUpperCase();
+      // Field reference excludes a fixed value — remove any fixedUnit/fixedCurrency.
+      elem = elem.replace(/[ \t]*<fixedUnit>[^<]*<\/fixedUnit>\n?/, '');
+      elem = elem.replace(/[ \t]*<fixedCurrency>[^<]*<\/fixedCurrency>\n?/, '');
+      // aDSO-level reference path is #///FIELD (segment-qualified only inside transformations).
+      elem = elem.replace(/(<inlineType[^>]*\/>)/, `$1\n  <unitCurrencyElement>#///${refField}</unitCurrencyElement>`);
     }
   }
 
@@ -681,6 +701,7 @@ const SEMANTICS_TAG: Record<string, string> = {
 const SEMANTIC_TYPE: Record<string, string> = {
   'DATS': 'date',
   'CUKY': 'currencyCode',
+  'UNIT': 'unitOfMeasure',
   'CURR': 'amount',
   'QUAN': 'quantity',
 };
@@ -700,10 +721,15 @@ function buildPureFieldElement(field: FieldDef): string {
     if (fixedDims[1] !== 0) inlineAttrs.push(`precision="${fixedDims[1]}"`);
     // scale omitted (always 0)
   } else if (apiType === 'CURR' || apiType === 'QUAN') {
-    // CURR/QUAN: length always 0; precision in XML = decimal places (scale preferred, fallback to precision)
+    // CURR/QUAN: XML precision = total digits, XML scale = decimal places (length always 0).
+    // Users pass `scale` = decimal places (required, > 0 — BW rejects a currency/quantity with
+    // scale 0). `precision` (with scale) = total digits, default 17 (BW standard amount/quantity
+    // length). For backward compatibility a lone `precision` is still read as the decimal count.
+    const decimalPlaces = field.scale ?? field.precision ?? 0;
+    const totalDigits = field.scale !== undefined ? (field.precision ?? 17) : 17;
     inlineAttrs.push('length="0"');
-    const decimalPlaces = field.scale ?? field.precision;
-    if (decimalPlaces !== undefined) inlineAttrs.push(`precision="${decimalPlaces}"`);
+    inlineAttrs.push(`precision="${totalDigits}"`);
+    inlineAttrs.push(`scale="${decimalPlaces}"`);
   } else if (apiType === 'DEC') {
     // DEC: XML length = total digits (precision param), XML precision = decimal places (scale param)
     const totalDigits = field.precision ?? field.length;
@@ -880,7 +906,7 @@ export async function bwUpdateAdsoAddPureField(
   const adsoUpper = adsoName.toUpperCase();
   const adsoPath = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
 
-  const adsoResult = await client.get(adsoPath, ADSO_ACCEPT);
+  const adsoResult = await freshRead(adsoPath, ADSO_ACCEPT);
   const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
   let xml = adsoResult.body;
 
@@ -974,7 +1000,7 @@ export async function bwUpdateAdso(
 
   // Read current aDSO once (full XML + timestamp)
   const adsoPath = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
-  const adsoResult = await client.get(adsoPath, ADSO_ACCEPT);
+  const adsoResult = await freshRead(adsoPath, ADSO_ACCEPT);
   const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
 
   let updatedXml = adsoResult.body;
@@ -998,14 +1024,17 @@ export async function bwUpdateAdso(
       });
     }
   } else {
-    // add_field — read each InfoObject and inject
+    // add_field — read each InfoObject and inject. One fresh reader session for the
+    // whole call: an InfoObject created/edited earlier through the shared client
+    // could otherwise be served from a stale session buffer.
+    const iobjReader = createClientFromEnv();
     for (const name of names) {
       if (updatedXml.includes(`infoObjectName="${name}"`)) {
         skipped.push(name);
         continue;
       }
-      const iObjResult = await client.get(
-        `/sap/bw/modeling/iobj/${name.toLowerCase()}/m`,
+      const iObjResult = await iobjReader.get(
+        `/sap/bw/modeling/iobj/${name.toLowerCase()}/m?forceCacheUpdate=true`,
         MEDIA_TYPES['iobj']
       );
       const iObjProps = parseInfoObjectProps(iObjResult.body);

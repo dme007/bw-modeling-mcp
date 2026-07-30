@@ -1,5 +1,147 @@
 # Changelog
 
+## [1.2.0] — 2026-07-29
+
+### Added
+
+- **BTP Cloud Foundry Deployment** — the MCP server now runs centrally on SAP BTP Cloud Foundry as an HTTP server (`npm run start:http`) instead of only locally via stdio. Enables shared hosting, concurrent users, and enterprise authentication
+- **XSUAA OAuth Authentication** — BTP integration with SAP XSUAA service for identity management and role-based access control. **Built on the same [@arc-mcp/xsuaa-auth](https://github.com/arc-mcp/xsuaa-auth) module as [ARC-1](https://github.com/arc-mcp/arc-1)** for consistency across NextLytics MCP ecosystem. Stateless Dynamic Client Registration (DCR) + callback proxy pattern ensures secure, session-independent auth. Supports both BasicAuthentication (Stage 1: shared technical user) and Principal Propagation (Stage 2: per-user identity)
+- **Role-Based Access Control (RBAC)** — two role collections ship with xs-security.json:
+  - `BW MCP Reader` — read-only access to the metadata and query tools (via `read` scope)
+  - `BW MCP Developer` — full access including create/update/delete/activate (via `write` scope). Write scope implicitly grants read, following the principle of least surprise
+- **Scope Enforcement** — new `src/scopes.ts` enforces which tools require which scopes; read-only tools are explicitly listed, all mutations default to `write`, ensuring new tools are safe by default (unavailable to read-only users until explicitly whitelisted)
+- **Cloud Connector Integration** — BTP destinations route on-premise BW traffic via Cloud Connector; supports HTTP proxy type for transparent connectivity without exposing internal networks
+
+### Improved
+
+- **Security by Default** — the scopes system defaults new write tools to `write` scope rather than accidentally permitting them to read-only users. Classification comes from actual HTTP verbs (POST/PUT/DELETE usage, not tool name)
+- **xs-security.json Structure** — three-layer authorization model (scopes → role-templates → role-collections) allows future granularity without code changes; documentation added for extending roles (query, monitor, metadata, data_push, admin scopes as examples)
+
+### Fixed
+
+- **stdio entrypoint compatibility** — `dist/index.js` again starts the stdio server when executed directly (`node dist/index.js`), via a run-as-main guard. The Cloud Foundry refactor had moved the bootstrap into `dist/stdio.js`, silently breaking existing local MCP client configurations that launch `dist/index.js`: the process started but exited within seconds without completing the MCP handshake. Both `dist/index.js` and the canonical `dist/stdio.js` bin now work; the guard does not fire when the module is imported, so the HTTP entrypoint never double-starts
+
+### Notes
+
+- **Shared technical user (Stage 1)** — `BasicAuthentication` via the BTP destination, tested and verified end-to-end
+- **Principal propagation (Stage 2)** — per-user identity via Cloud Connector certificate propagation plus ABAP-side CERTRULE and ICM reverse-proxy trust, tested and verified end-to-end; setup documented in docs/CENTRAL-HOSTING-SETUP.md (Stage 2) and docs/CLOUD-FOUNDRY.md §3
+- **stdio Mode Unchanged** — local stdio invocation (`npm run start`) continues to work without authentication, unchanged by this release. The HTTP server is additive; upgrading an existing local install is non-breaking
+- **npm Package** — bw-modeling-mcp is now published to npm as both stdio (default `bin` entrypoint) and HTTP (via `npm run start:http`)
+
+## [1.1.0] — 2026-07-23
+
+### Added
+
+- `bw_create_rkf` — create one reusable Restricted Key Figure (RKF, TLOGO ELEM) on an InfoProvider from a base key figure plus one or more characteristic restrictions (built for mass creation, one RKF per call); each restriction value is validated against the InfoProvider and mapped to its internal key, and the RKF is written consistent (no separate activation step). Media-type negotiation follows the working query path and the observed backend behaviour: the CREA lock on the shared `comp/enq` endpoint uses the query media type (that endpoint negotiates the same type for every ELEM component, Query and RKF alike), and the writes on the dedicated `/rkf/<name>/a` resource send `Accept` as a version range (the resource negotiates a lower version than the discovery-advertised collection — verified live: resource speaks `rkf-v1_9_0` while discovery advertises `rkf-v1_10_0`), so a single discovery-derived value is never pinned. Verified live on BW/4HANA
+- `bw_add_process_chain_program` — add an "Execute ABAP Program" step (RSPC process type ABAP) to an existing Process Chain, optionally with a named SE38 selection variant. In-place edit: the program call is stored as an inline process variant inside the chain model (no separate variant object). Positioning via `before` / `after` / `predecessor` (default: strand end closest to the trigger); idempotent (an existing ABAP step for the same program/variant is skipped), with ETag concurrency and transport handling
+
+### Improved
+
+- `bw_create_process_chain` / `bw_update_process_chain` — new `ADSOREM` step type ("Delete Requests from DataStore Object" / DSO request cleanup) with an inline variant; one entry per aDSO carrying its cleanup action and request selection (all requests / keep last N / older than N days / package size)
+
+### Fixed
+
+- `bw_set_dtp_filter_routine` — the routine's inactive version is now syntax-checked before activation. Broken routine code (e.g. `i_r_request->get_dtp( )`, which does not exist on the request interface) is reported with the ABAP error messages and the DTP is left unchanged, instead of being silently reported as "activated". The generated program's EU (ADT) enqueue lock is now released on the error path too (no orphaned SM12 lock), and a genuine activation failure is surfaced instead of returning success
+- Process chain transport check — a `validateobject` HTTP 404 caused by a stale stateful MCP session is now handled softly (the write proceeds without a transport header) instead of aborting. The previous hard abort wrongly blocked follow-up writes to local (`$TMP`) chains, which need no transport at all; a genuinely transportable object is still refused by the PUT with HTTP 403, at which point a transport request must be supplied
+
+## [1.0.0] — 2026-07-17
+
+The largest feature drop so far, and the release that takes the server to 1.0: a broad
+wave of write tools turns what was already a solid read/write toolkit into full
+BW/4HANA modeling coverage — query authoring, extended process chain authoring,
+transport-request integration, and a hardened session model. No breaking API changes.
+
+### Added
+
+- Query authoring — the query object graduates from read-only to fully writable:
+  - `bw_create_query` — create a new, consistent query (TLOGO ELEM) on an InfoProvider in package $TMP; with the new `copy_from` parameter the query is created as a full copy of an existing query (layout, filter, variables, key figures), deriving the InfoProvider from the source when none is given
+  - `bw_update_query_layout` — rows, columns, structures, and free characteristics
+  - `bw_update_query_filter` — query filter and restrictions
+  - `bw_update_query_key_figures` — basic key figures, RKF/CKF references, and local formula members (recursive operator/operand tree), with exception aggregation, display properties, and member removal
+  - `bw_update_query_settings` — query properties
+  - all four update tools accept an optional `transport` request number for queries on a transportable package
+  - query deletion via `bw_delete`
+- Process chain authoring, extended:
+  - `bw_append_process_chain_dtp` — append one DTP load step (optionally with its own DSO activation step) to an existing chain
+  - `bw_swap_process_chain_dtp` — swap one DTP load variant for another in an existing chain
+  - `bw_add_process_chain_error_links` — add on-error (negative) links by mirroring the existing success links
+  - `bw_create_decision_variant` — create a DECISION process variant for use as a branch/decision step
+- Transport lifecycle:
+  - `bw_create_transport_task` — add a task (sub-request) for a user to an existing workbench transport request
+  - `bw_list_changeable_transports` — list transport requests and their tasks via the BW transport state (`cto/check`)
+- DataSource authoring:
+  - `bw_change_datasource_delta` — change the delta process of a DataSource (full read-modify-write of `deltaProperties`)
+  - `bw_set_datasource_fields` — set the transfer flag of DataSource fields and/or the segment `language_field`
+- `bw_set_transformation_expert_routine` — write Start/End/Expert routine code into the transformation master so it survives activation and transport
+
+### Improved
+
+- `bw_create_dtp` — `target_object_subtype` (`ATTR` / `TEXT` / `HIER`) selects the InfoObject sub-object role for InfoObject targets, mapped to the correct DTP type code (`IOBJA` / `IOBJT` / `IOBJH`); previously only attribute targets were reachable
+- `bw_update_query_key_figures` — `add_formula` documents the full BW analytic-engine operator catalog (basic, percentage, data, mathematical, trigonometric, and boolean operators plus ternary `IF`) and validates each operator's operand count before saving, so a malformed formula fails with a clear message instead of leaving the query saved in an inconsistent state; operator codes are now case-insensitive. `LEAF` (which BW encodes as a dedicated nullary token, not a prefix operator) is rejected client-side rather than producing an HTTP 500
+
+### Fixed
+
+- `bw_set_transformation_runtime` — runtime switches no longer report false `runtime_not_persisted` errors and no longer get silently reverted. Root cause was the server-side ADT session model buffer: a session that had previously read (or locked) the transformation keeps serving its stale model even with `forceCacheUpdate=true`, so (a) the post-activation verify read the OLD active version through the shared long-lived client and reported a persisted switch as failed, and (b) a later read-modify-write through the same session could resurrect the stale `HANARuntime` value and re-persist it. The switch attempt (lock → GET `/m?forceCacheUpdate=true` → PUT → activate → unlock) and every active-version read (initial `already_set` decision and verify) now each run in a fresh session, which always returns the database state. Verified live with an abap→hana round-trip and independent virgin-session confirmation; the failure mode is value-independent (`sapHANAExecutionPossible` `COULD` and `MUST_NOT` alike, matching a manual-GUI trace of the `COULD` case)
+- Transformation write tools hardened against the same stale-session hazard: `bw_get_transformation`, `bw_update_transformation`, `bw_set_transformation_routine`, `bw_set_transformation_expert_routine`, `bw_set_transformation_routine_fields`, `bw_delete_transformation_routine`, and the post-create persistence check now read the transformation model through a fresh session with `forceCacheUpdate=true` (shared helper). Their previous pre-lock reads through the long-lived client could return a pinned stale model, and PUTting a model built on such a read silently resurrects old attribute values — the plausible mechanism behind observed runtime reversions. Lock ownership and the returned `lock_handle` contract are unchanged; verified live that the shared read path returns the database state through a deliberately dirtied session
+- The same fresh-session read hardening applied across the other object types (shared `freshRead` helper in the BW client): all five aDSO update tools and `bw_get_adso` (their model reads ran before the lock, the hazardous pattern), the `bw_get_infosource` / `bw_get_infoobject` / `bw_get_dtp` / DTP-details readers (diagnostic reads must reflect the database, not a pinned session buffer — this also removes the known stale inactive-shadow behavior of `bw_get_dtp`), the InfoObject lookups inside aDSO field addition, and `bw_update_infosource`'s post-lock read now passes `forceCacheUpdate=true`. Update tools that already lock before reading (InfoObject, InfoSource, DTP) were left on the locking session, since the lock refreshes the session's model buffer (verified live)
+- `bw_set_transformation_routine` — EXPERT routines on HANA-runtime transformations no longer generate a plain ABAP class instead of an AMDP class. The initial step is now sent bare (no `classNameM`, no `methodNameM`, no per-field target elementRefs, no `sourceSegment` on the group) so the server derives the class itself and generates a proper AMDP class (`interfaces IF_AMDP_MARKER_HDB`, method `BY DATABASE PROCEDURE FOR HDB LANGUAGE SQLSCRIPT`); the server-generated class source is left untouched (the END-oriented SELECT skeleton no longer applies, since the EXPERT IN type follows source columns and OUT follows target columns). Verified against a native Eclipse BWMT trace
+- `bw_set_transformation_routine` — creating a global routine on a transformation that has no existing rule group no longer throws. When no `<group id="1">` is present the new group is appended as the last child of `<trfn:transformation>` instead of requiring an existing group to insert before
+- `bw_get_request` / `bw_list_requests` — the message log (the primary diagnostic source) no longer dies on a 404 from the storage-dependent header/DTP-info/process endpoints when the storage code is wrong; each section is now isolated via `Promise.allSettled` and reported independently
+
+---
+
+## [0.9.2] — 2026-07-02
+
+### Added
+
+- `bw_change_package` — reassigns an existing BW object to a different package (Development Class) and records the change on a transport request via the CTO write endpoint (`/sap/bw/modeling/cto/write`); a single write with no activation, so the object is left inactive and must be re-activated with `bw_activate` using the same transport; for `object_type` `RSDS` the source system is mandatory (compound key) and the applied package is verified by re-reading the DataSource, guarding against the orphan-TADIR case where `writeResult="S"` is returned but the real object's package stays unchanged; verified for `TRFN` and `RSDS`
+
+### Improved
+
+- `bw_create_transformation` — new `source_object_subtype` / `target_object_subtype` parameters (`TEXT` / `ATTR` / `HIER`) to select the InfoObject facet when a source or target is an InfoObject (`IOBJ`): text table, attributes / master data, or hierarchy; passed through to both the transient GET (`sourceobjectsubtype` / `targetobjectsubtype`) and the transformation XML (`subType`)
+
+---
+
+## [0.9.1] — 2026-06-27
+
+### Fixed
+
+- `bw_search` / `bw_get_process_chain` — corrected the TLOGO codes in the tool and `object_type` descriptions: InfoSource is `TRCS` (not `ISFS`) and Process Chain is `RSPC` (not `PRCH`); the wrong codes were passed straight to the search endpoint and caused an HTTP 500. Verified against the `RSTLOGO` domain (`DD07T`) and live `bw_search` calls
+
+---
+
+## [0.9.0] — 2026-06-27
+
+### Added
+
+- `bw_get_aggregation_level` — reads an Aggregation Level (ALVL): the planning-enabled view on top of an InfoProvider, with the complete element list — characteristics including type, length, conversion routine, base InfoObject, compounding, and dimension group; key figures including aggregation behavior, semantics (AMO/QUA/NUM), and unit/currency reference (unit characteristic, fixed unit, or fixed currency)
+- `bw_get_planning_function` — reads a Planning Function (PLSE): function type, aggregation level, documentation, characteristic usage roles, conditions, and the full parameter tree with nested structure and values; for FORMULA functions the FOX code surfaces as the value of the FLINE parameter
+- `bw_get_planning_sequence` — reads a Planning Sequence (PLSQ): ordered step list with type code, aggregation level, planning function, and filter name per step
+- `bw_get_planning_properties` — reads the Planning Properties (PLCR) of a plan-enabled InfoProvider (real-time aDSO or CompositeProvider): key-date mode, maximum characteristic combinations, and save strategy (planning sequence and delta-read flag); data slices not yet included
+- `bw_create_process_chain` — creates a Process Chain (RSPC) via the BW/4HANA Cockpit REST API; builds the chain model from a step and edge list, creates a trigger-only skeleton, then updates it with the full model in one operation; optionally activates after creation; supported step types: `DTP_LOAD`, `ADSOACT`, `CHAIN` (local sub-chain start, verified), and collectors `AND` / `OR` / `XOR`; inline-configured process types (ABAP programs, OS commands, attribute change runs, etc.) are not yet supported
+- `bw_update_process_chain` — replaces the step model (nodes and edges) of an existing Process Chain; preserves the existing trigger node and scheduling configuration; optionally overrides description and InfoArea
+- `bw_activate_process_chain` — activates an existing Process Chain; returns the top-level activation message, severity, and full log
+- `bw_list_process_chain_runs` — lists execution runs of one or all process chains from the monitoring log; filterable by chain name, start date range, and status; ordered by start time descending; default limit 20
+- `bw_get_process_chain_run_detail` — reads step-level and message-level detail of a single chain run, including error messages; chain_id and log_id come from `bw_list_process_chain_runs` or `bw_list_process_chain_last_status`
+- `bw_list_process_chain_last_status` — last execution status and scheduling state for every chain in the system; one row per chain; includes log ID of the most recent run
+- `bw_get_open_hub` — reads an Open Hub Destination (DEST): destination type, source object, DB table, InfoArea, package, status, the complete output field list with type/length, InfoObject binding, conversion routine, compounding, and key flag; file properties for FILE-type destinations
+- `bw_list_remote_entities` — lists the remote entities (HANA views / virtual tables) a source system exposes as a DataSource basis; read-only discovery matching the Eclipse DataSource proposal page; the returned `technical_name` is exactly what binds into `bw_create_datasource`
+- `bw_create_datasource` — creates a DataSource (RSDS) on top of a remote entity from the server's field proposal, leaving it inactive; the server derives the full segment and field structure from the remote entity; local objects only (`$TMP` in v1); activation is a separate step via `bw_activate` (object_type `rsds`)
+- `bw_set_transformation_routine_fields` — edits the list of target fields a global END routine writes ("Felder setzen" in SAP GUI); accepts an explicit field list (`fields`) or an exclusion list (`exclude_fields`); requires an existing END routine; does not activate; returns lock_handle for `bw_activate`
+
+### Improved
+
+- `bw_activate` — now supports `hcpr` (CompositeProvider) as an activatable object type
+- `bw_create_dtp` — new `IOBJ` target type for InfoObject attributes; the BW XML `type` attribute is correctly set to `IOBJA` (InfoObject Attribute DTP target role)
+- `bw_update_transformation` — supports field-based direct mapping for targets without an underlying InfoObject; previously always attempted an InfoObject GET, which fails for plain aDSO/InfoSource field targets
+
+### Notes
+
+- `bw_get_planning_properties` reads `generalSettings` only; data slices (PLDS) are not yet included
+- Process chain authoring uses the BW/4HANA Cockpit REST API (`/sap/bc/http/sap/bw4/v1/modeling/processchains`) — the same API consumed internally by the BW/4HANA Cockpit
+
+---
+
 ## [0.8.0] — 2026-06-09
 
 ### Added
@@ -38,7 +180,7 @@
 
 ### Added
 
-- `bw_get_process_chain` — reads a Process Chain (RSPC) definition via the BW/4HANA-specific endpoint (`/sap/bw/modeling/rspc/{name}/m`, Accept: `application/vnd.sap.bw4.modeling.processchain-v1_0_0+json`); returns header metadata (description, InfoArea, status, version), scheduling attributes (job priority, owner, server, streaming mode), monitoring settings (auto-monitored, error notification, keep-alive, auto-reset), all steps (nodes) with process type, variant, description, last execution status, DECISION branch labels with socket resolution, OR join annotations, and sub-chain references; edges with full conditional flow semantics (positive/negative/neutral, DECISION branch names resolved from socket descriptions); inline variant section; by default (`include_variant_details=true`) automatically fetches and embeds variant configuration for each step via internal calls to `/sap/bw4/v1/modeling/processtypes/{type}/variants/{name}/m` — deterministic, not prompt-driven; types with no variant schema (DTP_LOAD, CHAIN, OR, AND, EXOR, DTP_ADSO) are skipped; set `include_variant_details=false` for structural overview without variant detail; `format="raw"` returns full parsed JSON; use `bw_search` with `object_type=PRCH` to find chain names
+- `bw_get_process_chain` — reads a Process Chain (RSPC) definition via the BW/4HANA-specific endpoint (`/sap/bw/modeling/rspc/{name}/m`, Accept: `application/vnd.sap.bw4.modeling.processchain-v1_0_0+json`); returns header metadata (description, InfoArea, status, version), scheduling attributes (job priority, owner, server, streaming mode), monitoring settings (auto-monitored, error notification, keep-alive, auto-reset), all steps (nodes) with process type, variant, description, last execution status, DECISION branch labels with socket resolution, OR join annotations, and sub-chain references; edges with full conditional flow semantics (positive/negative/neutral, DECISION branch names resolved from socket descriptions); inline variant section; by default (`include_variant_details=true`) automatically fetches and embeds variant configuration for each step via internal calls to `/sap/bw4/v1/modeling/processtypes/{type}/variants/{name}/m` — deterministic, not prompt-driven; types with no variant schema (DTP_LOAD, CHAIN, OR, AND, EXOR, DTP_ADSO) are skipped; set `include_variant_details=false` for structural overview without variant detail; `format="raw"` returns full parsed JSON; use `bw_search` with `object_type=RSPC` to find chain names
 - `bw_get_process_variant` — reads the detail configuration of a single Process Chain step variant from `/sap/bw4/v1/modeling/processtypes/{type}/variants/{name}/m`; generic across all 93 BW/4HANA process types; `oDetail` returned as indented JSON regardless of type — covers ABAP (program + selection variant), ADSOACT (aDSO + NOCONDENSE), ADSOREM (cleanup: days/requests), PLSWITCHL/PLSWITCHP (target aDSO), TRIGGER (full scheduling payload), DECISION (branch formula expressions), and any unknown type; `format="raw"` returns full parsed JSON; process_type and variant_name come from `bw_get_process_chain` output
 - `bw_preview_datasource` — fetches a live data preview from a DataSource (RSDS) via the internal `rsdsint/dataprev` endpoint (`POST /sap/bw/modeling/rsdsint/dataprev/{source_system}/{datasource}?records={n}&external=true`); field names resolved automatically from a prior GET on the DataSource structure; renders a padded plain-text table with proper column alignment; `records` parameter configurable (default 20); handles field/column count mismatch with fallback to `COL_N` headers and warning
 

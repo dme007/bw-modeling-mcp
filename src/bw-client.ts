@@ -2,6 +2,7 @@ import axios, { AxiosInstance, AxiosResponse } from 'axios';
 import https from 'https';
 import { randomUUID } from 'crypto';
 import * as fs from 'fs';
+import { currentClient } from './request-context.js';
 
 const ECLIPSE_USER_AGENT =
   'Eclipse/4.38.0.v20251201-0920 (win32; x86_64; Java 21.0.9) ADT/3.56.0 (devedition)';
@@ -16,6 +17,13 @@ export const MEDIA_TYPES: Record<string, string> = {
   area: 'application/vnd.sap.bw.modeling.area-v1_1_0+xml',
   trcs: 'application/vnd.sap.bw.modeling.trcs-v1_0_0+xml',
   rsds: 'application/vnd.sap.bw.modeling.rsds-v1_1_0+xml',
+  hcpr: 'application/vnd.sap.bw.modeling.hcpr-v1_15_0+xml',
+  dest: 'application/vnd.sap.bw.modeling.dest-v1_0_0+xml',
+  alvl: 'application/vnd.sap.bw.modeling.alvl-v1_0_0+xml',
+  plcr: 'application/vnd.sap.bw.modeling.plcr-v1_0_0+xml',
+  plsq: 'application/vnd.sap.bw.modeling.plsq-v1_0_0+xml',
+  plse: 'application/vnd.sap.bw.modeling.plse-v2_0_0+xml',
+  valuehelp: 'application/vnd.sap-bw-modeling.valuehelp2-v1_1_0+xml',
 };
 
 // DTPs do not need an unlock request after activation
@@ -34,6 +42,37 @@ export interface GetResult {
   headers: Record<string, string>;
 }
 
+/** Cloud Connector hop. The token expires, so it is resolved per request. */
+export interface BwProxyConfig {
+  host: string;
+  port: number;
+  /** Connectivity-service token, sent as `Proxy-Authorization: Bearer …`. */
+  token: string;
+  /** `SAP-Connectivity-SCC-Location_ID`, when several Cloud Connectors serve the subaccount. */
+  locationId?: string;
+}
+
+/**
+ * How a client authenticates to BW.
+ *
+ * `pp` is BTP principal propagation: the Destination service returns a value that the
+ * Cloud Connector converts into a short-lived X.509 certificate for the calling user.
+ * It is deliberately a separate variant rather than an extra optional field, so a
+ * per-user client cannot also carry a shared credential.
+ */
+export type BwAuth =
+  | { kind: 'basic'; user: string; password: string }
+  | { kind: 'cookies'; cookies: Record<string, string> }
+  | { kind: 'pp'; connectivityAuth: string };
+
+export interface BwClientOptions {
+  url: string;
+  auth: BwAuth;
+  client?: string;
+  language?: string;
+  proxy?: BwProxyConfig;
+}
+
 export class BwClient {
   private http: AxiosInstance;
   private csrfToken: string | null = null;
@@ -46,31 +85,38 @@ export class BwClient {
   // causes SAP to create a new stateless session, invalidating the lock handle.
   private readonly basicAuth: string | null;
   private readonly frozenCookies: Set<string> = new Set();
+  // Temporary session diagnostics — enable with BW_DEBUG_SESSION=1 (or "true").
+  // All debug output goes to stderr so it never corrupts the MCP stdio protocol.
+  private readonly sessionDebug: boolean =
+    process.env.BW_DEBUG_SESSION === '1' || process.env.BW_DEBUG_SESSION === 'true';
 
-  constructor(
-    url: string,
-    user: string | null,
-    password: string | null,
-    client: string,
-    language?: string,
-    initialCookies?: Record<string, string>
-  ) {
-    this.basicAuth = (user && password)
-      ? 'Basic ' + Buffer.from(`${user}:${password}`).toString('base64')
+  private readonly opts: BwClientOptions;
+
+  constructor(opts: BwClientOptions) {
+    this.opts = opts;
+    this.basicAuth = opts.auth.kind === 'basic'
+      ? 'Basic ' + Buffer.from(`${opts.auth.user}:${opts.auth.password}`).toString('base64')
       : null;
 
     // In cookie mode (e.g. BW Bridge): do not send sap-client and X-sap-adt-sessiontype
     // as global defaults. BW Bridge rejects stateful requests with 401 when no
     // pre-established backend session exists on the app instance pointed to by __VCAP_ID__.
-    const isCookieMode = initialCookies !== undefined;
+    const isCookieMode = opts.auth.kind === 'cookies';
     this.http = axios.create({
-      baseURL: url,
+      baseURL: opts.url,
+      // Cloud Connector: standard absolute-URI proxying. Note the destination URL must
+      // be http:// — an https:// target makes axios tunnel with CONNECT, which drops the
+      // Proxy-Authorization and SAP-Connectivity-Authentication headers, and the
+      // connectivity proxy answers 405.
+      proxy: opts.proxy
+        ? { host: opts.proxy.host, port: opts.proxy.port, protocol: 'http' }
+        : false,
       headers: {
         ...(isCookieMode ? {} : {
-          'sap-client': client,
+          ...(opts.client ? { 'sap-client': opts.client } : {}),
           'X-sap-adt-sessiontype': 'stateful',
         }),
-        ...(language ? { 'sap-language': language } : {}),
+        ...(opts.language ? { 'sap-language': opts.language } : {}),
       },
       httpsAgent: new https.Agent({ rejectUnauthorized: false }),
       validateStatus: () => true,
@@ -78,15 +124,62 @@ export class BwClient {
     delete this.http.defaults.headers.post['Content-Type'];
     delete (this.http.defaults.headers as any).common['Content-Type'];
 
+    // Proxy credentials belong on every request, unlike the identity header — the
+    // connectivity proxy authorizes each hop individually. An interceptor keeps that
+    // out of the ~20 individual request methods.
+    if (opts.proxy) {
+      const proxy = opts.proxy;
+      this.http.interceptors.request.use((config) => {
+        config.headers.set('Proxy-Authorization', `Bearer ${proxy.token}`);
+        if (proxy.locationId) config.headers.set('SAP-Connectivity-SCC-Location_ID', proxy.locationId);
+        return config;
+      });
+    }
+
     // Cookie mode: pre-populate cookie store from caller. Used for SAML/OAuth-fronted
     // systems where Basic Auth is not available and cookies are exported from a browser.
-    if (initialCookies) {
-      for (const [name, value] of Object.entries(initialCookies)) {
+    if (opts.auth.kind === 'cookies') {
+      for (const [name, value] of Object.entries(opts.auth.cookies)) {
         this.cookies.set(name, value);
         // Names from the cookie file are frozen — set-cookie responses must not overwrite them.
         this.frozenCookies.add(name);
       }
     }
+  }
+
+  /**
+   * A second client against the same system with the same identity, but its own
+   * session — empty cookie jar, no CSRF token.
+   *
+   * This is what the existing "fresh session" call sites need: BW keeps a per-session
+   * model buffer, so a session that has written an object serves stale reads afterwards.
+   * Cloning rather than rebuilding from the environment is what lets those call sites
+   * work unchanged under principal propagation, where there is no ambient credential
+   * to rebuild from.
+   */
+  freshSession(): BwClient {
+    return new BwClient(this.opts);
+  }
+
+  /**
+   * The identity credential, applied exactly where this client already sent Basic Auth
+   * — i.e. only on the session-establishing CSRF fetch.
+   *
+   * That placement is deliberate and load-bearing: re-sending a credential on a PUT
+   * makes SAP open a new stateless session and invalidates the lock handle (see the
+   * note on `basicAuth`). Principal propagation follows the same rule, so
+   * `SAP-Connectivity-Authentication` establishes the session and the session cookie
+   * carries it from there.
+   *
+   * `Authorization` is never sent under principal propagation — SAP reserves it for
+   * basic auth to the backend, and sending it breaks identity propagation.
+   */
+  private authHeaders(): Record<string, string> {
+    if (this.basicAuth) return { Authorization: this.basicAuth };
+    if (this.opts.auth.kind === 'pp') {
+      return { 'SAP-Connectivity-Authentication': this.opts.auth.connectivityAuth };
+    }
+    return {};
   }
 
   // ── Session info (debug) ──────────────────────────────────────────────────
@@ -105,18 +198,47 @@ export class BwClient {
   private updateCookies(response: AxiosResponse): void {
     const setCookies = response.headers['set-cookie'];
     if (!setCookies) return;
+    if (this.sessionDebug) {
+      console.error(`[bw-session] Set-Cookie received: ${JSON.stringify(setCookies)}`);
+    }
     for (const c of setCookies) {
-      const part = c.split(';')[0];
+      const attrs = c.split(';');
+      const part = attrs[0];
       const eqIdx = part.indexOf('=');
-      if (eqIdx > 0) {
-        const name = part.substring(0, eqIdx).trim();
-        if (this.frozenCookies.has(name)) continue;
-        this.cookies.set(
-          name,
-          part.substring(eqIdx + 1).trim()
-        );
+      if (eqIdx <= 0) continue;
+      const name = part.substring(0, eqIdx).trim();
+      if (this.frozenCookies.has(name)) continue;
+      const value = part.substring(eqIdx + 1).trim();
+      // Honour explicit cookie deletions (Max-Age<=0 or Expires in the past): drop the
+      // cookie from the jar instead of re-sending a stale value. Re-sending a session
+      // cookie (e.g. sap-contextid) that the server has already rolled out is a likely
+      // cause of intermittent "No Suitable Resource Found" errors on stateful calls.
+      if (this.isCookieDeletion(attrs)) {
+        this.cookies.delete(name);
+        continue;
+      }
+      this.cookies.set(name, value);
+    }
+    if (this.sessionDebug) {
+      console.error(`[bw-session] cookie jar now: ${JSON.stringify(Object.fromEntries(this.cookies.entries()))}`);
+    }
+  }
+
+  // A Set-Cookie is a deletion when Max-Age is <= 0 or Expires is in the past.
+  private isCookieDeletion(attrs: string[]): boolean {
+    for (const a of attrs.slice(1)) {
+      const eq = a.indexOf('=');
+      const key = (eq >= 0 ? a.slice(0, eq) : a).trim().toLowerCase();
+      const val = eq >= 0 ? a.slice(eq + 1).trim() : '';
+      if (key === 'max-age') {
+        const n = parseInt(val, 10);
+        if (Number.isFinite(n) && n <= 0) return true;
+      } else if (key === 'expires') {
+        const t = Date.parse(val);
+        if (Number.isFinite(t) && t <= Date.now()) return true;
       }
     }
+    return false;
   }
 
   // ── CSRF token ─────────────────────────────────────────────────────────────
@@ -126,7 +248,7 @@ export class BwClient {
       headers: {
         'X-CSRF-Token': 'Fetch',
         Accept: 'application/xml',
-        ...(this.basicAuth ? { Authorization: this.basicAuth } : {}),
+        ...this.authHeaders(),
         ...this.cookieHeaders(),
       },
       responseType: 'text',
@@ -525,7 +647,7 @@ export class BwClient {
     const cookieHdr = this.cookieHeader();
     const response = await freshHttp.post(url, body, {
       headers: {
-        ...(this.basicAuth ? { Authorization: this.basicAuth } : {}),
+        ...this.authHeaders(),
         ...(cookieHdr ? { Cookie: cookieHdr } : {}),
         ...headers,
       },
@@ -589,7 +711,7 @@ export class BwClient {
     const cookieHdr = this.cookieHeader();
     const response = await freshHttp.put(url, body, {
       headers: {
-        ...(this.basicAuth ? { Authorization: this.basicAuth } : {}),
+        ...this.authHeaders(),
         ...(cookieHdr ? { Cookie: cookieHdr } : {}),
         ...headers,
       },
@@ -623,7 +745,7 @@ export class BwClient {
     const cookieHdr = this.cookieHeader();
     const response = await freshHttp.delete(url, {
       headers: {
-        ...(this.basicAuth ? { Authorization: this.basicAuth } : {}),
+        ...this.authHeaders(),
         ...(cookieHdr ? { Cookie: cookieHdr } : {}),
         'x-csrf-token': csrfToken,
         ...headers,
@@ -650,7 +772,7 @@ export class BwClient {
     const response = await this.http.get('/sap/bw/modeling/discovery', {
       headers: {
         Accept: 'application/atomsvc+xml',
-        ...(this.basicAuth ? { Authorization: this.basicAuth } : {}),
+        ...this.authHeaders(),
         ...this.cookieHeaders(),
       },
       responseType: 'text',
@@ -846,7 +968,26 @@ export class BwClient {
   }
 }
 
+/**
+ * A client for the current caller.
+ *
+ * Under the HTTP transport a per-request client is already in scope (its identity came
+ * from XSUAA and, for a principal-propagation destination, from the Destination
+ * service). This returns a fresh *session* on that same identity, which is exactly what
+ * the ~30 existing call sites want — they call this to escape BW's per-session model
+ * buffer, not to pick up credentials.
+ *
+ * Under stdio there is no request context and this reads the environment, unchanged.
+ *
+ * Keeping the signature means no tool file had to be touched for principal propagation.
+ */
 export function createClientFromEnv(): BwClient {
+  const active = currentClient();
+  if (active) return active.freshSession();
+  return clientFromEnvironment();
+}
+
+function clientFromEnvironment(): BwClient {
   const url = process.env.BW_URL;
   const client = process.env.BW_CLIENT ?? '001';
   const language = process.env.BW_LANGUAGE;
@@ -888,9 +1029,7 @@ export function createClientFromEnv(): BwClient {
         `BW_COOKIE_FILE at ${cookieFile} contains no parseable cookies (expected Netscape or name=value format).`
       );
     }
-    const userOpt = process.env.BW_USER ?? null;
-    const passwordOpt = process.env.BW_PASSWORD ?? null;
-    return new BwClient(url, userOpt, passwordOpt, client, language, cookies);
+    return new BwClient({ url, client, language, auth: { kind: 'cookies', cookies } });
   }
 
   // Basic Auth mode: classic on-premise BW/4HANA — unchanged from previous behavior.
@@ -901,5 +1040,22 @@ export function createClientFromEnv(): BwClient {
       'Required environment variables missing: BW_URL, BW_USER, BW_PASSWORD'
     );
   }
-  return new BwClient(url, user, password, client, language);
+  return new BwClient({ url, client, language, auth: { kind: 'basic', user, password } });
+}
+
+/**
+ * One-shot read through a BRAND-NEW session with forceCacheUpdate=true.
+ *
+ * The BW ADT backend keeps a per-session model buffer: a session that has
+ * previously locked/written an object reliably serves STALE reads afterwards
+ * (even with forceCacheUpdate=true), and pre-lock reads may project outdated
+ * state. Building a read-modify-write on such a read silently resurrects old
+ * attribute values on the PUT. A fresh session always returns the database
+ * state, including an existing unactivated M draft. Use this for every
+ * pre-lock model read and for verification reads; post-lock reads in the
+ * locking session are refreshed by the lock itself and may stay as they are.
+ */
+export async function freshRead(path: string, accept: string): Promise<GetResult> {
+  const sep = path.includes('?') ? '&' : '?';
+  return createClientFromEnv().get(`${path}${sep}forceCacheUpdate=true`, accept);
 }

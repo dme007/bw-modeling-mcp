@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, freshRead } from '../bw-client.js';
 
 const TRCS_MEDIA = 'application/vnd.sap.bw.modeling.trcs-v1_0_0+xml';
 
@@ -11,7 +11,7 @@ const TRCS_MEDIA = 'application/vnd.sap.bw.modeling.trcs-v1_0_0+xml';
  */
 export async function bwGetInfosource(client: BwClient, name: string): Promise<string> {
   const nameLower = name.toLowerCase();
-  const result = await client.get(`/sap/bw/modeling/trcs/${nameLower}/m`, TRCS_MEDIA);
+  const result = await freshRead(`/sap/bw/modeling/trcs/${nameLower}/m`, TRCS_MEDIA);
   const xml = result.body;
 
   // Root attributes
@@ -215,9 +215,11 @@ export async function bwCreateInfosource(
 // ── bw_update_infosource ──────────────────────────────────────────────────────
 
 /**
- * bw_update_infosource — replace the field list of an InfoSource.
+ * bw_update_infosource — add/remove fields and update labels of an InfoSource.
  *
- * Workflow: Lock → GET full XML → replace element/keyElement sections → PUT
+ * Workflow: Lock → GET full XML → preserve existing elements, insert new ones / delete named ones → PUT
+ * `fields` lists the fields to add; `removeFields` lists field names to delete. Other existing
+ * fields are always kept verbatim.
  * tlogoProperties are passed through unchanged.
  * Returns lock_handle for bw_activate.
  */
@@ -226,7 +228,8 @@ export async function bwUpdateInfosource(
   name: string,
   description?: string,
   fields?: InfosourceField[],
-  transport?: string
+  transport?: string,
+  removeFields?: string[]
 ): Promise<string> {
   const nameUpper = name.toUpperCase();
   const trcsPath = `/sap/bw/modeling/trcs/${name.toLowerCase()}/m`;
@@ -234,39 +237,74 @@ export async function bwUpdateInfosource(
   // 1. Lock (no activity_context = update mode)
   const lockHandle = await client.lock('trcs', name);
 
-  // 2. GET current XML
-  const getResult = await client.get(trcsPath, TRCS_MEDIA);
+  // 2. GET current XML — post-lock in the locking session (the lock refreshes the
+  //    session's model buffer); forceCacheUpdate additionally syncs the server cache.
+  const getResult = await client.get(`${trcsPath}?forceCacheUpdate=true`, TRCS_MEDIA);
   const timestamp = getResult.headers['timestamp'] ?? getResult.headers['TIMESTAMP'];
   let xml = getResult.body;
 
-  // 3. Update description
+  // 3. Update description (top-level endUserTexts is the first match in the body)
   if (description !== undefined) {
     xml = xml.replace(/<endUserTexts label="[^"]*"\s*\/>/, `<endUserTexts label="${description}"/>`);
   }
 
-  // 4. Replace elements and keyElements
-  if (fields !== undefined) {
-    // Strip all existing <element> blocks (may span multiple lines)
-    xml = xml.replace(/[ \t]*<element\b[\s\S]*?<\/element>\n?/g, '');
-    // Strip all existing <keyElement> entries
-    xml = xml.replace(/[ \t]*<keyElement>[^<]*<\/keyElement>\n?/g, '');
+  // 4. Preserve existing elements; strip server-computed consumptionViewProperties for any change.
+  // The GET body carries a server-computed consumptionViewProperties in every element.
+  // The ADT PUT body does not. Strip it so the body matches the known-good ADT body.
+  const hasFieldChanges = fields !== undefined || (removeFields !== undefined && removeFields.length > 0);
+  if (hasFieldChanges) {
+    xml = xml.replace(/<consumptionViewProperties\b[^>]*\/>/g, '');
+  }
 
-    const elementBlocks = fields.map(buildElement);
-    const keyBlocks = fields
+  if (fields !== undefined) {
+    const existingNames = new Set<string>();
+    const nameRe = /<element\b[^>]*\bname="([^"]+)"/g;
+    let nm: RegExpExecArray | null;
+    while ((nm = nameRe.exec(xml)) !== null) {
+      existingNames.add(nm[1].toUpperCase());
+    }
+
+    const newFields = fields.filter((f) => !existingNames.has(f.name.toUpperCase()));
+    const newElementBlocks = newFields.map(buildElement);
+    const newKeyBlocks = newFields
       .filter((f) => f.isKey)
       .map((f) => `  <keyElement>#///${f.name.toUpperCase()}</keyElement>`);
 
-    const insertBlock = [...elementBlocks, ...keyBlocks].join('\n') + '\n';
-    if (xml.includes('<tlogoProperties')) {
-      xml = xml.replace('<tlogoProperties', insertBlock + '  <tlogoProperties');
-    } else {
-      xml = xml.replace('</trcs:infoSource>', insertBlock + '</trcs:infoSource>');
+    // Insert new <element> blocks before the first <keyElement>, or before <tlogoProperties> if none.
+    if (newElementBlocks.length > 0) {
+      const elementsXml = newElementBlocks.join('\n');
+      const firstKey = xml.indexOf('<keyElement>');
+      if (firstKey !== -1) {
+        xml = xml.slice(0, firstKey) + elementsXml + '\n  ' + xml.slice(firstKey);
+      } else {
+        xml = xml.replace('<tlogoProperties', elementsXml + '\n  <tlogoProperties');
+      }
+    }
+
+    // Insert new <keyElement> entries just before <tlogoProperties> (after existing ones).
+    if (newKeyBlocks.length > 0) {
+      xml = xml.replace('<tlogoProperties', newKeyBlocks.join('\n') + '\n  <tlogoProperties');
+    }
+  }
+
+  if (removeFields !== undefined && removeFields.length > 0) {
+    const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    for (const raw of removeFields) {
+      const esc = escapeRe(raw);
+      // Delete the element block (elements do not nest, so match to the first </element>).
+      xml = xml.replace(new RegExp(`<element\\b[^>]*\\bname="${esc}"[^>]*>[\\s\\S]*?</element>`), '');
+      // Delete its keyElement entry if the field was a key field.
+      xml = xml.replace(new RegExp(`<keyElement>#///${esc}</keyElement>`), '');
     }
   }
 
   // 5. PUT
+  // The GET of an active InfoSource returns contentState ACT. Sending ACT back makes the
+  // server treat the PUT as active content with no revision, so inserted fields are dropped.
+  // ADT always sends REV to force a revision. Force REV so additions are applied.
+  xml = xml.replace(/<contentState>[^<]*<\/contentState>/, '<contentState>REV</contentState>');
   try {
-    await client.put('trcs', name, lockHandle, xml, timestamp, transport);
+    await client.put('trcs', name, lockHandle, xml, timestamp, undefined, transport);
   } catch (err) {
     await client.unlock('trcs', name).catch(() => {/* ignore */});
     throw err;
