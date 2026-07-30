@@ -805,11 +805,13 @@ export class BwClient {
         .filter((mt) => extractVersion(mt) > 0);
       if (versioned.length === 0) continue;
       const best = versioned.reduce((a, b) => (extractVersion(b) >= extractVersion(a) ? b : a));
-      const existing = MEDIA_TYPES[key];
-      // Only update if the discovered version is >= the existing one (never downgrade).
-      if (!existing || extractVersion(best) >= extractVersion(existing)) {
-        MEDIA_TYPES[key] = best;
-      }
+      // Discovery is authoritative: it states what THIS backend accepts, so it always wins.
+      // The previous "never downgrade" guard kept the hardcoded fallback whenever it
+      // outranked the advertised version, which broke every backend running an older
+      // resource version than the fallback. Concrete case: adso is hardcoded to v1_7_0,
+      // but a BW/4HANA system advertising only adso-v1_6_0+xml then received v1_7_0 on
+      // every GET and lock, and answered HTTP 415 "Unsupported Media Type".
+      MEDIA_TYPES[key] = best;
     }
     process.stderr.write(`[bw-modeling-mcp] Loaded media types from discovery: ${JSON.stringify(MEDIA_TYPES)}\n`);
   }
