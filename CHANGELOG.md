@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.2.0] — 2026-07-29
+
+### Added
+
+- **BTP Cloud Foundry Deployment** — the MCP server now runs centrally on SAP BTP Cloud Foundry as an HTTP server (`npm run start:http`) instead of only locally via stdio. Enables shared hosting, concurrent users, and enterprise authentication
+- **XSUAA OAuth Authentication** — BTP integration with SAP XSUAA service for identity management and role-based access control. **Built on the same [@arc-mcp/xsuaa-auth](https://github.com/arc-mcp/xsuaa-auth) module as [ARC-1](https://github.com/arc-mcp/arc-1)** for consistency across NextLytics MCP ecosystem. Stateless Dynamic Client Registration (DCR) + callback proxy pattern ensures secure, session-independent auth. Supports both BasicAuthentication (Stage 1: shared technical user) and Principal Propagation (Stage 2: per-user identity)
+- **Role-Based Access Control (RBAC)** — two role collections ship with xs-security.json:
+  - `BW MCP Reader` — read-only access to the metadata and query tools (via `read` scope)
+  - `BW MCP Developer` — full access including create/update/delete/activate (via `write` scope). Write scope implicitly grants read, following the principle of least surprise
+- **Scope Enforcement** — new `src/scopes.ts` enforces which tools require which scopes; read-only tools are explicitly listed, all mutations default to `write`, ensuring new tools are safe by default (unavailable to read-only users until explicitly whitelisted)
+- **Cloud Connector Integration** — BTP destinations route on-premise BW traffic via Cloud Connector; supports HTTP proxy type for transparent connectivity without exposing internal networks
+
+### Improved
+
+- **Security by Default** — the scopes system defaults new write tools to `write` scope rather than accidentally permitting them to read-only users. Classification comes from actual HTTP verbs (POST/PUT/DELETE usage, not tool name)
+- **xs-security.json Structure** — three-layer authorization model (scopes → role-templates → role-collections) allows future granularity without code changes; documentation added for extending roles (query, monitor, metadata, data_push, admin scopes as examples)
+
+### Fixed
+
+- **stdio entrypoint compatibility** — `dist/index.js` again starts the stdio server when executed directly (`node dist/index.js`), via a run-as-main guard. The Cloud Foundry refactor had moved the bootstrap into `dist/stdio.js`, silently breaking existing local MCP client configurations that launch `dist/index.js`: the process started but exited within seconds without completing the MCP handshake. Both `dist/index.js` and the canonical `dist/stdio.js` bin now work; the guard does not fire when the module is imported, so the HTTP entrypoint never double-starts
+
+### Notes
+
+- **Shared technical user (Stage 1)** — `BasicAuthentication` via the BTP destination, tested and verified end-to-end
+- **Principal propagation (Stage 2)** — per-user identity via Cloud Connector certificate propagation plus ABAP-side CERTRULE and ICM reverse-proxy trust, tested and verified end-to-end; setup documented in docs/CENTRAL-HOSTING-SETUP.md (Stage 2) and docs/CLOUD-FOUNDRY.md §3
+- **stdio Mode Unchanged** — local stdio invocation (`npm run start`) continues to work without authentication, unchanged by this release. The HTTP server is additive; upgrading an existing local install is non-breaking
+- **npm Package** — bw-modeling-mcp is now published to npm as both stdio (default `bin` entrypoint) and HTTP (via `npm run start:http`)
+
 ## [1.1.0] — 2026-07-23
 
 ### Added

@@ -7,8 +7,13 @@ import {
   ListToolsRequestSchema,
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
+import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
+import { fileURLToPath } from 'node:url';
+import { realpathSync } from 'node:fs';
 
-import { createClientFromEnv } from './bw-client.js';
+import { createClientFromEnv, type BwClient } from './bw-client.js';
+import { currentClient } from './request-context.js';
+import { filterToolsByScope, hasScope, requiredScope } from './scopes.js';
 import { bwGetAdso, bwCreateAdso, FieldDef, bwUpdateAdso, bwUpdateAdsoAddPureField, bwUpdateAdsoSettings, AdsoSettings, bwUpdateAdsoManageKeys, bwUpdateAdsoFieldProperties, FieldProperties } from './tools/adso.js';
 import { bwGetInfoObject, bwCreateInfoObject, bwUpdateInfoObject, AttributeDef } from './tools/infoobject.js';
 import { bwGetTransformation, bwUpdateTransformation, bwCreateTransformation, bwSetTransformationRuntime, bwSetTransformationRoutine, bwDeleteTransformationRoutine, bwSetTransformationRoutineFields, bwSetTransformationExpertRoutine } from './tools/transformation.js';
@@ -39,14 +44,6 @@ import { bwListProcessChainRuns, bwGetProcessChainRunDetail, bwListProcessChainL
 import { bwCreateProcessChain, bwUpdateProcessChain, bwActivateProcessChain, bwAddProcessChainErrorLinks, bwSwapProcessChainDtp, bwAppendProcessChainDtp, bwAddProcessChainProgram, bwCreateDecisionVariant, CreateProcessChainParams, UpdateProcessChainParams, EdgeDef, TriggerEventConfig } from './tools/processchain_write.js';
 import { bwCreateTransportTask } from './tools/transport.js';
 
-// Single shared client instance (CSRF token + session cookies are reused)
-const client = createClientFromEnv();
-
-const server = new Server(
-  { name: 'bw-modeling-mcp', version: '0.1.0' },
-  { capabilities: { tools: {} } }
-);
-
 // Map the snake_case trigger_event tool argument to the TriggerEventConfig shape.
 function mapTriggerEvent(raw: unknown): TriggerEventConfig | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
@@ -62,8 +59,7 @@ function mapTriggerEvent(raw: unknown): TriggerEventConfig | undefined {
 
 // ── Tool definitions ─────────────────────────────────────────────────────────
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
+const TOOL_DEFINITIONS = [
     {
       name: 'bw_search',
       description:
@@ -3547,15 +3543,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['transport_request', 'user'],
       },
     },
-  ],
-}));
+];
 
 // ── Tool handlers ─────────────────────────────────────────────────────────────
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+async function handleToolCall(
+  request: { params: { name: string; arguments?: Record<string, unknown> } },
+  extra: { authInfo?: AuthInfo },
+): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
   const { name, arguments: args } = request.params;
 
+  // Deny before doing any work. stdio has no authInfo and nothing to check.
+  if (!hasScope(extra.authInfo, requiredScope(name))) {
+    throw new McpError(ErrorCode.InvalidRequest, `Tool '${name}' requires the '${requiredScope(name)}' scope.`);
+  }
+
+  // HTTP: the per-request client, whose identity came from XSUAA and the destination.
+  // stdio: no request context, so read the environment exactly as before.
+  const client = currentClient() ?? createClientFromEnv();
+
   try {
+    await ensureMediaTypes(client);
     let text: string;
 
     switch (name) {
@@ -4475,23 +4483,84 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       isError: true,
     };
   }
-});
+}
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+// ── Server ────────────────────────────────────────────────────────────────────
 
-async function main(): Promise<void> {
-  try {
-    await client.loadMediaTypes();
-  } catch (err) {
-    process.stderr.write(`[bw-modeling-mcp] Warning: discovery failed, using hardcoded media type fallbacks (${err})\n`);
+/**
+ * Build an MCP server with every tool registered.
+ *
+ * A factory rather than a module-level instance: the SDK binds a Server to exactly one
+ * transport for its lifetime, so the stateless HTTP transport needs a fresh one per
+ * request. stdio calls this once.
+ */
+export function createServer(): Server {
+  const server = new Server(
+    { name: 'bw-modeling-mcp', version: '0.1.0' },
+    { capabilities: { tools: {} } }
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, async (_request, extra) => ({
+    // Hide what the caller may not invoke, so a model never proposes a denied call.
+    tools: filterToolsByScope(TOOL_DEFINITIONS, extra.authInfo),
+  }));
+
+  server.setRequestHandler(CallToolRequestSchema, handleToolCall);
+
+  return server;
+}
+
+/**
+ * Populate MEDIA_TYPES on first use rather than at startup.
+ *
+ * The HTTP transport has no credentials at boot — they arrive with the request — so
+ * discovery cannot run there. The type->MIME map is system metadata, identical for every
+ * caller, so one process-wide cache is correct.
+ *
+ * Cleared on failure: otherwise one transient error during the very first request would
+ * leave the fallbacks in place for the life of the process, and later reads would fail
+ * with a misleading "object type not supported on this system".
+ */
+let discovery: Promise<void> | null = null;
+export function ensureMediaTypes(client: BwClient): Promise<void> {
+  if (!discovery) {
+    discovery = client.loadMediaTypes().catch((err) => {
+      discovery = null;
+      process.stderr.write(`[bw-modeling-mcp] Warning: discovery failed, using hardcoded media type fallbacks (${err})\n`);
+    });
   }
+  return discovery;
+}
+
+// ── Start (stdio) ─────────────────────────────────────────────────────────────
+
+export async function startStdio(): Promise<void> {
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await createServer().connect(transport);
   // Log to stderr only (stdout is used for MCP protocol messages)
   process.stderr.write('bw-modeling-mcp server started\n');
 }
 
-main().catch((err) => {
-  process.stderr.write(`Fatal error: ${err}\n`);
-  process.exit(1);
-});
+// ── Backward-compatible entrypoint ──────────────────────────────────────────────
+//
+// Historically the stdio server was launched via `node dist/index.js`, and many local
+// MCP client configs still point there. The BTP refactor turned this file into a shared
+// module imported by stdio.ts and http.ts, so it no longer self-started. Restore the old
+// behaviour: start the stdio server when this file is the process entry point. When it is
+// imported (stdio.ts / http.ts), import.meta.url differs from argv[1], so this is a no-op
+// and never double-starts.
+function isRunAsMain(): boolean {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]);
+  } catch {
+    return false;
+  }
+}
+
+if (isRunAsMain()) {
+  startStdio().catch((err) => {
+    process.stderr.write(`Fatal error: ${err}\n`);
+    process.exit(1);
+  });
+}
