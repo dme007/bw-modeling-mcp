@@ -64,7 +64,17 @@ function setRootAttr(xml: string, attr: string, value: string): string {
   return xml.replace(/(<adso:dataStore\b(?:[^>]|\n)*?)(\s*>)/, `$1 ${attr}="${value}"$2`);
 }
 
-const ADSO_ACCEPT = MEDIA_TYPES['adso'];
+/**
+ * Accept header for aDSO requests, resolved at CALL time.
+ *
+ * Must not be captured into a module-level constant: such a snapshot is evaluated when this
+ * module is imported, which happens before ensureMediaTypes() has ever run. It therefore
+ * froze the hardcoded fallback for the life of the process and discovery could never take
+ * effect. Concrete case: the fallback is adso-v1_7_0+xml, so a system advertising only
+ * adso-v1_6_0+xml answered every GET and lock with HTTP 415 — even though discovery had
+ * correctly written v1_6_0 into MEDIA_TYPES.
+ */
+const adsoAccept = (): string => MEDIA_TYPES['adso'];
 
 export interface AdsoSettings {
   adsoType?: 'standard' | 'staging_inbound_only' | 'staging_compress' | 'staging_reporting' | 'datamart' | 'direct_update';
@@ -93,7 +103,7 @@ export async function bwUpdateAdsoSettings(
   const adsoPath = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
 
   // 1. Read current XML
-  const adsoResult = await freshRead(adsoPath, ADSO_ACCEPT);
+  const adsoResult = await freshRead(adsoPath, adsoAccept());
   const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
   let xml = adsoResult.body;
 
@@ -161,7 +171,7 @@ export async function bwGetAdso(
   format: 'text' | 'raw' = 'text',
 ): Promise<string> {
   const path = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
-  const result = await freshRead(path, ADSO_ACCEPT);
+  const result = await freshRead(path, adsoAccept());
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
   const ts = result.headers['timestamp'] ?? '';
   const rawOutput = `aDSO: ${adsoName.toUpperCase()}\nStatus: ${status}\nTimestamp: ${ts}\n\n${result.body}`;
@@ -446,7 +456,7 @@ export async function bwUpdateAdsoManageKeys(
   const adsoPath = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
 
   // 1. Read current XML
-  const adsoResult = await freshRead(adsoPath, ADSO_ACCEPT);
+  const adsoResult = await freshRead(adsoPath, adsoAccept());
   const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
   let xml = adsoResult.body;
 
@@ -518,7 +528,7 @@ export async function bwUpdateAdsoFieldProperties(
 
   // 1. GET full XML
   const adsoPath = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
-  const adsoResult = await freshRead(adsoPath, ADSO_ACCEPT);
+  const adsoResult = await freshRead(adsoPath, adsoAccept());
   const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
   const fullXml = adsoResult.body;
 
@@ -906,7 +916,7 @@ export async function bwUpdateAdsoAddPureField(
   const adsoUpper = adsoName.toUpperCase();
   const adsoPath = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
 
-  const adsoResult = await freshRead(adsoPath, ADSO_ACCEPT);
+  const adsoResult = await freshRead(adsoPath, adsoAccept());
   const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
   let xml = adsoResult.body;
 
@@ -1000,7 +1010,7 @@ export async function bwUpdateAdso(
 
   // Read current aDSO once (full XML + timestamp)
   const adsoPath = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
-  const adsoResult = await freshRead(adsoPath, ADSO_ACCEPT);
+  const adsoResult = await freshRead(adsoPath, adsoAccept());
   const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
 
   let updatedXml = adsoResult.body;
