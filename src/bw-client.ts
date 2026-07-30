@@ -108,9 +108,16 @@ export class BwClient {
       // be http:// — an https:// target makes axios tunnel with CONNECT, which drops the
       // Proxy-Authorization and SAP-Connectivity-Authentication headers, and the
       // connectivity proxy answers 405.
+      //
+      // Without an explicit Cloud Connector hop the field stays unset, so axios keeps
+      // honouring HTTP_PROXY/http_proxy. It must not be `false`: that disables the
+      // environment proxy and cuts off every deployment that reaches BW through a local
+      // one. SAP Business Application Studio is the case in point — a
+      // `<destination>.dest` host has no DNS entry there and is resolved solely by the
+      // BAS proxy, which also performs the destination lookup and principal propagation.
       proxy: opts.proxy
         ? { host: opts.proxy.host, port: opts.proxy.port, protocol: 'http' }
-        : false,
+        : undefined,
       headers: {
         ...(isCookieMode ? {} : {
           ...(opts.client ? { 'sap-client': opts.client } : {}),
