@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead, resolveMasterSystem } from '../bw-client.js';
 import { parseInfoObjectProps } from './infoobject.js';
 import { parseActivationMessages, parseDtpsDeactivated, bwActivate } from './activation.js';
 
@@ -92,7 +92,7 @@ export async function bwCreateTransformation(
   const trfnLower = trfnName.toLowerCase();
 
   const language     = process.env.BW_LANGUAGE ?? 'DE';
-  const masterSystem = new URL(process.env.BW_URL ?? 'http://localhost').hostname.split('.')[0].toUpperCase();
+  const masterSystem = await resolveMasterSystem(client);
   const responsible  = (process.env.BW_USER ?? '').toUpperCase();
 
   // Step 2: Lock with CREA. rawPost() wipes every axios default header, so the session

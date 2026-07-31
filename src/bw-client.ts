@@ -1068,3 +1068,42 @@ export async function freshRead(path: string, accept: string): Promise<GetResult
   const sep = path.includes('?') ? '&' : '?';
   return createClientFromEnv().get(`${path}${sep}forceCacheUpdate=true`, accept);
 }
+
+/** Resolved once per process; the SID cannot change under a running connector. */
+let masterSystemCache: string | null = null;
+
+/**
+ * The backend's system ID, for `adtcore:masterSystem` in creation payloads.
+ *
+ * Deriving it from the BW_URL hostname — as the create tools used to do — only works when the
+ * host happens to be named after the system. Behind a BTP destination or any reverse proxy it
+ * yields the gateway name (e.g. `<DESTINATION-HOST>`), and the backend answers the POST with
+ * `BW-Modell-Deserialisierung ist fehlgeschlagen`.
+ *
+ * The systeminfo resource has no SID property, only `system.logsys` (the logical system, e.g.
+ * `<SID><CLNT>` or `<SID>CLNT<CLNT>`). A SAP system ID is always exactly three characters, so the SID is
+ * the first three of a logical system that follows the usual <SID>[CLNT]<client> shape. That
+ * pattern is checked rather than assumed: logical systems can be named freely, and for anything
+ * that does not match we fall back to the old derivation instead of sending a wrong SID.
+ */
+export async function resolveMasterSystem(client: BwClient): Promise<string> {
+  if (masterSystemCache) return masterSystemCache;
+
+  try {
+    const { body } = await client.rawGet('/sap/bw/modeling/repo/is/systeminfo', {
+      Accept: 'application/xml',
+    });
+    const logsys = body
+      .match(/name="system\.logsys"\s+value="([^"]*)"/)?.[1]
+      ?.trim()
+      .toUpperCase();
+    if (logsys && /^[A-Z0-9]{3}(CLNT)?[0-9]{3}$/.test(logsys)) {
+      masterSystemCache = logsys.slice(0, 3);
+      return masterSystemCache;
+    }
+  } catch {
+    // systeminfo unreachable — fall through to the hostname derivation below.
+  }
+
+  return new URL(process.env.BW_URL ?? 'http://localhost').hostname.split('.')[0].toUpperCase();
+}
