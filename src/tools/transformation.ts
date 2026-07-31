@@ -1916,6 +1916,9 @@ export async function bwSetTransformationRoutine(
     await client.unlock('trfn', trfnLower).catch(() => {/* ignore */});
     throw err;
   }
+  // Release inside this call: every tool call runs in its own session and an enqueue
+  // can only be released by the session holding it (see BwClient.unlock).
+  await client.unlock('trfn', trfnLower).catch(() => {/* best effort */});
 
   // ADT class write flow — activate the generated _M class and inject a proper skeleton.
   // For ABAP: BW generates the class only after activation — skip if 404.
@@ -1962,7 +1965,7 @@ export async function bwSetTransformationRoutine(
     routine_type: routineTypeUpper,
     class_name: classNameM,
     method_name: methodName,
-    lock_handle: lockHandle,
+    lock_handle: '',
     transformation_name: trfnUpper,
     object_type: 'trfn',
   });
@@ -2280,6 +2283,9 @@ export async function bwSetTransformationRoutineFields(
     await client.unlock('trfn', trfnLower).catch(() => {/* ignore */});
     throw err;
   }
+  // Release inside this call: every tool call runs in its own session and an enqueue
+  // can only be released by the session holding it (see BwClient.unlock).
+  await client.unlock('trfn', trfnLower).catch(() => {/* best effort */});
 
   return JSON.stringify({
     success: true,
@@ -2290,7 +2296,7 @@ export async function bwSetTransformationRoutineFields(
     selected_fields: selectedFields,
     selected_count: selectedFields.length,
     total_target_fields: allTargetFields.length,
-    lock_handle: lockHandle,
+    lock_handle: '',
     transformation_name: trfnUpper,
     object_type: 'trfn',
   });
@@ -2362,6 +2368,9 @@ export async function bwDeleteTransformationRoutine(
     await client.unlock('trfn', trfnLower).catch(() => {/* ignore */});
     throw err;
   }
+  // Release inside this call: every tool call runs in its own session and an enqueue
+  // can only be released by the session holding it (see BwClient.unlock).
+  await client.unlock('trfn', trfnLower).catch(() => {/* best effort */});
 
   return JSON.stringify({
     success: true,
@@ -2371,7 +2380,7 @@ export async function bwDeleteTransformationRoutine(
       ' Call bw_activate to activate.',
     routine_type: routineTypeUpper,
     group_removed: !hasRemainingRules,
-    lock_handle: lockHandle,
+    lock_handle: '',
     transformation_name: trfnUpper,
     object_type: 'trfn',
   });
