@@ -214,6 +214,11 @@ export async function bwCreateTransformation(
     true,
   );
 
+  // The create session can take an enqueue of its own, and only that session can release
+  // it (the counter lives in its roll area — see BwClient.unlock). Harmless no-op when it
+  // holds nothing.
+  await createClient.unlock('trfn', trfnLower).catch(() => {/* best effort */});
+
   // Step 4: Verify persisted — through a fresh session so the check reflects the
   // database, not the creating session's model buffer.
   try {

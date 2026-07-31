@@ -958,6 +958,23 @@ export class BwClient {
     }
   }
 
+  /**
+   * Release the object lock.
+   *
+   * CRITICAL — this only works from the client that took the lock, in a stateful session:
+   * the server counts the enqueue in *instance* state (`P_S_ENQUEUE-COUNT` on the TLOGO
+   * instance, which lives in the session's roll area). `CL_RSO_RES_TRFN=>UNLOCK` re-fetches
+   * the instance via `factory()` and calls `DEQUEUE`, which decrements the counter and
+   * calls `DEQUEUE_<object>` only `IF count = 0`. Reached from a *different* session (or a
+   * stateless request, which gets a fresh roll area), the factory returns a NEW instance
+   * with `count` initial, the decrement yields -1, the dequeue function module is never
+   * called — and the request still answers HTTP 200. That is the "reports success but the
+   * lock persists" behaviour. Verified in the ABAP debugger on 2026-07-31: same client +
+   * `stateful` on both requests → `count = 1` → lock released.
+   *
+   * Therefore: never route an unlock through a different client than its lock, and always
+   * declare the session type explicitly (the axios default is absent in cookie mode).
+   */
   async unlock(type: string, name: string): Promise<void> {
     if (NO_UNLOCK_TYPES.has(type.toLowerCase())) return;
     await this.ensureCsrf();
@@ -968,6 +985,8 @@ export class BwClient {
       {
         headers: {
           'Content-Type': mediaType,
+          'Accept': mediaType,
+          'X-sap-adt-sessiontype': 'stateful',
           'X-CSRF-Token': this.csrfToken!,
           ...this.cookieHeaders(),
         },
@@ -979,16 +998,6 @@ export class BwClient {
     if (response.status >= 400) {
       throw new Error(`UNLOCK ${type.toUpperCase()} ${name} → HTTP ${response.status}\n${response.data}`);
     }
-
-    // The action=unlock request alone does NOT reliably release the enqueue on this
-    // landscape ("bw_unlock reports success but the lock persists", verified repeatedly).
-    // What DOES reliably release it (measured live 2026-07-31): a STATELESS request on the
-    // same cookie jar makes the server tear the stateful session down, and the session's
-    // enqueues die with it. unlock() is always the terminal call of a modeling cycle, so
-    // sacrificing the session here is free — the next call simply opens a fresh one.
-    try {
-      await this.rawGet('/sap/bw/modeling/repo/is/systeminfo', { Accept: 'application/xml' });
-    } catch { /* best effort — the unlock above already succeeded */ }
   }
 }
 

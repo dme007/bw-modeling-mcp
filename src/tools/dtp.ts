@@ -318,12 +318,6 @@ export async function bwUnlockDtp(client: BwClient, dtpName: string): Promise<vo
       'X-sap-adt-sessiontype': 'stateful',
     }
   );
-  // Guaranteed enqueue release: tear the stateful session down with a stateless request
-  // on the same jar — its enqueues die with it (same mechanism as BwClient.unlock()).
-  // bwUnlockDtp is only called at the end of a create flow, so the session is expendable.
-  try {
-    await client.rawGet('/sap/bw/modeling/repo/is/systeminfo', { Accept: 'application/xml' });
-  } catch { /* best effort */ }
 }
 
 // ── bwCreateDtp ───────────────────────────────────────────────────────────────
@@ -506,6 +500,10 @@ export async function bwCreateDtp(
         'x-csrf-token': createCsrf,
       }
     );
+
+    // Release an enqueue the create session may have taken — only that session can
+    // (the counter lives in its roll area, see BwClient.unlock). No-op when it holds none.
+    await bwUnlockDtp(createClient, dtpLower).catch(() => {/* best effort */});
 
     // Step 4: Explicit unlock
     const csrfToken3 = await client.getCsrfToken();

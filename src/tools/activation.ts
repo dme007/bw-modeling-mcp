@@ -1,16 +1,25 @@
 import { BwClient, MEDIA_TYPES, createClientFromEnv } from '../bw-client.js';
 
 /**
- * Tear down a helper client's stateful session so its enqueues die with it.
- * Activation runs in a fresh stateful session (see bwActivate); on this landscape the
- * activation itself can enqueue the object (e.g. ERSTRFN_TRANID for a TRFN referenced
- * by an activating DTP) and that lock would otherwise survive until session timeout or
- * SM12. A stateless request on the client's cookie jar makes the server drop the
- * session (measured live 2026-07-31). Best effort — never fails the caller.
+ * Release any enqueue the activation session acquired, through that same session.
+ *
+ * Activation runs in a fresh stateful session, and on this landscape it can take an
+ * enqueue itself (observed: activating a DTP locks the referenced transformation). An
+ * enqueue can only be released by the session that holds it — the server tracks the count
+ * in instance state in that session's roll area (see BwClient.unlock). So the unlock has
+ * to go through the activation client, not the caller's.
+ *
+ * Harmless when the session holds nothing: the counter simply goes negative, the dequeue
+ * function module is not called, and the request answers 200. Best effort — never fails
+ * the caller.
  */
-async function teardownSession(helperClient: BwClient): Promise<void> {
+async function releaseActivationLock(
+  activationClient: BwClient,
+  type: string,
+  name: string,
+): Promise<void> {
   try {
-    await helperClient.rawGet('/sap/bw/modeling/repo/is/systeminfo', { Accept: 'application/xml' });
+    await activationClient.unlock(type, name);
   } catch { /* best effort */ }
 }
 
@@ -110,10 +119,9 @@ export async function bwActivate(
 
   const activationXml = await activationClient.activate(typeLower, objectName, lockHandle, corrNr, sourceSystem);
 
-  // The fresh activation session has served its purpose — tear it down so any enqueue
-  // it acquired during activation dies with it (see teardownSession).
+  // Release an enqueue the activation session may have taken, through that same session.
   if (activationClient !== client) {
-    await teardownSession(activationClient);
+    await releaseActivationLock(activationClient, typeLower, objectName);
   }
 
   // Step 3: Unlock (skipped for dtpa and rsds — both are standalone activations with no lock)
@@ -144,7 +152,7 @@ export async function bwActivate(
   if (hasError && hasDeletedRule && typeLower === 'trfn') {
     const retryClient = createClientFromEnv();
     const retryXml = await retryClient.activate(typeLower, objectName, lockHandle, corrNr);
-    await teardownSession(retryClient);
+    await releaseActivationLock(retryClient, typeLower, objectName);
     if (lockHandle) {
       await client.unlock(typeLower, objectName);
     }
@@ -177,7 +185,7 @@ export async function bwActivate(
     await new Promise((resolve) => setTimeout(resolve, 1000));
     const retryClient = createClientFromEnv();
     const retryXml = await retryClient.activate(typeLower, objectName, '', corrNr);
-    await teardownSession(retryClient);
+    await releaseActivationLock(retryClient, typeLower, objectName);
     // No unlock needed here — retrying with empty lockHandle means the object was not locked
     const retryMessages = parseActivationMessages(retryXml);
     const retryDeactivatedDtps = parseDtpsDeactivated(retryXml);
