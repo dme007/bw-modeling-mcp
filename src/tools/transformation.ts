@@ -1239,6 +1239,10 @@ export async function bwUpdateTransformation(
       await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
       throw err;
     }
+    // Release inside this call. Every tool call runs in its own session (stdio builds a
+    // fresh client per call), and an enqueue can only be released by the session holding
+    // it — a later bw_unlock or bw_activate could never clear this one.
+    await client.unlock('trfn', transformationName).catch(() => {/* best effort */});
 
     return JSON.stringify({
       success: true,
@@ -1250,7 +1254,7 @@ export async function bwUpdateTransformation(
         'AMDP SQLSCRIPT methods only allow ASCII 7-bit characters. ' +
         'Do NOT use non-ASCII characters (e.g. German umlauts like ä/ö/ü or symbols like <=) ' +
         'in SQLSCRIPT code or comments — they will cause a syntax error.',
-      lock_handle: lockHandle,
+      lock_handle: '',
       transformation_name: transformationName.toUpperCase(),
       object_type: 'trfn',
       converted_from: ruleInfo.stepType,
@@ -1321,6 +1325,10 @@ export async function bwUpdateTransformation(
       await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
       throw err;
     }
+    // Release inside this call. Every tool call runs in its own session (stdio builds a
+    // fresh client per call), and an enqueue can only be released by the session holding
+    // it — a later bw_unlock or bw_activate could never clear this one.
+    await client.unlock('trfn', transformationName).catch(() => {/* best effort */});
 
     return JSON.stringify({
       success: true,
@@ -1328,7 +1336,7 @@ export async function bwUpdateTransformation(
         `InfoObject ${tgtUpper} in transformation ${transformationName.toUpperCase()} ` +
         `converted to StepFormula. Call bw_activate to activate.`,
       formula,
-      lock_handle: lockHandle,
+      lock_handle: '',
       transformation_name: transformationName.toUpperCase(),
       object_type: 'trfn',
       converted_from: ruleInfo.stepType,
@@ -1370,6 +1378,10 @@ export async function bwUpdateTransformation(
       await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
       throw err;
     }
+    // Release inside this call. Every tool call runs in its own session (stdio builds a
+    // fresh client per call), and an enqueue can only be released by the session holding
+    // it — a later bw_unlock or bw_activate could never clear this one.
+    await client.unlock('trfn', transformationName).catch(() => {/* best effort */});
 
     return JSON.stringify({
       success: true,
@@ -1377,7 +1389,7 @@ export async function bwUpdateTransformation(
         `InfoObject ${tgtUpper} in transformation ${transformationName.toUpperCase()} ` +
         `converted to StepConstant with value "${writtenValue}". Call bw_activate to activate.`,
       constant_value: writtenValue,
-      lock_handle: lockHandle,
+      lock_handle: '',
       transformation_name: transformationName.toUpperCase(),
       object_type: 'trfn',
       converted_from: ruleInfo.stepType,
@@ -1432,6 +1444,10 @@ export async function bwUpdateTransformation(
       await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
       throw err;
     }
+    // Release inside this call. Every tool call runs in its own session (stdio builds a
+    // fresh client per call), and an enqueue can only be released by the session holding
+    // it — a later bw_unlock or bw_activate could never clear this one.
+    await client.unlock('trfn', transformationName).catch(() => {/* best effort */});
 
     return JSON.stringify({
       success: true,
@@ -1440,7 +1456,7 @@ export async function bwUpdateTransformation(
         `converted to StepRead (Lookup) from ${lookupObjectType.toUpperCase()} ${lookupObject.toUpperCase()}. Call bw_activate to activate.`,
       lookup_object: lookupObject.toUpperCase(),
       lookup_object_type: lookupObjectType.toUpperCase(),
-      lock_handle: lockHandle,
+      lock_handle: '',
       transformation_name: transformationName.toUpperCase(),
       object_type: 'trfn',
       converted_from: ruleInfo.stepType,
@@ -1479,12 +1495,16 @@ export async function bwUpdateTransformation(
       await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
       throw err;
     }
+    // Release inside this call. Every tool call runs in its own session (stdio builds a
+    // fresh client per call), and an enqueue can only be released by the session holding
+    // it — a later bw_unlock or bw_activate could never clear this one.
+    await client.unlock('trfn', transformationName).catch(() => {/* best effort */});
     return JSON.stringify({
       success: true,
       message:
         `InfoObject ${tgtUpper} in transformation ${transformationName.toUpperCase()} ` +
         `reverted to StepNoUpdate (no mapping). Call bw_activate to activate.`,
-      lock_handle: lockHandle,
+      lock_handle: '',
       transformation_name: transformationName.toUpperCase(),
       object_type: 'trfn',
       converted_from: ruleInfo.stepType,
@@ -1566,6 +1586,10 @@ export async function bwUpdateTransformation(
       await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
       throw err;
     }
+    // Release inside this call. Every tool call runs in its own session (stdio builds a
+    // fresh client per call), and an enqueue can only be released by the session holding
+    // it — a later bw_unlock or bw_activate could never clear this one.
+    await client.unlock('trfn', transformationName).catch(() => {/* best effort */});
 
     return JSON.stringify({
       success: true,
@@ -1575,7 +1599,7 @@ export async function bwUpdateTransformation(
         `transformation ${transformationName.toUpperCase()}. Call bw_activate to activate.`,
       key_figure: tgtUpper,
       unit_currency_field: unitTgtField,
-      lock_handle: lockHandle,
+      lock_handle: '',
       transformation_name: transformationName.toUpperCase(),
       object_type: 'trfn',
     });
@@ -1659,13 +1683,15 @@ export async function bwUpdateTransformation(
     await client.unlock('trfn', transformationName).catch(() => {/* ignore unlock error */});
     throw err;
   }
+  // Release inside this call — see the identical note on the other update paths.
+  await client.unlock('trfn', transformationName).catch(() => {/* best effort */});
 
   return JSON.stringify({
     success: true,
     message:
       `Source field ${srcUpper} mapped to target ${tgtUpper} in ` +
       `transformation ${transformationName.toUpperCase()}. Call bw_activate to activate.`,
-    lock_handle: lockHandle,
+    lock_handle: '',
     transformation_name: transformationName.toUpperCase(),
     object_type: 'trfn',
   });
