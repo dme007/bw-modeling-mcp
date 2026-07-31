@@ -119,10 +119,8 @@ export async function bwCreateTransformation(
 
   // Step 3: POST minimal XML (manually constructed — see payloads/trfn_create.md)
   // adtcore:createdAt / createdBy and the packageRef are what an Eclipse BWMT create sends
-  // (verified against an HTTP trace of the BW wizard). Without the packageRef the model has
-  // no package assigned, and the backend's HANA-executability check dumps on a NULL version
-  // reference (OBJECTS_OBJREF_NOT_ASSIGNED in CL_RSTRAN_TRFN=>GET_PROGID). Eclipse sends the
-  // creation date at midnight UTC, not the current time.
+  // (verified against an HTTP trace of the BW wizard). Eclipse sends the creation date at
+  // midnight UTC, not the current time.
   const createdAt = new Date().toISOString().slice(0, 10) + 'T00:00:00Z';
   const packageUri = `/sap/bc/adt/packages/${encodeURIComponent(pkg.toLowerCase())}`;
 
@@ -189,12 +187,19 @@ export async function bwCreateTransformation(
     process.stderr.write(`Warning: CTS transport check for trfn/${trfnLower} failed: ${ctsErr}\n`);
   }
 
-  // The POST must run in the SAME session that holds the lock. A lock handle obtained in
-  // session A is rejected in session B with HTTP 423 / ExceptionResourceInvalidLockHandle,
-  // surfaced in German as "Sperr-Handle für Objekt TRFN … konnte nicht angelegt werden" —
-  // which reads as if the LOCK had failed, when in fact the lock is fine and only the
-  // handle is not valid over there.
-  await client.postWithCsrf(
+  // The POST must run in a DIFFERENT session than the lock — the same split Eclipse uses.
+  // The lock handle is not session-bound: the backend validates it by re-reading the enqueue
+  // (ENQUEUE_READ in CL_ADT_ENQUEUE=>READ, existence only) and hashing the entry's identity,
+  // so any session may present it as long as the enqueue is still alive (which the stateful
+  // lock above guarantees). Running the POST inside the lock session instead hits that
+  // session's roll area, where CL_RSTRAN_TRFN's class-static buffer P_TH_TRAN still holds
+  // the source-/target-less "prepare only" instance the lock handler created — the factory
+  // returns it unchecked, version creation fails, and the save dumps with
+  // OBJECTS_OBJREF_NOT_ASSIGNED in CL_RSTRAN_TRFN=>GET_PROGID. A fresh session gets a fresh
+  // roll area and builds the instance properly from the posted source/target.
+  const createClient = createClientFromEnv();
+  await createClient.getCsrfToken();
+  await createClient.postWithCsrf(
     createPath,
     postBody,
     trfnAccept(),
