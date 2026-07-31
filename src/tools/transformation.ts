@@ -95,13 +95,16 @@ export async function bwCreateTransformation(
   const masterSystem = new URL(process.env.BW_URL ?? 'http://localhost').hostname.split('.')[0].toUpperCase();
   const responsible  = (process.env.BW_USER ?? '').toUpperCase();
 
-  // Step 2: Lock with CREA — exact Eclipse header set, no SAP session headers
+  // Step 2: Lock with CREA. rawPost() wipes every axios default header, so the session
+  // type has to be passed explicitly — without it the request is stateless, and the
+  // stateful session the lock opens server-side cannot be reached again.
   const csrfToken = await client.getCsrfToken();
   const lockPath = `/sap/bw/modeling/trfn/${trfnLower}?action=lock`;
   const lockResponse = await client.rawPost(lockPath, '', {
     'activity_context': 'CREA',
     'Accept': trfnAccept(),
     'x-csrf-token': csrfToken,
+    'X-sap-adt-sessiontype': 'stateful',
   });
   const lockHandleMatch = lockResponse.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/);
   if (!lockHandleMatch) {
