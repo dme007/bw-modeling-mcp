@@ -309,11 +309,14 @@ export async function bwUpdateInfosource(
     await client.unlock('trcs', name).catch(() => {/* ignore */});
     throw err;
   }
+  // Release inside this call: every tool call runs in its own session and an enqueue
+  // can only be released by the session holding it (see BwClient.unlock).
+  await client.unlock('trcs', name).catch(() => {/* best effort */});
 
   return JSON.stringify({
     success: true,
     message: `InfoSource ${nameUpper} updated. Call bw_activate to activate.`,
-    lock_handle: lockHandle,
+    lock_handle: '',
     infosource_name: nameUpper,
     object_type: 'trcs',
   });

@@ -307,6 +307,12 @@ export async function bwGetDtp(client: BwClient, dtpName: string): Promise<strin
  */
 export async function bwUnlockDtp(client: BwClient, dtpName: string): Promise<void> {
   const dtpLower = dtpName.toLowerCase();
+
+  // Re-take the lock first — after a PUT the instance no longer carries the enqueue
+  // counter, and the dequeue only fires when the counter reaches 0. See BwClient.unlock()
+  // for the full mechanism. No-op when the counter is still intact.
+  await client.lock('dtpa', dtpLower).catch(() => {/* foreign lock — release anyway */});
+
   const csrf = await client.getCsrfToken();
   await client.rawPost(
     `/sap/bw/modeling/dtpa/${dtpLower}?action=unlock`,
@@ -674,8 +680,12 @@ export async function bwUpdateDtp(
   const dtpName  = args.dtp_name.toUpperCase();
   const dtpLower = args.dtp_name.toLowerCase();
 
-  // Lock (stateful_enqueue — same pattern as bwUpdateInfoObject)
-  const lockHandle = await client.lock('dtpa', dtpLower, {}, 'stateful_enqueue');
+  // Lock in a plain stateful session. NOT stateful_enqueue: the server ends such a session
+  // at request end (it sends the sap-contextid deletion right in the lock response), so the
+  // enqueue is already gone when the PUT below presents the handle — the PUT then fails with
+  // "423 / Sperr-Handle … konnte nicht angelegt werden" (i.e. no enqueue found). Measured
+  // 2026-07-31: bw_update_dtp was unusable for exactly this reason.
+  const lockHandle = await client.lock('dtpa', dtpLower);
 
   // The enqueue lock (SM12: RSBKDTP) must be released on success AND error;
   // bwActivate does not release it for dtpa, so it is freed in the finally block.

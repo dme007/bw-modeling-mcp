@@ -150,11 +150,14 @@ export async function bwUpdateAdsoSettings(
     await client.unlock('adso', adsoName).catch(() => {/* ignore */});
     throw err;
   }
+  // Release inside this call: every tool call runs in its own session and an enqueue
+  // can only be released by the session holding it (see BwClient.unlock).
+  await client.unlock('adso', adsoName).catch(() => {/* best effort */});
 
   return JSON.stringify({
     success: true,
     message: `aDSO ${adsoUpper} settings updated. Call bw_activate to activate.`,
-    lock_handle: lockHandle,
+    lock_handle: '',
     adso_name: adsoUpper,
     object_type: 'adso',
     applied: settings,
@@ -483,11 +486,14 @@ export async function bwUpdateAdsoManageKeys(
     await client.unlock('adso', adsoName).catch(() => {/* ignore */});
     throw err;
   }
+  // Release inside this call: every tool call runs in its own session and an enqueue
+  // can only be released by the session holding it (see BwClient.unlock).
+  await client.unlock('adso', adsoName).catch(() => {/* best effort */});
 
   return JSON.stringify({
     success: true,
     message: `aDSO ${adsoUpper} key fields updated. Call bw_activate to activate.`,
-    lock_handle: lockHandle,
+    lock_handle: '',
     adso_name: adsoUpper,
     object_type: 'adso',
     key_fields: normalized,
@@ -639,11 +645,14 @@ export async function bwUpdateAdsoFieldProperties(
     await client.unlock('adso', adsoName).catch(() => {/* ignore */});
     throw err;
   }
+  // Release inside this call: every tool call runs in its own session and an enqueue
+  // can only be released by the session holding it (see BwClient.unlock).
+  await client.unlock('adso', adsoName).catch(() => {/* best effort */});
 
   return JSON.stringify({
     success: true,
     message: `Field ${nameUpper} in aDSO ${adsoUpper} updated. Call bw_activate to activate.`,
-    lock_handle: lockHandle,
+    lock_handle: '',
     adso_name: adsoUpper,
     object_type: 'adso',
     field_name: nameUpper,
@@ -970,11 +979,14 @@ export async function bwUpdateAdsoAddPureField(
     await client.unlock('adso', adsoName).catch(() => {/* ignore */});
     throw err;
   }
+  // Release inside this call: every tool call runs in its own session and an enqueue
+  // can only be released by the session holding it (see BwClient.unlock).
+  await client.unlock('adso', adsoName).catch(() => {/* best effort */});
 
   const result: Record<string, unknown> = {
     success: true,
     message: `${processed.length} pure field(s) added to aDSO ${adsoUpper}. Call bw_activate to activate.`,
-    lock_handle: lockHandle,
+    lock_handle: '',
     adso_name: adsoUpper,
     object_type: 'adso',
     processed,
@@ -1076,12 +1088,15 @@ export async function bwUpdateAdso(
     await client.unlock('adso', adsoName).catch(() => {/* ignore unlock error */});
     throw err;
   }
+  // Release inside this call: every tool call runs in its own session and an enqueue
+  // can only be released by the session holding it (see BwClient.unlock).
+  await client.unlock('adso', adsoName).catch(() => {/* best effort */});
 
   const verb = action === 'remove_field' ? 'removed from' : 'added to';
   const result: Record<string, unknown> = {
     success: true,
     message: `${processed.join(', ')} ${verb} aDSO ${adsoUpper}. Call bw_activate to activate.`,
-    lock_handle: lockHandle,
+    lock_handle: '',
     adso_name: adsoUpper,
     object_type: 'adso',
     processed,
