@@ -307,12 +307,6 @@ export async function bwGetDtp(client: BwClient, dtpName: string): Promise<strin
  */
 export async function bwUnlockDtp(client: BwClient, dtpName: string): Promise<void> {
   const dtpLower = dtpName.toLowerCase();
-
-  // Re-take the lock first — after a PUT the instance no longer carries the enqueue
-  // counter, and the dequeue only fires when the counter reaches 0. See BwClient.unlock()
-  // for the full mechanism. No-op when the counter is still intact.
-  await client.lock('dtpa', dtpLower).catch(() => {/* foreign lock — release anyway */});
-
   const csrf = await client.getCsrfToken();
   await client.rawPost(
     `/sap/bw/modeling/dtpa/${dtpLower}?action=unlock`,

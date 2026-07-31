@@ -972,28 +972,15 @@ export class BwClient {
    * lock persists" behaviour. Verified in the ABAP debugger on 2026-07-31: same client +
    * `stateful` on both requests → `count = 1` → lock released.
    *
-   * Therefore: never route an unlock through a different client than its lock, and always
-   * declare the session type explicitly (the axios default is absent in cookie mode).
+   * A PUT in between does not affect this — measured: lock → PUT → unlock releases the
+   * enqueue as long as it all happens in one session.
+   *
+   * Therefore: never route an unlock through a different client than its lock, always
+   * release within the call that locked (each tool call builds its own client under stdio),
+   * and declare the session type explicitly (the axios default is absent in cookie mode).
    */
   async unlock(type: string, name: string): Promise<void> {
     if (NO_UNLOCK_TYPES.has(type.toLowerCase())) return;
-
-    // Re-take the lock before releasing it. This looks redundant but is what makes the
-    // release actually happen after a PUT: saving runs `prepare( i_with_enqueue = false )`,
-    // which leaves the instance without the enqueue counter, so the following DEQUEUE
-    // decrements 0 → -1 and never reaches its `IF count = 0` branch. Locking again gives
-    // the (fresh) instance `count = 1`, so the DEQUEUE lands on 0 and the function module
-    // fires. The backend hands back the *same* lock handle — the enqueue entry is not
-    // duplicated, it is the instance state that is restored. Measured on 2026-07-31:
-    // lock → PUT → unlock leaves the lock standing; lock → PUT → lock → unlock clears it.
-    //
-    // Harmless in the other cases: with the counter already at 1 the ENQUEUE method is a
-    // no-op (`IF p_s_enqueue-enqueued = rs_c_false`), and on an unlocked object the pair
-    // simply takes and drops the lock. A foreign lock makes this throw — then the plain
-    // release below still runs, which is the best we can do.
-    try {
-      await this.lock(type, name);
-    } catch { /* foreign lock or object not lockable — fall through to the release */ }
 
     await this.ensureCsrf();
     const mediaType = resolveMediaType(type);
