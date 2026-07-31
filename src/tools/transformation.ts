@@ -145,10 +145,12 @@ export async function bwCreateTransformation(
     : '';
   const createPath = `/sap/bw/modeling/trfn/${trfnLower}?lockHandle=${lockHandle}${copyParams}`;
 
-  // Session B: eigene Session + CSRF-Token, POST mit lockHandle aus Session A
-  const client2 = createClientFromEnv();
-  await client2.getCsrfToken();
-  await client2.postWithCsrf(
+  // The POST must run in the SAME session that holds the lock. A lock handle obtained in
+  // session A is rejected in session B with HTTP 423 / ExceptionResourceInvalidLockHandle,
+  // surfaced in German as "Sperr-Handle für Objekt TRFN … konnte nicht angelegt werden" —
+  // which reads as if the LOCK had failed, when in fact the lock is fine and only the
+  // handle is not valid over there.
+  await client.postWithCsrf(
     createPath,
     postBody,
     trfnAccept(),
