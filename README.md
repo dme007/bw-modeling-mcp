@@ -8,6 +8,8 @@ A Model Context Protocol (MCP) server that enables AI assistants like Claude to 
 
 ## ☁️ Running on SAP BTP Cloud Foundry
 
+![Central MCP server for AI-assisted SAP BW/4HANA modeling: MCP-capable AI clients connect via OAuth to bw-modeling-mcp with role-based access control, which reaches on-premise, private cloud and BW Bridge systems via principal propagation](docs/btp-hosting.png)
+
 Besides stdio, the server can run as an HTTP service on SAP BTP Cloud Foundry with XSUAA
 OAuth in front and a BTP destination behind — either a shared technical user
 (`BasicAuthentication`) or **principal propagation**, where each caller reaches BW as
@@ -21,13 +23,15 @@ stdio is unchanged — `npm start` behaves exactly as before.
 
 ---
 
-## 📖 Featured Blog Post
+## 📖 Featured Blog Posts
 
-**Agentic AI meets SAP BW** — the full story behind this project: why I built it, what's inside, what happens when Claude walks through a complete BW data lineage on its own.
+A two-part blog series about this project (both available in German and English):
 
-Read the blog (DE + EN): https://www.nextlytics.com/blog/agentic-ai-meets-sap-bw
+1. **Agentic AI meets SAP BW** — the full story behind this project: why I built it, what's inside, what happens when Claude walks through a complete BW data lineage on its own.
+   https://www.nextlytics.com/blog/agentic-ai-meets-sap-bw
 
-![Agentic AI meets SAP BW](docs/blog-cover.png)
+2. **Agentic AI in practice: MCP server for SAP BW/4HANA** — how the server is operated company-wide on SAP BTP Cloud Foundry with role-based access and per-user identity, plus two real customer projects.
+   https://www.nextlytics.com/blog/agentic-ai-in-practice-mcp-server-for-sap-bw/4hana
 
 ---
 
