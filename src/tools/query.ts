@@ -1,5 +1,5 @@
 import { XMLParser } from 'fast-xml-parser';
-import { BwClient, createClientFromEnv, MEDIA_TYPES } from '../bw-client.js';
+import { BwClient, createClientFromEnv, MEDIA_TYPES, resolveMasterSystem } from '../bw-client.js';
 
 // Fallback version range used when the discovery document does not advertise a
 // query media type. The exact query version depends on the BW backend SP level,
@@ -926,7 +926,7 @@ export async function bwCreateQuery(
   try {
     // Step 4: Build the create XML (see payloads/query_create.md).
     const language     = process.env.BW_LANGUAGE ?? 'DE';
-    const masterSystem = new URL(process.env.BW_URL ?? 'http://localhost').hostname.split('.')[0].toUpperCase();
+    const masterSystem = await resolveMasterSystem(client);
     const responsible  = (process.env.BW_USER ?? '').toUpperCase();
     const timestamp    = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     const descEsc      = escapeXml(description);
