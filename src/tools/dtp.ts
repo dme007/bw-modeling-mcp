@@ -315,6 +315,7 @@ export async function bwUnlockDtp(client: BwClient, dtpName: string): Promise<vo
       'Content-Type': MEDIA_TYPES['dtpa'],
       'Accept': MEDIA_TYPES['dtpa'],
       'x-csrf-token': csrf,
+      'X-sap-adt-sessiontype': 'stateful',
     }
   );
 }
@@ -420,6 +421,11 @@ export async function bwCreateDtp(
 
   // Step 1: Generate DTP name via POST generateDtpId — DTP name is in Location header
   const csrfToken = await client.getCsrfToken();
+  // All rawPost() calls in this flow must declare the session type explicitly:
+  // rawPost wipes every axios default header, and a stateless request arriving on
+  // the cookie jar of a stateful session makes the server tear that session down —
+  // the enqueue dies with it and the next call fails with "400 Session Timed Out
+  // or Not Found" (same defect class as the TRFN create lock, fixed 2026-07-31).
   const genResponse = await client.rawPost(
     '/sap/bw/modeling/dtpa/generateDtpId',
     '',
@@ -427,6 +433,7 @@ export async function bwCreateDtp(
       'Accept': MEDIA_TYPES['dtpa'],
       'Content-Type': MEDIA_TYPES['dtpa'],
       'x-csrf-token': csrfToken,
+      'X-sap-adt-sessiontype': 'stateful',
     }
   );
   const location = genResponse.headers['location'] ?? genResponse.headers['Location'] ?? '';
@@ -445,6 +452,7 @@ export async function bwCreateDtp(
       'activity_context': 'CREA',
       'Accept': MEDIA_TYPES['dtpa'],
       'x-csrf-token': csrfToken2,
+      'X-sap-adt-sessiontype': 'stateful',
     }
   );
   const lockHandle = lockResponse.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1] ?? '';
@@ -502,6 +510,7 @@ export async function bwCreateDtp(
         'Content-Type': MEDIA_TYPES['dtpa'],
         'Accept': MEDIA_TYPES['dtpa'],
         'x-csrf-token': csrfToken3,
+        'X-sap-adt-sessiontype': 'stateful',
       }
     );
 
@@ -514,6 +523,7 @@ export async function bwCreateDtp(
         {
           'Accept': MEDIA_TYPES['dtpa'],
           'x-csrf-token': descLockCsrf,
+          'X-sap-adt-sessiontype': 'stateful',
         }
       );
       const descLockHandle = descLockResponse.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1] ?? '';
@@ -557,6 +567,7 @@ export async function bwCreateDtp(
           'Content-Type': MEDIA_TYPES['dtpa'],
           'Accept': MEDIA_TYPES['dtpa'],
           'x-csrf-token': descUnlockCsrf,
+          'X-sap-adt-sessiontype': 'stateful',
         }
       );
     }
