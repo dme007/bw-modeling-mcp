@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead, resolveMasterSystem } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead, resolveMasterSystem, ECLIPSE_USER_AGENT, adtRequestId } from '../bw-client.js';
 import { parseInfoObjectProps } from './infoobject.js';
 import { parseActivationMessages, parseDtpsDeactivated, bwActivate } from './activation.js';
 
@@ -105,6 +105,11 @@ export async function bwCreateTransformation(
     'Accept': trfnAccept(),
     'x-csrf-token': csrfToken,
     'X-sap-adt-sessiontype': 'stateful',
+    // Eclipse sends these three on the lock as well; rawPost() wipes all defaults, so they
+    // have to be repeated here to match the traced wire format.
+    'User-Agent': ECLIPSE_USER_AGENT,
+    'sap-adt-request-id': adtRequestId(),
+    'X-sap-adt-profiling': 'server-time',
   });
   const lockHandleMatch = lockResponse.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/);
   if (!lockHandleMatch) {
@@ -113,6 +118,14 @@ export async function bwCreateTransformation(
   const lockHandle = lockHandleMatch[1];
 
   // Step 3: POST minimal XML (manually constructed — see payloads/trfn_create.md)
+  // adtcore:createdAt / createdBy and the packageRef are what an Eclipse BWMT create sends
+  // (verified against an HTTP trace of the BW wizard). Without the packageRef the model has
+  // no package assigned, and the backend's HANA-executability check dumps on a NULL version
+  // reference (OBJECTS_OBJREF_NOT_ASSIGNED in CL_RSTRAN_TRFN=>GET_PROGID). Eclipse sends the
+  // creation date at midnight UTC, not the current time.
+  const createdAt = new Date().toISOString().slice(0, 10) + 'T00:00:00Z';
+  const packageUri = `/sap/bc/adt/packages/${encodeURIComponent(pkg.toLowerCase())}`;
+
   const postBody = `<?xml version="1.0" encoding="UTF-8"?>
 <trfn:transformation
   xmlns:adtcore="http://www.sap.com/adt/core"
@@ -124,6 +137,8 @@ export async function bwCreateTransformation(
   name="${trfnName}"
   startRoutine="">
   <tlogoProperties
+    adtcore:createdAt="${createdAt}"
+    adtcore:createdBy="${responsible}"
     adtcore:language="${language}"
     adtcore:name="${trfnName}"
     adtcore:type="TRFN"
@@ -135,6 +150,7 @@ export async function bwCreateTransformation(
       href="/sap/bw/modeling/trfn/${trfnLower}/m"
       rel="self"
       type="application/vnd.sap-bw-modeling.trfn+xml"/>
+    <adtcore:packageRef adtcore:name="${pkg}" adtcore:type="DEVC/K" adtcore:uri="${packageUri}"/>
     <objectVersion>M</objectVersion>
     <objectStatus>inactive</objectStatus>
     <contentState>NEW</contentState>
@@ -147,6 +163,31 @@ export async function bwCreateTransformation(
     ? `&copyFromObjectName=${args.copy_from_transformation.toUpperCase()}&copyFromObjectType=TRFN`
     : '';
   const createPath = `/sap/bw/modeling/trfn/${trfnLower}?lockHandle=${lockHandle}${copyParams}`;
+
+  // Between lock and create, Eclipse announces the object to CTS
+  // (BwTransportService.ensureLockedOnTransport). Our flow skipped this entirely. Failures
+  // are non-fatal: on $TMP the check is a formality, and a hard error here would block a
+  // creation that might otherwise succeed.
+  const ctsBody = `<?xml version="1.0" encoding="UTF-8" ?><asx:abap version="1.0" xmlns:asx="http://www.sap.com/abapxml"><asx:values><DATA><PGMID></PGMID><OBJECT>TRFN</OBJECT><OBJECTNAME>${trfnName}</OBJECTNAME><DEVCLASS>${pkg}</DEVCLASS><SUPER_PACKAGE></SUPER_PACKAGE><RECORD_CHANGES></RECORD_CHANGES><OPERATION>I</OPERATION><URI>/sap/bw/modeling/trfn/${trfnLower}</URI></DATA></asx:values></asx:abap>`;
+  const ctsType = 'application/vnd.sap.as+xml; charset=UTF-8; dataname=com.sap.adt.transport.service.checkData';
+  //
+  // It must run in its OWN session. Eclipse sends it stateless from a separate session while
+  // the enqueue session stays untouched. Issued from the locking client it shares the cookie
+  // jar, arrives stateless, and tears down the very session that holds the lock — the POST
+  // then fails with "400 Session Timed Out or Not Found" (observed live).
+  try {
+    const ctsClient = createClientFromEnv();
+    await ctsClient.rawPost('/sap/bc/adt/cts/transportchecks', ctsBody, {
+      'Content-Type': ctsType,
+      'Accept': ctsType,
+      'x-csrf-token': await ctsClient.getCsrfToken(),
+      'User-Agent': ECLIPSE_USER_AGENT,
+      'sap-adt-request-id': adtRequestId(),
+      'X-sap-adt-profiling': 'server-time',
+    });
+  } catch (ctsErr) {
+    process.stderr.write(`Warning: CTS transport check for trfn/${trfnLower} failed: ${ctsErr}\n`);
+  }
 
   // The POST must run in the SAME session that holds the lock. A lock handle obtained in
   // session A is rejected in session B with HTTP 423 / ExceptionResourceInvalidLockHandle,
