@@ -44,6 +44,11 @@ export interface CreateTransformationArgs {
   // object type is IOBJ. Selects the InfoObject facet (text table, attributes, hierarchy).
   source_object_subtype?: string;
   target_object_subtype?: string;
+  // Transport request (corrNr) — required for transportable packages so the system
+  // records the object on the given request instead of silently creating its own.
+  transport?: string;
+  // Activate the transformation right after creation (bw_activate flow, fresh session).
+  activate?: boolean;
 }
 
 /**
@@ -53,6 +58,7 @@ export interface CreateTransformationArgs {
  * 1. GET 8TRANSIENT → server generates the Transformation name
  * 2. Lock (CREA)    → lockHandle
  * 3. POST minimal XML (manually constructed, per payloads/trfn_create.md)
+ * 4. Optional: activate (reuses the CREA lock handle; unlock happens there)
  *
  * Returns the generated Transformation name for use with bw_activate.
  */
@@ -160,7 +166,8 @@ export async function bwCreateTransformation(
   const copyParams = args.copy_from_transformation
     ? `&copyFromObjectName=${args.copy_from_transformation.toUpperCase()}&copyFromObjectType=TRFN`
     : '';
-  const createPath = `/sap/bw/modeling/trfn/${trfnLower}?lockHandle=${lockHandle}${copyParams}`;
+  const corrNrPrefix = args.transport ? `corrNr=${encodeURIComponent(args.transport)}&` : '';
+  const createPath = `/sap/bw/modeling/trfn/${trfnLower}?${corrNrPrefix}lockHandle=${lockHandle}${copyParams}`;
 
   // Between lock and create, Eclipse announces the object to CTS
   // (BwTransportService.ensureLockedOnTransport). Our flow skipped this entirely. Failures
@@ -218,7 +225,26 @@ export async function bwCreateTransformation(
     );
   }
 
-  // Step 5: Unlock (CREA lock is no longer needed after successful creation)
+  // Step 5a: Optional activation. bwActivate runs the activation in a fresh session
+  // (same roll-area reasoning as the create POST), passes corrNr, and releases the
+  // CREA lock through the lock-holding client — so no separate unlock here.
+  if (args.activate) {
+    const activationResult = JSON.parse(await bwActivate(client, 'trfn', trfnLower, lockHandle, args.transport));
+    return JSON.stringify({
+      success: activationResult.success === true,
+      transformation_name: trfnName,
+      source: { type: srcType, name: srcName },
+      target: { type: tgtType, name: tgtName },
+      package: pkg,
+      ...(args.transport ? { transport: args.transport } : {}),
+      activation: activationResult,
+      message: activationResult.success === true
+        ? `Transformation '${trfnName}' created and activated.`
+        : `Transformation '${trfnName}' created inactive, but activation reported errors — see activation.messages.`,
+    });
+  }
+
+  // Step 5b: Unlock (CREA lock is no longer needed after successful creation)
   try {
     await client.unlock('trfn', trfnLower);
   } catch (unlockErr) {
@@ -231,6 +257,7 @@ export async function bwCreateTransformation(
     source: { type: srcType, name: srcName },
     target: { type: tgtType, name: tgtName },
     package: pkg,
+    ...(args.transport ? { transport: args.transport } : {}),
     message: `Transformation '${trfnName}' created inactive. Call bw_activate with object_type "trfn" to activate.`,
   });
 }
