@@ -979,6 +979,16 @@ export class BwClient {
     if (response.status >= 400) {
       throw new Error(`UNLOCK ${type.toUpperCase()} ${name} → HTTP ${response.status}\n${response.data}`);
     }
+
+    // The action=unlock request alone does NOT reliably release the enqueue on this
+    // landscape ("bw_unlock reports success but the lock persists", verified repeatedly).
+    // What DOES reliably release it (measured live 2026-07-31): a STATELESS request on the
+    // same cookie jar makes the server tear the stateful session down, and the session's
+    // enqueues die with it. unlock() is always the terminal call of a modeling cycle, so
+    // sacrificing the session here is free — the next call simply opens a fresh one.
+    try {
+      await this.rawGet('/sap/bw/modeling/repo/is/systeminfo', { Accept: 'application/xml' });
+    } catch { /* best effort — the unlock above already succeeded */ }
   }
 }
 

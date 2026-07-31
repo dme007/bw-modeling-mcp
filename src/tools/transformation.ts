@@ -723,9 +723,12 @@ function buildNoUpdateToFormulaRule(
   sourceFields: Array<{ name: string; dataType: string; length: string; elementXml: string }>,
   formula: string,
 ): string {
-  const stepMatch = ruleXml.match(/<step\b[^>]*>([\s\S]*?)<\/step>/);
-  if (!stepMatch) throw new Error('Cannot parse step from StepNoUpdate rule');
-  const stepOutputBlock = stepMatch[1].trim();
+  // Take ONLY the <output> block from the old step. For a StepNoUpdate rule that is the
+  // whole step body; for StepDirect/StepFormula rules the body also contains <input>
+  // blocks of the OLD source fields, which must not survive the rebuild.
+  const stepOutputMatch = ruleXml.match(/<output\b[^>]*\bid="[^"]*"[\s\S]*?<\/output>/);
+  if (!stepOutputMatch) throw new Error('Cannot parse step output block from rule');
+  const stepOutputBlock = stepOutputMatch[0].trim();
 
   const tgt = targetInfoObject.toUpperCase();
   const g = groupId;
@@ -1270,15 +1273,11 @@ export async function bwUpdateTransformation(
     }
 
     let newRule: string;
-    if (ruleInfo.stepType === 'NO_UPDATE') {
-      if (!srcUpper) {
-        return JSON.stringify({
-          success: false,
-          message:
-            `source_field is required when converting a StepNoUpdate rule to StepFormula ` +
-            `(target InfoObject ${tgtUpper} has no source mapping yet).`,
-        });
-      }
+    if (srcUpper) {
+      // Explicit source field(s) given: rebuild the rule from scratch with exactly these
+      // inputs, regardless of the current step type. This is the only way to change the
+      // source of an existing StepDirect/StepFormula rule (the convert path below keeps
+      // the old inputs, and a formula referencing a non-input field fails activation).
       const allSourceFields = [srcUpper, ...(additionalSourceFields ?? []).map(f => f.toUpperCase())];
       const srcFieldDefs = allSourceFields.map(f => {
         const props = extractSourceFieldProps(originalXml, f);
@@ -1292,8 +1291,16 @@ export async function bwUpdateTransformation(
         srcFieldDefs,
         formula,
       );
+    } else if (ruleInfo.stepType === 'NO_UPDATE') {
+      return JSON.stringify({
+        success: false,
+        message:
+          `source_field is required when converting a StepNoUpdate rule to StepFormula ` +
+          `(target InfoObject ${tgtUpper} has no source mapping yet).`,
+      });
     } else {
-      // StepDirect or StepInitial — source already mapped, just convert the step type
+      // StepDirect or StepInitial without explicit source — source already mapped,
+      // just convert the step type and keep the existing input.
       newRule = convertDirectOrInitialRuleToFormula(ruleInfo.oldRuleXml, formula);
     }
 

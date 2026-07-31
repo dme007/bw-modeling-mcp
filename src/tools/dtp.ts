@@ -318,6 +318,12 @@ export async function bwUnlockDtp(client: BwClient, dtpName: string): Promise<vo
       'X-sap-adt-sessiontype': 'stateful',
     }
   );
+  // Guaranteed enqueue release: tear the stateful session down with a stateless request
+  // on the same jar — its enqueues die with it (same mechanism as BwClient.unlock()).
+  // bwUnlockDtp is only called at the end of a create flow, so the session is expendable.
+  try {
+    await client.rawGet('/sap/bw/modeling/repo/is/systeminfo', { Accept: 'application/xml' });
+  } catch { /* best effort */ }
 }
 
 // ── bwCreateDtp ───────────────────────────────────────────────────────────────
