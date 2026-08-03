@@ -343,3 +343,451 @@ export async function bwCreateCompositeProvider(
     view_type: viewType,
   });
 }
+
+// ── bw_update_composite_provider: inputs and their field mappings ────────────
+
+const IPROV_ACCEPT = [
+  'application/vnd.sap.bw.modeling.iprov-v1_0_0+xml',
+  'application/vnd.sap.bw.modeling.iprov-v1_4_0+xml',
+  'application/vnd.sap.bw.modeling.iprov-v1_7_0+xml',
+  'application/vnd.sap.bw.modeling.iprov-v1_8_0+xml',
+  'application/vnd.sap.bw.modeling.iprov-v1_9_0+xml',
+  'application/vnd.sap.bw.modeling.iprov-v1_10_0+xml',
+  'application/vnd.sap.bw.modeling.iprov-v1_11_0+xml',
+  'application/vnd.sap.bw.modeling.iprov-v1_12_0+xml',
+  'application/vnd.sap.bw.modeling.iprov-v1_13_0+xml',
+  'application/vnd.sap.bw.modeling.iprov-v1_14_0+xml',
+  'application/vnd.sap.bw.modeling.iprov-v9_99_9+xml',
+].join(',');
+
+const HCPR_PATH = (name: string) => `/sap/bw/modeling/hcpr/${name.toLowerCase()}/m`;
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Adds an xmlns declaration to the root tag if it is not there yet. */
+function ensureNamespace(xml: string, prefix: string, uri: string): string {
+  if (new RegExp(`xmlns:${prefix}=`).test(xml)) return xml;
+  return xml.replace(/(<Composite:compositeView\b)/, `$1 xmlns:${prefix}="${uri}"`);
+}
+
+/** Insert before the earliest of the given anchors, falling back to before the closing tag. */
+function injectBeforeAnchor(xml: string, insertXml: string, anchors: string[], fallbackClose: string): string {
+  const positions = anchors.map((a) => xml.indexOf(a)).filter((i) => i !== -1);
+  if (positions.length > 0) {
+    const idx = Math.min(...positions);
+    return xml.substring(0, idx) + insertXml + '\n  ' + xml.substring(idx);
+  }
+  return xml.replace(fallbackClose, insertXml + '\n' + fallbackClose);
+}
+
+function getViewNodeName(xml: string): string {
+  return xml.match(/<viewNode\b[^>]*\bname="([^"]*)"/)?.[1] ?? '';
+}
+
+/**
+ * Expand a self-closing view node into an open/close pair.
+ *
+ * A node without inputs comes back as `<viewNode …/>`, and inserting into it silently does
+ * nothing: there is no anchor and no closing tag to fall back to, so the PUT goes out
+ * unchanged and still reports success.
+ */
+function openViewNode(xml: string): string {
+  return xml.replace(/(<viewNode\b[^>]*?)\s*\/>/, '$1></viewNode>');
+}
+
+function getViewNodeType(xml: string): 'Join' | 'Union' | undefined {
+  const local = xml.match(/<viewNode\b[^>]*\bxsi:type="([^"]*)"/)?.[1]?.split(':').pop();
+  return local === 'JoinNode' ? 'Join' : local === 'Union' ? 'Union' : undefined;
+}
+
+export interface FieldMapping {
+  /** Element name in the CompositeProvider, existing or to be created. */
+  target: string;
+  /** Bare field name on the source, before its generated prefix. Defaults to `target`. */
+  source?: string;
+  /** Mutually exclusive with `source`. */
+  constantValue?: string;
+  /** Binds a newly created target element to an InfoObject instead of leaving it field-based. */
+  infoObjectName?: string;
+}
+
+export interface SourceFieldMeta {
+  /** Name the mapping has to address, prefixed on a field-based source. */
+  sourceName: string;
+  defaultTargetName: string;
+  label: string;
+  inlineTypeXml: string;
+  dataType: string;
+  isKeyFigure: boolean;
+  aggregationBehavior: string;
+  conversionRoutine?: string;
+  fixedUnit?: string;
+  unitCurrencyRefBareName?: string;
+  outputLength: number;
+  /** Set when the source models this field through an InfoObject rather than a plain field. */
+  infoObjectName?: string;
+  conversionType?: string;
+}
+
+// Pure CUKY/UNIT fields are bound to the standard currency/unit characteristics at
+// CompositeProvider level even when the source itself carries no InfoObject.
+const AUTO_IOBJ_FOR_TYPE: Record<string, string> = { CUKY: '0CURRENCY', UNIT: '0UNIT' };
+
+/**
+ * Record-count fields are left out of auto-mapping. BW maintains the row count itself as an
+ * internal attribute of the generated column view, and mapping it as an ordinary element
+ * makes activation fail on that view with "__numoffacttablerows is missing". An explicit
+ * mapping still passes through, so the caller can override this.
+ */
+const AUTO_MAP_EXCLUDED = new Set(['1ROWCOUNT']);
+
+// <semantics> is derived from the field's data type and appears only on the CP-level element.
+const SEMANTICS_TAG: Record<string, string> = {
+  INT1: 'INT', INT2: 'INT', INT4: 'INT', INT8: 'INT',
+  FLTP: 'NUM', DEC: 'NUM', CURR: 'AMO', QUAN: 'QUA',
+};
+
+/**
+ * Read the InfoProvider-as-composite-input view of a source provider.
+ *
+ * This is the only way to learn the generated field-name prefix: it cannot be derived
+ * client-side, and every mapping has to address source fields by their prefixed name.
+ */
+export async function fetchCompositeSourceFields(
+  providerName: string
+): Promise<{ fieldNamePrefix: string; lastModified?: string; fields: SourceFieldMeta[] }> {
+  const path = `/sap/bw/modeling/infoprov/${providerName.toUpperCase()}/a?view=dt`;
+  const xml = (await freshRead(path, IPROV_ACCEPT)).body;
+
+  const fieldNamePrefix = xml.match(/\bfieldNamePrefix="([^"]*)"/)?.[1] ?? '';
+  const lastModified = xml.match(/<tlogoProperties\b[^>]*\badtcore:changedAt="([^"]*)"/)?.[1];
+
+  const fields: SourceFieldMeta[] = [];
+  if (fieldNamePrefix) {
+    const elemRegex = /<element\b([\s\S]*?)(?:\/>|>([\s\S]*?)<\/element>)/g;
+    let em: RegExpExecArray | null;
+    while ((em = elemRegex.exec(xml)) !== null) {
+      const elemAttrs = em[1];
+      const body = em[2] ?? '';
+      const name = attr(elemAttrs, 'name');
+      const dimension = attr(elemAttrs, 'dimension');
+      const sourceInfoObject = attr(elemAttrs, 'infoObjectName');
+      // Two source shapes. A field-based provider names its fields "<prefix>-<FIELD>" and
+      // marks them with a dimension; an InfoObject-based one names them after the
+      // InfoObject and carries no dimension. Everything else — navigation attributes, and
+      // fields whose name was too long and got hashed into "<prefix>-<hash>" — is not
+      // addressable as an input field.
+      const fieldBased = Boolean(dimension) && name.startsWith(`${fieldNamePrefix}-`);
+      const infoObjectBased = !dimension && Boolean(sourceInfoObject) && name === sourceInfoObject;
+      if (!name || (!fieldBased && !infoObjectBased)) continue;
+
+      const inlineTypeXml = body.match(/<inlineType\b[^>]*\/>/)?.[0] ?? '';
+      const unitCurrencyRaw = body.match(/<unitCurrencyElement>([^<]*)<\/unitCurrencyElement>/)?.[1];
+      const refPrefix = `#///${fieldNamePrefix}-`;
+      const outputLengthRaw = attr(elemAttrs, 'outputLength');
+
+      fields.push({
+        sourceName: name,
+        defaultTargetName: fieldBased ? name.slice(fieldNamePrefix.length + 1) : name,
+        infoObjectName: infoObjectBased ? sourceInfoObject : undefined,
+        conversionType: attr(elemAttrs, 'conversionType') || undefined,
+        label: decodeXmlEntities(body.match(/<endUserTexts label="([^"]*)"/)?.[1] ?? ''),
+        inlineTypeXml,
+        dataType: attr(inlineTypeXml, 'name'),
+        isKeyFigure: /LocalKeyfigureProperties/.test(body),
+        aggregationBehavior: attr(elemAttrs, 'aggregationBehavior') || 'NONE',
+        conversionRoutine: attr(elemAttrs, 'conversionRoutine') || undefined,
+        fixedUnit: body.match(/<fixedUnit>([^<]*)<\/fixedUnit>/)?.[1],
+        unitCurrencyRefBareName: unitCurrencyRaw?.startsWith(refPrefix)
+          ? unitCurrencyRaw.slice(refPrefix.length)
+          : undefined,
+        outputLength: outputLengthRaw ? parseInt(outputLengthRaw, 10) : 0,
+      });
+    }
+  }
+
+  return { fieldNamePrefix, lastModified, fields };
+}
+
+/** Build the target element block for a field that the CompositeProvider does not have yet. */
+function buildTargetElementXml(
+  field: SourceFieldMeta,
+  targetName: string,
+  nodeName: string,
+  resolveUnitCurrencyTarget: (bareSourceName: string) => string | undefined,
+  infoObjectNameOverride?: string
+): string {
+  // A field the source models through an InfoObject is rebuilt in the shape an active
+  // CompositeProvider uses for it: no dimension, the label in endUserTexts, and the
+  // association back to the InfoObject. See payloads/hcpr_add_input_infoobject_based.md.
+  if (field.infoObjectName) {
+    const iobjAttrs = [
+      `name="${targetName}"`,
+      ...(field.isKeyFigure ? [`aggregationBehavior="${field.aggregationBehavior}"`] : []),
+      `infoObjectName="${field.infoObjectName}"`,
+      ...(field.conversionRoutine ? [`conversionRoutine="${field.conversionRoutine}"`] : []),
+      ...(field.conversionType ? [`conversionType="${field.conversionType}"`] : []),
+      ...(field.outputLength ? [`outputLength="${field.outputLength}"`] : []),
+    ].join(' ');
+    const iobjLines = [`  <element xsi:type="BwCore:BwElement" ${iobjAttrs}>`];
+    iobjLines.push(`    <endUserTexts label="${escapeXmlAttr(field.label)}"/>`);
+    if (field.inlineTypeXml) iobjLines.push(`    ${field.inlineTypeXml}`);
+    if (field.isKeyFigure) {
+      iobjLines.push(`    <localProperties xsi:type="BwCore:LocalKeyfigureProperties"/>`);
+      const semantics = SEMANTICS_TAG[field.dataType];
+      if (semantics) iobjLines.push(`    <semantics>${semantics}</semantics>`);
+    } else {
+      iobjLines.push(`    <localProperties xsi:type="BwCore:LocalCharacteristicProperties">`);
+      iobjLines.push(`      <authorizationRelevant>N</authorizationRelevant>`);
+      iobjLines.push(`    </localProperties>`);
+    }
+    iobjLines.push(`    <associationType>1</associationType>`);
+    iobjLines.push(`  </element>`);
+    return iobjLines.join('\n');
+  }
+
+  const infoObjectName = infoObjectNameOverride ?? AUTO_IOBJ_FOR_TYPE[field.dataType];
+  const attrs = [
+    `name="${targetName}"`,
+    `aggregationBehavior="${field.aggregationBehavior}"`,
+    ...(infoObjectName ? [`infoObjectName="${infoObjectName}"`] : []),
+    ...(field.conversionRoutine ? [`conversionRoutine="${field.conversionRoutine}"`] : []),
+    `dimension="#///GROUP1§"`,
+    `outputLength="${field.outputLength}"`,
+  ].join(' ');
+
+  const label = escapeXmlAttr(field.label);
+  const lines: string[] = [`  <element xsi:type="BwCore:BwElement" ${attrs}>`];
+  if (field.inlineTypeXml) lines.push(`    ${field.inlineTypeXml}`);
+  if (field.fixedUnit) lines.push(`    <fixedUnit>${field.fixedUnit}</fixedUnit>`);
+  if (field.unitCurrencyRefBareName) {
+    const refTarget = resolveUnitCurrencyTarget(field.unitCurrencyRefBareName) ?? field.unitCurrencyRefBareName;
+    lines.push(`    <unitCurrencyElement>#///${nodeName}/${refTarget}</unitCurrencyElement>`);
+  }
+  if (field.isKeyFigure) {
+    lines.push(`    <localProperties xsi:type="BwCore:LocalKeyfigureProperties">`);
+    lines.push(`      <descriptions label="${label}"/>`);
+    lines.push(`    </localProperties>`);
+    const semantics = SEMANTICS_TAG[field.dataType];
+    if (semantics) lines.push(`    <semantics>${semantics}</semantics>`);
+  } else {
+    lines.push(`    <localProperties xsi:type="BwCore:LocalCharacteristicProperties">`);
+    lines.push(`      <descriptions label="${label}"/>`);
+    lines.push(`      <referentialIntegrity>false</referentialIntegrity>`);
+    lines.push(`      <authorizationRelevant>N</authorizationRelevant>`);
+    lines.push(`    </localProperties>`);
+    if (infoObjectName) lines.push(`    <associationType>1</associationType>`);
+  }
+  lines.push(`  </element>`);
+  return lines.join('\n');
+}
+
+function buildTypeMappingXml(targetName: string, sourceName: string): string {
+  return `    <mapping xsi:type="Type:ElementMapping" targetName="${targetName}" sourceName="${sourceName}"/>`;
+}
+
+// Not covered by a captured request; kept in the same shape as the confirmed element mapping.
+function buildConstantMappingXml(targetName: string, value: string): string {
+  return `    <mapping xsi:type="Type:ConstantElementMapping" targetName="${targetName}" value="${escapeXmlAttr(value)}"/>`;
+}
+
+/**
+ * Resolve a mapping list against the source's field metadata: build the mapping elements
+ * and, for every target the CompositeProvider does not have yet, its element block.
+ */
+function resolveMappings(
+  mappings: FieldMapping[],
+  fields: SourceFieldMeta[],
+  providerName: string,
+  nodeName: string,
+  existingXml: string
+): { mappingsXml: string[]; newElementsXml: string[] } {
+  const byBareName = new Map(fields.map((f) => [f.defaultTargetName, f]));
+
+  // Resolve target names up front so a unit or currency reference can point at a sibling
+  // field of the same batch before that field's element block exists.
+  const targetNameByBareSource = new Map<string, string>();
+  for (const m of mappings) {
+    if (m.constantValue === undefined) {
+      targetNameByBareSource.set((m.source ?? m.target).trim().toUpperCase(), m.target.trim().toUpperCase());
+    }
+  }
+
+  const mappingsXml: string[] = [];
+  const newElementsXml: string[] = [];
+  for (const m of mappings) {
+    const target = m.target.trim().toUpperCase();
+    if (m.constantValue !== undefined) {
+      mappingsXml.push(buildConstantMappingXml(target, m.constantValue));
+      continue;
+    }
+    const bareSource = (m.source ?? m.target).trim().toUpperCase();
+    const field = byBareName.get(bareSource);
+    if (!field) {
+      throw new Error(
+        `Source field ${bareSource} not found on InfoProvider ${providerName.toUpperCase()} ` +
+        `(available: ${fields.map((f) => f.defaultTargetName).join(', ')}).`
+      );
+    }
+    mappingsXml.push(buildTypeMappingXml(target, field.sourceName));
+    if (!new RegExp(`<element\\b[^>]*\\bname="${escapeRegex(target)}"`).test(existingXml)) {
+      newElementsXml.push(
+        buildTargetElementXml(field, target, nodeName, (bare) => targetNameByBareSource.get(bare), m.infoObjectName)
+      );
+    }
+  }
+  return { mappingsXml, newElementsXml };
+}
+
+function dedupeTargetName(desired: string, existingXml: string, usedInBatch: Set<string>): string {
+  const exists = (name: string) =>
+    usedInBatch.has(name) || new RegExp(`<element\\b[^>]*\\bname="${escapeRegex(name)}"`).test(existingXml);
+  if (!exists(desired)) return desired;
+  let n = 0;
+  while (exists(`${desired}_${n}`)) n++;
+  return `${desired}_${n}`;
+}
+
+/**
+ * Auto-map every field of one input.
+ *
+ * Union and Join differ on purpose: a union stacks rows, so a same-named field from
+ * another input merges into the shared target column, while a join puts both side by side
+ * and a colliding name is suffixed instead.
+ */
+function buildAutoMappings(
+  fields: SourceFieldMeta[],
+  existingXml: string,
+  viewNodeType: 'Join' | 'Union' | undefined
+): FieldMapping[] {
+  const usedInBatch = new Set<string>();
+  return fields.filter((f) => !AUTO_MAP_EXCLUDED.has(f.defaultTargetName)).map((f) => {
+    const target =
+      viewNodeType === 'Union'
+        ? dedupeTargetName(f.defaultTargetName, '', usedInBatch)
+        : dedupeTargetName(f.defaultTargetName, existingXml, usedInBatch);
+    usedInBatch.add(target);
+    return { target, source: f.defaultTargetName };
+  });
+}
+
+/** Next free alias for a view node and provider type, continuing BW's own numbering. */
+function nextInputAlias(xml: string, nodeName: string, providerType: string): string {
+  const type = providerType.trim().toUpperCase();
+  const re = new RegExp(`alias="${escapeRegex(nodeName)}\\.${escapeRegex(type)}\\.(\\d+)"`, 'g');
+  let max = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml)) !== null) max = Math.max(max, parseInt(m[1], 10));
+  return `${nodeName}.${type}.${max + 1}`;
+}
+
+export interface InputProviderDef {
+  providerName: string;
+  /** TLOGO-style suffix used in the generated alias, e.g. "ADSO". */
+  providerType: string;
+  /** Omit or pass an empty list to map every field of the source one to one. */
+  mappings?: FieldMapping[];
+}
+
+/**
+ * bw_update_composite_provider actions "add_input" and "remove_input".
+ *
+ * add_input reads the source's field metadata, attaches an entity-referenced input with
+ * its mappings, and creates the target elements that do not exist yet. The alias is
+ * generated to continue BW's own numbering; later calls address the input by that alias.
+ * remove_input strips the input block; references to it in a join must be updated
+ * separately. Returns the lock handle so the caller can activate afterwards.
+ */
+export async function bwUpdateCompositeProviderInput(
+  client: BwClient,
+  compositeProviderName: string,
+  action: 'add_input' | 'remove_input',
+  opts: { input?: InputProviderDef; inputAlias?: string; transport?: string } = {}
+): Promise<string> {
+  const { input, inputAlias, transport } = opts;
+  const cpUpper = compositeProviderName.toUpperCase();
+  const cpResult = await freshRead(HCPR_PATH(compositeProviderName), HCPR_ACCEPT);
+  const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
+  let xml = cpResult.body;
+
+  let message: string;
+  let resultAlias: string | undefined;
+
+  if (action === 'remove_input') {
+    const alias = (inputAlias ?? '').trim();
+    if (!alias) throw new Error('remove_input requires inputAlias.');
+    const inputRegex = new RegExp(
+      `[ \\t]*<input\\b[^>]*\\balias="${escapeRegex(alias)}"[^>]*>[\\s\\S]*?<\\/input>\\n?`
+    );
+    if (!inputRegex.test(xml)) {
+      return JSON.stringify({
+        success: false,
+        message: `Input ${alias} not found in CompositeProvider ${cpUpper}. No changes made.`,
+      });
+    }
+    xml = xml.replace(inputRegex, '');
+    message =
+      `Input ${alias} removed from CompositeProvider ${cpUpper}. Join references to it must be ` +
+      `updated separately. Call bw_activate to activate.`;
+  } else {
+    if (!input) throw new Error('add_input requires an input definition.');
+
+    const nodeName = getViewNodeName(xml);
+    if (!nodeName) throw new Error(`Could not determine view node name for CompositeProvider ${cpUpper}.`);
+
+    const { fieldNamePrefix, lastModified, fields } = await fetchCompositeSourceFields(input.providerName);
+    if (!fieldNamePrefix) {
+      throw new Error(
+        `Could not determine the field name prefix for source InfoProvider ` +
+        `${input.providerName.toUpperCase()}; it reports no fieldNamePrefix.`
+      );
+    }
+
+    const requested: FieldMapping[] =
+      input.mappings && input.mappings.length > 0
+        ? input.mappings
+        : buildAutoMappings(fields, xml, getViewNodeType(xml));
+
+    const alias = nextInputAlias(xml, nodeName, input.providerType);
+    const { mappingsXml, newElementsXml } = resolveMappings(requested, fields, input.providerName, nodeName, xml);
+    xml = openViewNode(xml);
+
+    if (newElementsXml.length > 0) {
+      xml = injectBeforeAnchor(xml, newElementsXml.join('\n'), ['<input', '<join'], '</viewNode>');
+    }
+    xml = ensureNamespace(xml, 'BwCore', 'http://www.sap.com/bw/modeling/BwCore.ecore');
+    xml = ensureNamespace(xml, 'Type', 'http://www.sap.com/ndb/DataModelType.ecore');
+
+    const lastModifiedAttr = lastModified ? ` lastModified="${lastModified}"` : '';
+    const inputXml =
+      `  <input xsi:type="Composite:CompositeInput" alias="${alias}" selectAll="false"` +
+      ` hiddenNavigationAttributes="true" hiddenTemporalFields="false"${lastModifiedAttr}>\n` +
+      `    <entity>${buildEntityRef(input.providerName)}</entity>\n` +
+      `${mappingsXml.join('\n')}\n` +
+      `  </input>`;
+    xml = injectBeforeAnchor(xml, inputXml, ['<join'], '</viewNode>');
+    resultAlias = alias;
+    message =
+      `Input ${alias} (${input.providerName.toUpperCase()}) added to CompositeProvider ${cpUpper} ` +
+      `with ${mappingsXml.length} mapping(s). Call bw_activate to activate.`;
+  }
+
+  const lockHandle = await client.lock('hcpr', compositeProviderName);
+  try {
+    await client.put('hcpr', compositeProviderName, lockHandle, xml, timestamp, transport);
+  } catch (err) {
+    await client.unlock('hcpr', compositeProviderName).catch(() => {/* ignore */});
+    throw err;
+  }
+
+  return JSON.stringify({
+    success: true,
+    message,
+    lock_handle: lockHandle,
+    composite_provider_name: cpUpper,
+    object_type: 'hcpr',
+    ...(resultAlias ? { input_alias: resultAlias } : {}),
+  });
+}
