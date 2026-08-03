@@ -69,9 +69,16 @@ export async function bwGetCompositeProvider(
     const name = attr(elemAttrs, 'name');
     if (!name) continue;
     const infoObjectName = attr(elemAttrs, 'infoObjectName');
+    const elemBody = em[2] ?? '';
     const dimension = attr(elemAttrs, 'dimension');
     const dimName = dimension.match(/#\/\/\/([^§]*)§/)?.[1] ?? dimension;
-    const isKeyFigure = dimName.includes('__KEYFIGURES');
+    // The __KEYFIGURES dimension only exists in models that are modelled with dimensions;
+    // a plain Union node carries no dimension at all. The element body always says what
+    // the field is, so read that first and keep the dimension as a fallback.
+    const isKeyFigure =
+      /consumptionViewProperties\b[^>]*objectType="KYF"/.test(elemBody) ||
+      /<localProperties\b[^>]*LocalKeyfigureProperties/.test(elemBody) ||
+      dimName.includes('__KEYFIGURES');
     fields.push({
       name,
       ...(infoObjectName ? { info_object_name: infoObjectName } : {}),

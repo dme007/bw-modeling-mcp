@@ -71,6 +71,46 @@ export interface BwClientOptions {
   client?: string;
   language?: string;
   proxy?: BwProxyConfig;
+  /**
+   * Stable identity of the caller, used to scope the lock registry below. Set it wherever
+   * the credential itself is not stable per user — principal propagation hands out a fresh
+   * connectivity token per request, so without this every request would look like a
+   * different identity and no lock could ever be matched to its session.
+   */
+  identity?: string;
+}
+
+/**
+ * Sessions that hold a BW enqueue, keyed by identity and object.
+ *
+ * A BW lock belongs to the ABAP session that took it: `?action=unlock` from any other
+ * session answers HTTP 200 and releases nothing. Every MCP call builds its own client,
+ * so the session that locked in `bw_update_*` is already gone when `bw_activate` tries to
+ * unlock. The lock then survives until the ADT session times out, and the next write
+ * fails with "object is locked by <user>" until someone clears it in SM12.
+ *
+ * Remembering which client took the lock closes that gap: `unlock()` routes through that
+ * session, and `lock()` hands back the handle we already hold instead of failing. Entries
+ * are dropped once the lock is released.
+ */
+const lockSessions = new Map<string, { client: BwClient; handle: string }>();
+
+function lockKey(identity: string, type: string, name: string): string {
+  return `${identity}|${type.toLowerCase()}/${name.toLowerCase()}`;
+}
+
+/**
+ * Types whose lock this client does not release: DTPs go through the DTP framework's own
+ * unlock endpoint, so `unlock()` returns early for them. Registering them would leave an
+ * entry that nothing ever deletes, and a later 403 would then hand back a dead handle.
+ *
+ * The registry also cannot help when the registered session has died server-side: the
+ * unlock then opens a new session and BW answers 200 without releasing anything, exactly
+ * as before this registry existed. In practice a dying session releases its own enqueues,
+ * which is why the case that used to block agents is the live-but-unreachable session.
+ */
+function tracksLock(type: string): boolean {
+  return !NO_UNLOCK_TYPES.has(type.toLowerCase());
 }
 
 export class BwClient {
@@ -162,6 +202,26 @@ export class BwClient {
    */
   freshSession(): BwClient {
     return new BwClient(this.opts);
+  }
+
+  /**
+   * Who this client acts as. Two clients sharing it reach BW as the same user, which is
+   * what makes it safe to hand one client's lock to the other — and what keeps a
+   * multi-user deployment from ever touching someone else's session.
+   */
+  private identityKey(): string {
+    if (this.opts.identity) return `${this.opts.identity}@${this.opts.url}/${this.opts.client ?? ''}`;
+    const auth = this.opts.auth;
+    const who =
+      auth.kind === 'basic' ? `basic:${auth.user}`
+      : auth.kind === 'cookies' ? 'cookies'
+      : `pp:${auth.connectivityAuth}`;
+    return `${who}@${this.opts.url}/${this.opts.client ?? ''}`;
+  }
+
+  /** Same caller, so this client may act on the other one's lock. */
+  private sameIdentityAs(other: BwClient): boolean {
+    return other.identityKey() === this.identityKey();
   }
 
   /**
@@ -362,7 +422,13 @@ export class BwClient {
       }
     );
     this.updateCookies(response);
+    const key = lockKey(this.identityKey(), type, name);
     if (response.status >= 400) {
+      // 403 also means "you already hold this lock, in another session" — BW refuses even
+      // the same user from a new session. Reuse the handle we still know instead of making
+      // the caller wait for the ADT session to time out.
+      const held = tracksLock(type) ? lockSessions.get(key) : undefined;
+      if (response.status === 403 && held) return held.handle;
       throw new Error(`Lock ${type}/${name} → HTTP ${response.status}\n${response.data}`);
     }
     const body = response.data as string;
@@ -371,6 +437,7 @@ export class BwClient {
     if (!match) {
       throw new Error(`No <LOCK_HANDLE> in lock response body:\n${body}`);
     }
+    if (tracksLock(type)) lockSessions.set(key, { client: this, handle: match[1] });
     return match[1];
   }
 
@@ -468,7 +535,10 @@ export class BwClient {
       }
     );
     this.updateCookies(response);
+    const key = lockKey(this.identityKey(), type, name);
     if (response.status >= 400) {
+      const held = tracksLock(type) ? lockSessions.get(key) : undefined;
+      if (response.status === 403 && held) return held.handle;
       throw new Error(`Delete-lock ${type}/${name} → HTTP ${response.status}\n${response.data}`);
     }
     const body = response.data as string;
@@ -476,6 +546,7 @@ export class BwClient {
     if (!match) {
       throw new Error(`No <LOCK_HANDLE> in delete-lock response:\n${body}`);
     }
+    if (tracksLock(type)) lockSessions.set(key, { client: this, handle: match[1] });
     return match[1];
   }
 
@@ -955,6 +1026,14 @@ export class BwClient {
 
   async unlock(type: string, name: string): Promise<void> {
     if (NO_UNLOCK_TYPES.has(type.toLowerCase())) return;
+    const key = lockKey(this.identityKey(), type, name);
+    // Release through the session that took the lock. From any other session BW answers
+    // 200 and keeps the enqueue, which is what used to leave objects locked until SM12.
+    const held = lockSessions.get(key);
+    if (held && held.client !== this) {
+      await held.client.unlock(type, name);
+      return;
+    }
     await this.ensureCsrf();
     const mediaType = resolveMediaType(type);
     const response = await this.http.post(
@@ -974,6 +1053,7 @@ export class BwClient {
     if (response.status >= 400) {
       throw new Error(`UNLOCK ${type.toUpperCase()} ${name} → HTTP ${response.status}\n${response.data}`);
     }
+    lockSessions.delete(key);
   }
 }
 

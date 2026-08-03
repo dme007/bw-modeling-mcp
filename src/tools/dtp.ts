@@ -118,6 +118,7 @@ interface DtpInfo {
   packageSize: string;
   filterFields: DtpFilterField[];
   globalRoutineCode: string[];
+  semanticGroupFields: { name: string; description: string; isKey: boolean; isField: boolean }[];
 }
 
 function parseDtpXml(xml: string, status: string): DtpInfo {
@@ -207,6 +208,22 @@ function parseDtpXml(xml: string, status: string): DtpInfo {
     globalRoutineCode.push(gm[1]);
   }
 
+  // Semantic group candidates. Entries with field="true" are plain fields or key figures,
+  // the others are InfoObject-based and carry infoObjectType plus a reference.
+  const semanticGroupFields: DtpInfo['semanticGroupFields'] = [];
+  const sgBlock = xml.match(/<semanticGroup>[\s\S]*?<\/semanticGroup>/)?.[0] ?? '';
+  const groupFieldRegex = /<groupField\b([^>]*)\/>/g;
+  let sgm: RegExpExecArray | null;
+  while ((sgm = groupFieldRegex.exec(sgBlock)) !== null) {
+    const a = sgm[1];
+    semanticGroupFields.push({
+      name: attr(a, 'name'),
+      description: attr(a, 'description'),
+      isKey: /\bkeyField="true"/.test(a),
+      isField: /\bfield="true"/.test(a),
+    });
+  }
+
   return {
     name,
     description,
@@ -218,6 +235,7 @@ function parseDtpXml(xml: string, status: string): DtpInfo {
     packageSize,
     filterFields,
     globalRoutineCode,
+    semanticGroupFields,
   };
 }
 
@@ -276,6 +294,23 @@ export async function bwGetDtp(client: BwClient, dtpName: string): Promise<strin
       if (!f.hasRoutine && f.selections.length === 0) {
         lines.push('    → (no selection / no routine)');
       }
+    }
+  }
+
+  const sgSelected = info.semanticGroupFields.filter((f) => f.isKey);
+  const sgAvailable = info.semanticGroupFields.filter((f) => !f.isKey);
+  lines.push('', `── Semantic Group (${sgSelected.length} of ${info.semanticGroupFields.length} selected) ──`);
+  if (info.semanticGroupFields.length === 0) {
+    lines.push('  (no semantic group available for this DTP)');
+  } else {
+    if (sgSelected.length === 0) {
+      lines.push('  (no field selected)');
+    }
+    for (const f of sgSelected) {
+      lines.push(`  [key] ${f.name}${f.description ? ` — ${f.description}` : ''}`);
+    }
+    if (sgAvailable.length > 0) {
+      lines.push(`  Available: ${sgAvailable.map((f) => f.name).join(', ')}`);
     }
   }
 
@@ -643,8 +678,65 @@ export interface UpdateDtpArgs {
   filter_excluding?: boolean;
   filter_clear_fields?: string;
   extraction_mode?: 'full' | 'delta';
+  semantic_group_fields?: string;
   transport?: string;
   transport_lock_holder?: string;
+}
+
+/**
+ * Rewrite the <semanticGroup> element of a DTP document so that exactly the requested
+ * fields are the semantic group (replace semantics; an empty list clears the selection).
+ *
+ * The selection lives solely in the keyField attribute of the <groupField> elements,
+ * which the server already lists for every groupable field of the source — no element is
+ * ever added or removed. The serialization is asymmetric: a GET carries keyField only on
+ * the selected fields, while the Eclipse client sends an explicit keyField="false" on
+ * every entry. Replacing keyField="false" would therefore silently hit nothing on a GET
+ * document, so all keyField attributes are stripped and re-added instead.
+ *
+ * Throws when the document has no semantic group, or when a requested field name is not
+ * among the groupable fields — the server would answer HTTP 200 and keep the old
+ * selection, which is indistinguishable from success for the caller.
+ */
+export function applySemanticGroup(xml: string, fields: string, dtpName: string): string {
+  const sgMatch = xml.match(/<semanticGroup>[\s\S]*?<\/semanticGroup>/);
+  if (!sgMatch) {
+    throw new Error(
+      `DTP '${dtpName}' has no <semanticGroup> element — semantic groups are not available ` +
+      `for this source/target combination.`
+    );
+  }
+
+  const requested = [...new Set(
+    fields.split(',').map((f) => f.trim()).filter(Boolean)
+  )];
+
+  let sgXml = sgMatch[0].replace(
+    /(<groupField\b[^>]*?)\s+keyField="(?:true|false)"/g,
+    '$1'
+  );
+
+  const missing: string[] = [];
+  for (const field of requested) {
+    // Field names carry regex metacharacters, e.g. the /BIC/ prefix of custom fields.
+    const escaped = field.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+    const re = new RegExp(`(<groupField\\b[^>]*\\bname="${escaped}"[^>]*?)(\\s*/>)`);
+    if (!re.test(sgXml)) {
+      missing.push(field);
+      continue;
+    }
+    sgXml = sgXml.replace(re, '$1 keyField="true"$2');
+  }
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Semantic group field(s) not found in DTP '${dtpName}': ${missing.join(', ')}. ` +
+      `Use bw_get_dtp to list the available group fields with their exact names.`
+    );
+  }
+
+  // Replacer function, not a plain string: field descriptions may contain '$'.
+  return xml.replace(sgMatch[0], () => sgXml);
 }
 
 /**
@@ -743,6 +835,10 @@ export async function bwUpdateDtp(
           .replace(/\bextractionMode="[^"]*"/, `extractionMode="${extractionMode}"`)
           .replace(/\bdeltaSettingStatus="[^"]*"/, `deltaSettingStatus="${deltaSettingStatus}"`)
       );
+    }
+
+    if (args.semantic_group_fields !== undefined) {
+      putXml = applySemanticGroup(putXml, args.semantic_group_fields, dtpName);
     }
 
     // PUT on a fresh stateless client — Eclipse uses a separate stateless session for PUT

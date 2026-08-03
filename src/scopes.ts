@@ -2,10 +2,12 @@
  * Scope enforcement for the HTTP transport.
  *
  * Two scopes, matching the two role collections:
- *   read  — the 41 tools that only read (including `bw_query_data` and
+ *   read  — the tools that only read (including `bw_query_data` and
  *           `bw_preview_datasource`, which return rows but change nothing).
- *   write — the 42 tools that create, update, delete, activate, push, run, or unlock.
+ *   write — the tools that create, update, delete, activate, push, run, or unlock.
  *           `write` implies `read`.
+ * The exact counts live in tests/tool-surface.test.mjs, where they are enforced rather
+ * than left to rot in a comment.
  *
  * The READ set is the explicit one, and anything unrecognised requires `write`. That
  * direction matters: a tool added later without touching this file is unavailable to

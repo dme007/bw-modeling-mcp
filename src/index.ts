@@ -26,8 +26,10 @@ import { bwChangePackage, bwListChangeableTransports } from './tools/cto.js';
 import { bwCreateInfosource, bwUpdateInfosource, bwGetInfosource, InfosourceField } from './tools/infosource.js';
 import { bwPushData, bwGetPushSchema } from './tools/push.js';
 import { bwGetQuery, bwCreateQuery } from './tools/query.js';
+import { bwCreateVariable, CreateVariableArgs } from './tools/variable.js';
 import { bwUpdateQueryLayout, bwUpdateQueryFilter, bwUpdateQueryKeyFigures, bwUpdateQuerySettings, LayoutOperation, FilterOperation, KeyFigureOperation, UpdateQuerySettingsArgs } from './tools/query_update.js';
 import { bwGetCompositeProvider } from './tools/composite_provider.js';
+import { bwUpdateCompositeProvider, CompositeProviderFieldAction } from './tools/composite_provider_update.js';
 import { bwGetCkf, bwGetRkf, bwGetStructure } from './tools/cp_components.js';
 import { bwCreateRkf, CreateRkfArgs } from './tools/rkf_create.js';
 import { bwListContents } from './tools/repository.js';
@@ -1450,7 +1452,7 @@ const TOOL_DEFINITIONS = [
     {
       name: 'bw_update_dtp',
       description:
-        'Update DTP properties: description, simple value filter (e.g. field = value), and/or extraction mode (Full vs Delta). Use this for setting filter values on existing filter fields. ' +
+        'Update DTP properties: description, simple value filter (e.g. field = value), extraction mode (Full vs Delta), and/or the semantic group. Use this for setting filter values on existing filter fields. ' +
         'Note: switching extraction mode between Delta and Full (and back) has BW delta-init implications — a later delta load may require re-initialization of the delta on the source.',
       inputSchema: {
         type: 'object',
@@ -1487,6 +1489,14 @@ const TOOL_DEFINITIONS = [
             type: 'string',
             enum: ['full', 'delta'],
             description: 'Switch the DTP extraction mode. "full" sets extractionMode="F"; "delta" sets extractionMode="D" (only valid for delta-capable sources). Switching modes has delta-init implications — see the tool note.',
+          },
+          semantic_group_fields: {
+            type: 'string',
+            description:
+              'Comma-separated list of field names that form the semantic group (e.g. "FIELD_NAME,/BIC/FIELD_NAME"). ' +
+              'Replaces the current selection completely: the listed fields become the semantic group, all others are deselected. ' +
+              'Pass an empty string to clear the semantic group. Use bw_get_dtp to read the available group field names — ' +
+              'they must match exactly, including any /BIC/ prefix.',
           },
           transport: {
             type: 'string',
@@ -1603,6 +1613,78 @@ const TOOL_DEFINITIONS = [
           },
         },
         required: ['query_name'],
+      },
+    },
+    {
+      name: 'bw_create_variable',
+      description:
+        'Create a reusable BW Variable on a characteristic, for use as a filter parameter in ' +
+        'queries. The variable is created active and consistent. Covers processing types ' +
+        'UserEntry (manual entry, the default), CustomerExit, Authorization and the ' +
+        'current-member flavour of ReplacementPath, and stands for a characteristic value, ' +
+        'a hierarchy or hierarchy nodes. Text and formula variables are not supported. ' +
+        'To keep a variable out of the user\'s variable screen, set ready_for_input false.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          variable_name: {
+            type: 'string',
+            description: 'Technical name of the variable to create (e.g. "VAR_NAME").',
+          },
+          iobj_name: {
+            type: 'string',
+            description: 'Technical name of the InfoObject (characteristic) this variable is based on (e.g. "0CALMONTH"). Must exist in the system.',
+          },
+          description: {
+            type: 'string',
+            description: 'Variable description (displayed in query parameter screens).',
+          },
+          development_class: {
+            type: 'string',
+            description: 'Package name (e.g. "ZPKG"). Defaults to $TMP if omitted.',
+          },
+          ready_for_input: {
+            type: 'boolean',
+            description: 'Whether the variable is shown on the variable screen for user input. Defaults to true. Set false for a variable that only the customer exit fills.',
+          },
+          reusable: {
+            type: 'boolean',
+            description: 'Whether the variable can be reused in multiple queries. Defaults to true.',
+          },
+          represents: {
+            type: 'string',
+            enum: ['Interval', 'SingleValue', 'SeveralSingleValues', 'SelectionOption'],
+            description: 'Selection type. Interval is a from/to range, SelectionOption allows the full set of comparison operators. Defaults to Interval.',
+          },
+          processing_type: {
+            type: 'string',
+            enum: ['UserEntry', 'CustomerExit', 'Authorization', 'ReplacementPath'],
+            description: 'How the variable is filled: UserEntry (manual entry by the user, the default), CustomerExit (filled by the exit), Authorization, or ReplacementPath. Replacement path is limited to the current-member variant, which needs no donor object; replacement from a query result is not supported.',
+          },
+          variable_type: {
+            type: 'string',
+            enum: ['CharacteristicValue', 'Hierarchy', 'HierarchyNodes'],
+            description: 'What the variable stands for: a characteristic value (default), a whole hierarchy, or hierarchy nodes. Hierarchy variables still reference a characteristic via iobj_name.',
+          },
+          input_type: {
+            type: 'string',
+            enum: ['Optional', 'MandatoryWithInitial', 'MandatoryWithoutInitial'],
+            description: 'Whether a value is required: Optional (default), MandatoryWithInitial (entry required, initial value allowed) or MandatoryWithoutInitial (entry required, initial value rejected).',
+          },
+          master_language: {
+            type: 'string',
+            description: 'Language code for the descriptions (e.g. "EN", "DE"). Defaults to the BW_LANGUAGE of the connection, otherwise "EN".',
+          },
+          package: {
+            type: 'string',
+            description: 'Alias for development_class (for consistency with other tools).',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number (e.g. "DEVK900123"). Only needed when the target package is transportable.',
+          },
+        },
+        required: ['variable_name', 'iobj_name', 'description'],
       },
     },
     {
@@ -2013,6 +2095,44 @@ const TOOL_DEFINITIONS = [
           },
         },
         required: ['composite_provider_name'],
+      },
+    },
+    {
+      name: 'bw_update_composite_provider',
+      description:
+        'Add or remove fields of a CompositeProvider (HCPR). ' +
+        'action "add_field" (default): adds an <element> to the view node and a mapping in every part provider that supplies the field. ' +
+        'Field metadata (data type, aggregation behaviour, output length, label) is taken from the part provider, so the field must already exist there. ' +
+        'action "remove_field": removes the element and all mappings that reference it. ' +
+        'Returns a lock_handle that must be passed to bw_activate (object type hcpr) to complete the operation.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          composite_provider_name: {
+            type: 'string',
+            description: 'Technical name of the CompositeProvider (e.g. "HCPR_NAME").',
+          },
+          info_object_name: {
+            type: 'string',
+            description: 'Field name or comma-separated list to add or remove (e.g. "IOBJ_NAME" or "IOBJ_A,IOBJ_B").',
+          },
+          action: {
+            type: 'string',
+            enum: ['add_field', 'remove_field'],
+            description: '"add_field" (default) or "remove_field".',
+          },
+          source_providers: {
+            type: 'string',
+            description:
+              'Optional. Comma-separated part provider names or aliases (e.g. "PROVIDER_NAME" or "U1.ADSO.1") to restrict which inputs get a mapping. ' +
+              'Omit to map the field in every part provider that contains it. Only used by add_field.',
+          },
+          transport: {
+            type: 'string',
+            description: 'Optional transport request (e.g. DEVK900123). Omit for local objects.',
+          },
+        },
+        required: ['composite_provider_name', 'info_object_name'],
       },
     },
     {
@@ -4018,6 +4138,7 @@ async function handleToolCall(
           filter_excluding: args?.filter_excluding as boolean | undefined,
           filter_clear_fields: args?.filter_clear_fields as string | undefined,
           extraction_mode: args?.extraction_mode as 'full' | 'delta' | undefined,
+          semantic_group_fields: args?.semantic_group_fields as string | undefined,
           transport: args?.transport as string | undefined,
           transport_lock_holder: args?.transport_lock_holder as string | undefined,
         });
@@ -4048,6 +4169,24 @@ async function handleToolCall(
           infoprovider: args?.infoprovider as string | undefined,
           description: args?.description as string | undefined,
           copy_from: args?.copy_from as string | undefined,
+        });
+        break;
+
+      case 'bw_create_variable':
+        text = await bwCreateVariable(client, {
+          variable_name: args?.variable_name as string,
+          iobj_name: args?.iobj_name as string,
+          description: args?.description as string,
+          development_class: args?.development_class as string | undefined,
+          ready_for_input: args?.ready_for_input as boolean | undefined,
+          reusable: args?.reusable as boolean | undefined,
+          represents: args?.represents as 'Interval' | 'SingleValue' | 'SeveralSingleValues' | 'SelectionOption' | undefined,
+          processing_type: args?.processing_type as 'UserEntry' | 'CustomerExit' | 'Authorization' | 'ReplacementPath' | undefined,
+          variable_type: args?.variable_type as 'CharacteristicValue' | 'Hierarchy' | 'HierarchyNodes' | undefined,
+          input_type: args?.input_type as 'Optional' | 'MandatoryWithInitial' | 'MandatoryWithoutInitial' | undefined,
+          master_language: args?.master_language as string | undefined,
+          package: args?.package as string | undefined,
+          transport: args?.transport as string | undefined,
         });
         break;
 
@@ -4159,6 +4298,17 @@ async function handleToolCall(
 
       case 'bw_get_composite_provider':
         text = await bwGetCompositeProvider(client, args?.composite_provider_name as string);
+        break;
+
+      case 'bw_update_composite_provider':
+        text = await bwUpdateCompositeProvider(
+          client,
+          args?.composite_provider_name as string,
+          args?.info_object_name as string,
+          (args?.action as CompositeProviderFieldAction | undefined) ?? 'add_field',
+          args?.source_providers as string | undefined,
+          args?.transport as string | undefined,
+        );
         break;
 
       case 'bw_get_ckf':
