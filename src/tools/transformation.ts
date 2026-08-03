@@ -2,7 +2,8 @@ import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead } from '../bw-cli
 import { parseInfoObjectProps } from './infoobject.js';
 import { parseActivationMessages, parseDtpsDeactivated, bwActivate } from './activation.js';
 
-const TRFN_ACCEPT = MEDIA_TYPES['trfn'];
+/** Resolved per call, not once at import — see the note on adsoAccept() in adso.ts. */
+const trfnAccept = (): string => MEDIA_TYPES['trfn'];
 
 /**
  * Read the inactive (/m) version of a Transformation through a FRESH session
@@ -19,7 +20,7 @@ const TRFN_ACCEPT = MEDIA_TYPES['trfn'];
 async function freshReadInactive(
   trfnLower: string
 ): Promise<{ body: string; headers: Record<string, string> }> {
-  return freshRead(`/sap/bw/modeling/trfn/${trfnLower}/m`, TRFN_ACCEPT);
+  return freshRead(`/sap/bw/modeling/trfn/${trfnLower}/m`, trfnAccept());
 }
 
 // ── bwCreateTransformation ────────────────────────────────────────────────────
@@ -74,7 +75,7 @@ export async function bwCreateTransformation(
     `&sourceobjectname=${srcNameForUrl}` +
     `&targetobjectname=${tgtName}`;
 
-  const { body: transientXml } = await client.get(transientPath, TRFN_ACCEPT);
+  const { body: transientXml } = await client.get(transientPath, trfnAccept());
 
   const nameMatch = transientXml.match(/\bname="([^"]+)"/);
   if (!nameMatch) {
@@ -92,7 +93,7 @@ export async function bwCreateTransformation(
   const lockPath = `/sap/bw/modeling/trfn/${trfnLower}?action=lock`;
   const lockResponse = await client.rawPost(lockPath, '', {
     'activity_context': 'CREA',
-    'Accept': TRFN_ACCEPT,
+    'Accept': trfnAccept(),
     'x-csrf-token': csrfToken,
   });
   const lockHandleMatch = lockResponse.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/);
@@ -143,7 +144,7 @@ export async function bwCreateTransformation(
   await client2.postWithCsrf(
     createPath,
     postBody,
-    TRFN_ACCEPT,
+    trfnAccept(),
     { 'Development-Class': pkg },
     true,
   );
@@ -1990,7 +1991,7 @@ export async function bwSetTransformationExpertRoutine(
 
     // Step 5: Priming GET (mirrors Eclipse), then TLOGO-activate with the same lockHandle.
     await client
-      .get(`/sap/bw/modeling/trfn/${trfnLower}/m?forceCacheUpdate=true`, TRFN_ACCEPT)
+      .get(`/sap/bw/modeling/trfn/${trfnLower}/m?forceCacheUpdate=true`, trfnAccept())
       .catch(() => {/* priming only */});
     activationXml = await client.activate('trfn', trfnLower, lockHandle);
   } catch (err) {
@@ -2273,7 +2274,7 @@ async function readActiveHanaRuntime(trfnLower: string): Promise<'true' | 'false
     const freshReader = createClientFromEnv();
     const { body } = await freshReader.get(
       `/sap/bw/modeling/trfn/${trfnLower}/a?forceCacheUpdate=true`,
-      TRFN_ACCEPT
+      trfnAccept()
     );
     const m = body.match(/\bHANARuntime="(true|false)"/);
     return (m?.[1] as 'true' | 'false' | undefined) ?? null;
@@ -2306,7 +2307,7 @@ async function attemptRuntimeSwitch(
   try {
     const { body: xml, headers } = await client.get(
       `/sap/bw/modeling/trfn/${trfnLower}/m?forceCacheUpdate=true`,
-      TRFN_ACCEPT
+      trfnAccept()
     );
     const timestamp = headers['timestamp'] ?? '';
 

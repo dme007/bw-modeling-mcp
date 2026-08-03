@@ -169,6 +169,10 @@ src/
 
 Full endpoint list from BW/4HANA discovery — **47 workspaces, 130+ endpoints**.
 
+The media types below are the compiled-in fallbacks. At runtime the values advertised by
+the connected system's `/sap/bw/modeling/discovery` replace them, including when that
+system serves a lower resource version than the fallback.
+
 ### Core Modeling Objects
 
 | BW Object | Endpoint | Media Type |

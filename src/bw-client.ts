@@ -108,9 +108,12 @@ export class BwClient {
       // be http:// — an https:// target makes axios tunnel with CONNECT, which drops the
       // Proxy-Authorization and SAP-Connectivity-Authentication headers, and the
       // connectivity proxy answers 405.
+      // `undefined`, never `false`: false would also disable the HTTP_PROXY/http_proxy
+      // environment variables, and some hosts are reachable only through that proxy —
+      // it resolves the host and performs the destination lookup itself.
       proxy: opts.proxy
         ? { host: opts.proxy.host, port: opts.proxy.port, protocol: 'http' }
-        : false,
+        : undefined,
       headers: {
         ...(isCookieMode ? {} : {
           ...(opts.client ? { 'sap-client': opts.client } : {}),
@@ -792,6 +795,12 @@ export class BwClient {
       return m ? parseInt(m[1]) * 10000 + parseInt(m[2]) * 100 + parseInt(m[3]) : 0;
     };
     const segments = xml.split(/(?=<app:collection\s)/);
+    // Keys already written by THIS run. Discovery is authoritative for the backend that
+    // answered, so its value must replace the hardcoded fallback even when it is lower —
+    // a backend serving an older resource version rejects the higher one with HTTP 415.
+    // Within one document, several collections can still map to the same key, so among
+    // those the highest version wins rather than whichever comes last.
+    const discovered = new Set<string>();
     for (const segment of segments) {
       const hrefMatch = segment.match(/^<app:collection\b[^>]*?\shref="([^"]+)"/);
       if (!hrefMatch) continue;
@@ -805,10 +814,10 @@ export class BwClient {
         .filter((mt) => extractVersion(mt) > 0);
       if (versioned.length === 0) continue;
       const best = versioned.reduce((a, b) => (extractVersion(b) >= extractVersion(a) ? b : a));
-      const existing = MEDIA_TYPES[key];
-      // Only update if the discovered version is >= the existing one (never downgrade).
+      const existing = discovered.has(key) ? MEDIA_TYPES[key] : undefined;
       if (!existing || extractVersion(best) >= extractVersion(existing)) {
         MEDIA_TYPES[key] = best;
+        discovered.add(key);
       }
     }
     process.stderr.write(`[bw-modeling-mcp] Loaded media types from discovery: ${JSON.stringify(MEDIA_TYPES)}\n`);
