@@ -1144,6 +1144,19 @@ function clientFromEnvironment(): BwClient {
  * pre-lock model read and for verification reads; post-lock reads in the
  * locking session are refreshed by the lock itself and may stay as they are.
  */
+/**
+ * Decode the XML entities the modeling API returns in labels and titles. `&amp;` goes
+ * last, so a literally escaped entity in the text survives instead of being decoded twice.
+ */
+export function decodeXmlEntities(value: string): string {
+  return value
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
 export async function freshRead(path: string, accept: string): Promise<GetResult> {
   const sep = path.includes('?') ? '&' : '?';
   return createClientFromEnv().get(`${path}${sep}forceCacheUpdate=true`, accept);
