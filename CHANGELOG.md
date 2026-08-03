@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.2.1] — 2026-08-03
+
+### Fixed
+
+- **Environment proxies are no longer disabled** (#22) — the HTTP client passed `proxy: false` whenever no explicit Cloud Connector hop was configured. In axios that does not mean "no proxy", it means "ignore proxy settings", which also switches off the `HTTP_PROXY` / `http_proxy` environment variables. Deployments whose only route to the BW host is a local or corporate proxy lost that route and failed with `ENOTFOUND`. An explicit Cloud Connector hop still takes precedence.
+- **Media type discovery now reaches the wire** (#23) — two independent defects made every aDSO call fail with HTTP 415 on systems advertising a lower `adso` resource version than the compiled-in fallback:
+  - `loadMediaTypes()` kept the fallback whenever it outranked the advertised version. Discovery states what the connected backend accepts, so it is now authoritative; where one document maps several collections to the same key, the highest version still wins.
+  - `Accept` headers for aDSO, transformation and value-help requests were bound to module-level constants, evaluated at import time — before discovery had ever run. They are resolved per call now, so a discovered media type actually reaches the request.
+
+### Notes
+
+- Because environment proxies apply again, a globally set `HTTP_PROXY` now also covers BW hosts that were previously contacted directly. Use `NO_PROXY` to exclude them. This restores the behaviour of versions before v1.2.0.
+- Regression tests cover both fixes against a local fake backend and a local proxy, so neither needs a BW system to reproduce: `npm test`.
+
 ## [1.2.0] — 2026-07-29
 
 ### Added
