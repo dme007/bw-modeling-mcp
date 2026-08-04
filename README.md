@@ -62,9 +62,10 @@ Verified against a BW/4HANA system all the way to an **activated** CompositeProv
 
 This began as a contribution — the traced payloads come from [#20](https://github.com/dnic-dev/bw-modeling-mcp/pull/20) by [@JosephManu12](https://github.com/JosephManu12), ported onto the current code base and extended.
 
-**📊 Planning objects — a first**
+**📊 Aggregation levels**
 
-- **`bw_create_aggregation_level`** and **`bw_update_aggregation_level`** — the first objects from the planning side the server can create, optionally with a subset of the provider's fields rather than all of them
+- **`bw_create_aggregation_level`** and **`bw_update_aggregation_level`** — built on an aDSO or on a CompositeProvider, over all fields of the provider or a chosen subset
+- Reading planning objects was already possible; the aggregation level is the first one the server can create
 
 **🧰 Also new**
 
@@ -176,7 +177,7 @@ A BW enqueue belongs to the ABAP session that took it. `?action=unlock` from any
 
 ### Planning
 - Read aggregation levels, planning functions, planning sequences and planning properties
-- Create and change aggregation levels — over all fields of the provider or a chosen subset
+- Create and change aggregation levels on an aDSO or a CompositeProvider — over all fields of the provider or a chosen subset
 
 ### Global CP Components (Read & Authoring)
 - Read global Calculated Key Figure (CKF) — formula recursively resolved to a human-readable string, full dependency graph of all referenced sub-components
@@ -558,7 +559,7 @@ Change a CompositeProvider. Eight actions: `add_field` / `remove_field` for fiel
 Two things to know: both sides of a join key must be mapped onto the **same** target field, otherwise activation fails with "join fields need at least one common target field" — auto-mapping deliberately does not do this, so map the second side's key fields explicitly. And `remove_input` leaves the removed input's elements and any join referencing it behind; those have to be cleaned up separately.
 
 ### `bw_create_aggregation_level`
-Create an aggregation level (ALVL) over a planning-enabled provider, either over all its fields or a chosen subset. Needs at least one characteristic and one key figure. Activate with `bw_activate`, object type `alvl` and an empty `lock_handle`.
+Create an aggregation level (ALVL) on a planning-enabled aDSO or CompositeProvider, either over all its fields or a chosen subset. Needs at least one characteristic and one key figure. Activate with `bw_activate`, object type `alvl` and an empty `lock_handle`.
 
 ### `bw_update_aggregation_level`
 Change the field selection of an existing aggregation level.
