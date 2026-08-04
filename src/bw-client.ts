@@ -449,16 +449,25 @@ export class BwClient {
    *
    * extraHeaders: e.g. { 'Development-Class': '$TMP' }
    */
+  /**
+   * `extraQuery` carries create options that live in the URL rather than in the body — a
+   * CompositeProvider copies its structure from a template that way, for instance.
+   */
   async create(
     type: string,
     name: string,
     lockHandle: string,
     body: string,
-    extraHeaders?: Record<string, string>
+    extraHeaders?: Record<string, string>,
+    extraQuery?: Record<string, string>
   ): Promise<string> {
     await this.ensureCsrf();
     const mediaType = resolveMediaType(type);
-    const path = `/sap/bw/modeling/${type.toLowerCase()}/${name.toLowerCase()}?lockHandle=${lockHandle}`;
+    const query = Object.entries(extraQuery ?? {})
+      .map(([k, v]) => `&${k}=${encodeURIComponent(v)}`)
+      .join('');
+    const path =
+      `/sap/bw/modeling/${type.toLowerCase()}/${name.toLowerCase()}?lockHandle=${lockHandle}${query}`;
     const response = await this.http.post(path, body, {
       headers: {
         'Content-Type': `application/xml, ${mediaType}`,

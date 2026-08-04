@@ -28,7 +28,15 @@ import { bwPushData, bwGetPushSchema } from './tools/push.js';
 import { bwGetQuery, bwCreateQuery } from './tools/query.js';
 import { bwCreateVariable, CreateVariableArgs } from './tools/variable.js';
 import { bwUpdateQueryLayout, bwUpdateQueryFilter, bwUpdateQueryKeyFigures, bwUpdateQuerySettings, LayoutOperation, FilterOperation, KeyFigureOperation, UpdateQuerySettingsArgs } from './tools/query_update.js';
-import { bwGetCompositeProvider } from './tools/composite_provider.js';
+import {
+  bwGetCompositeProvider,
+  bwCreateCompositeProvider,
+  bwUpdateCompositeProviderInput,
+  bwUpdateCompositeProviderMapping,
+  bwUpdateCompositeProviderJoin,
+  bwRemoveCompositeProviderJoin,
+  bwUpdateCompositeProviderSettings,
+} from './tools/composite_provider.js';
 import { bwUpdateCompositeProvider, CompositeProviderFieldAction } from './tools/composite_provider_update.js';
 import { bwGetCkf, bwGetRkf, bwGetStructure } from './tools/cp_components.js';
 import { bwCreateRkf, CreateRkfArgs } from './tools/rkf_create.js';
@@ -41,7 +49,15 @@ import { bwGetProcessChain } from './tools/processchain.js';
 import { bwGetProcessVariant } from './tools/processvariant.js';
 import { bwListRequests, bwGetRequest, bwActivateRequest } from './tools/request_monitor.js';
 import { bwGetOpenHub } from './tools/openhub.js';
-import { bwGetAggregationLevel, bwGetPlanningProperties, bwGetPlanningSequence, bwGetPlanningFunction } from './tools/planning.js';
+import {
+  bwGetAggregationLevel,
+  bwCreateAggregationLevel,
+  bwUpdateAggregationLevelFields,
+  AggregationLevelFieldAction,
+  bwGetPlanningProperties,
+  bwGetPlanningSequence,
+  bwGetPlanningFunction,
+} from './tools/planning.js';
 import { bwListProcessChainRuns, bwGetProcessChainRunDetail, bwListProcessChainLastStatus } from './tools/process_chain_monitor.js';
 import { bwCreateProcessChain, bwUpdateProcessChain, bwActivateProcessChain, bwAddProcessChainErrorLinks, bwSwapProcessChainDtp, bwAppendProcessChainDtp, bwAddProcessChainProgram, bwCreateDecisionVariant, CreateProcessChainParams, UpdateProcessChainParams, EdgeDef, TriggerEventConfig } from './tools/processchain_write.js';
 import { bwCreateTransportTask } from './tools/transport.js';
@@ -909,7 +925,7 @@ const TOOL_DEFINITIONS = [
     {
       name: 'bw_activate',
       description:
-        'Activate one BW object (aDSO, Transformation, DTP, InfoObject, InfoSource, DataSource, or CompositeProvider). ' +
+        'Activate one BW object (aDSO, Transformation, DTP, InfoObject, InfoSource, DataSource, CompositeProvider, or Aggregation Level). ' +
         'Pass the lock_handle from bw_update_adso or bw_update_transformation. ' +
         'For DTP and DataSource (rsds) activation use lock_handle="" (no lock needed — standalone activation). ' +
         'For object_type "rsds" also pass source_system (a DataSource is identified by DataSource name plus source system). ' +
@@ -920,8 +936,10 @@ const TOOL_DEFINITIONS = [
         properties: {
           object_type: {
             type: 'string',
-            enum: ['adso', 'trfn', 'dtpa', 'iobj', 'trcs', 'rsds', 'hcpr'],
-            description: 'Object type: adso, trfn, dtpa, iobj, trcs, rsds (DataSource), or hcpr (CompositeProvider).',
+            enum: ['adso', 'trfn', 'dtpa', 'iobj', 'trcs', 'rsds', 'hcpr', 'alvl'],
+            description:
+              'Object type: adso, trfn, dtpa, iobj, trcs, rsds (DataSource), hcpr (CompositeProvider), ' +
+              'or alvl (Aggregation Level).',
           },
           object_name: {
             type: 'string',
@@ -931,7 +949,8 @@ const TOOL_DEFINITIONS = [
             type: 'string',
             description:
               'Lock handle from bw_update_adso or bw_update_transformation. ' +
-              'Use empty string "" for DTP and DataSource (rsds) activation.',
+              'Use empty string "" for DTP and DataSource (rsds) activation, and for an ' +
+              'Aggregation Level (alvl) created with bw_create_aggregation_level.',
           },
           source_system: {
             type: 'string',
@@ -980,8 +999,10 @@ const TOOL_DEFINITIONS = [
         properties: {
           object_type: {
             type: 'string',
-            enum: ['adso', 'trfn', 'trcs', 'iobj', 'area', 'dtpa'],
-            description: 'Object type: adso, trfn, trcs, iobj, area (InfoArea), or dtpa (DTP).',
+            enum: ['adso', 'trfn', 'trcs', 'iobj', 'area', 'dtpa', 'hcpr', 'alvl'],
+            description:
+              'Object type: adso, trfn, trcs, iobj, area (InfoArea), dtpa (DTP), ' +
+              'hcpr (CompositeProvider) or alvl (Aggregation Level).',
           },
           object_name: {
             type: 'string',
@@ -2100,11 +2121,13 @@ const TOOL_DEFINITIONS = [
     {
       name: 'bw_update_composite_provider',
       description:
-        'Add or remove fields of a CompositeProvider (HCPR). ' +
-        'action "add_field" (default): adds an <element> to the view node and a mapping in every part provider that supplies the field. ' +
-        'Field metadata (data type, aggregation behaviour, output length, label) is taken from the part provider, so the field must already exist there. ' +
-        'action "remove_field": removes the element and all mappings that reference it. ' +
-        'Returns a lock_handle that must be passed to bw_activate (object type hcpr) to complete the operation.',
+        'Change a CompositeProvider (HCPR): its fields, its source providers, their field mappings, the join condition, or root settings. ' +
+        'Every action returns a lock_handle that must be passed to bw_activate (object type hcpr) — an HCPR cannot be activated without it. ' +
+        'Fields: "add_field" (default) adds an element plus a mapping in every part provider supplying it, taking the field metadata from there; "remove_field" removes the element and all mappings referencing it. ' +
+        'Sources: "add_input" attaches a source provider, creates the target elements it needs and returns the generated alias; "remove_input" strips one by alias, leaving its elements and any join reference behind. ' +
+        'Mappings: "update_mapping" replaces the complete mapping list of one input; pass no mappings to map every field of its source one to one. This is also how an input attached at creation time gets its mappings. ' +
+        'Joins: "update_join" sets the condition between one pair of inputs — call it once per pair to build an N-way join — and "remove_join" drops one pair. Note that both sides of a join key must be mapped onto the SAME target field, otherwise activation fails with "join fields need at least one common target field"; auto-mapping does not do this, so map the second side\'s key fields explicitly. ' +
+        'Settings: "update_settings" edits label, stackable, default node and aggregation behaviour.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -2112,27 +2135,145 @@ const TOOL_DEFINITIONS = [
             type: 'string',
             description: 'Technical name of the CompositeProvider (e.g. "HCPR_NAME").',
           },
-          info_object_name: {
-            type: 'string',
-            description: 'Field name or comma-separated list to add or remove (e.g. "IOBJ_NAME" or "IOBJ_A,IOBJ_B").',
-          },
           action: {
             type: 'string',
-            enum: ['add_field', 'remove_field'],
-            description: '"add_field" (default) or "remove_field".',
+            enum: [
+              'add_field', 'remove_field', 'add_input', 'remove_input',
+              'update_mapping', 'update_join', 'remove_join', 'update_settings',
+            ],
+            description: 'Defaults to "add_field".',
+          },
+          info_object_name: {
+            type: 'string',
+            description: 'add_field / remove_field: field name or comma-separated list (e.g. "IOBJ_NAME" or "IOBJ_A,IOBJ_B").',
           },
           source_providers: {
             type: 'string',
             description:
-              'Optional. Comma-separated part provider names or aliases (e.g. "PROVIDER_NAME" or "U1.ADSO.1") to restrict which inputs get a mapping. ' +
-              'Omit to map the field in every part provider that contains it. Only used by add_field.',
+              'add_field only. Comma-separated part provider names or aliases (e.g. "PROVIDER_NAME" or "U1.ADSO.1") to restrict which inputs get a mapping. ' +
+              'Omit to map the field in every part provider that contains it.',
+          },
+          provider_name: {
+            type: 'string',
+            description: 'add_input: technical name of the source InfoProvider to attach.',
+          },
+          provider_type: {
+            type: 'string',
+            description: 'add_input: TLOGO-style suffix used in the generated alias (e.g. "ADSO"). Defaults to "ADSO".',
+          },
+          input_alias: {
+            type: 'string',
+            description: 'remove_input / update_mapping: alias of the input (e.g. "U1.ADSO.1").',
+          },
+          mappings: {
+            type: 'array',
+            description:
+              'add_input / update_mapping. Omit or pass an empty list to map every field of the source one to one.',
+            items: {
+              type: 'object',
+              properties: {
+                target: { type: 'string', description: 'Element name in the CompositeProvider.' },
+                source: { type: 'string', description: 'Field name on the source; defaults to target.' },
+                constant_value: { type: 'string', description: 'Constant instead of a source field.' },
+                info_object_name: { type: 'string', description: 'Bind a newly created target element to this InfoObject.' },
+              },
+              required: ['target'],
+            },
+          },
+          left_alias: {
+            type: 'string',
+            description: 'update_join / remove_join: alias of the left input.',
+          },
+          right_alias: {
+            type: 'string',
+            description: 'update_join / remove_join: alias of the right input.',
+          },
+          key_pairs: {
+            type: 'array',
+            description: 'update_join: the join key field pairs, named as they appear on each side\'s own source.',
+            items: {
+              type: 'object',
+              properties: {
+                left: { type: 'string' },
+                right: { type: 'string' },
+              },
+              required: ['left', 'right'],
+            },
+          },
+          join_type: {
+            type: 'string',
+            description: 'update_join: "inner" (default), "leftOuter", etc. — lowercase first letter.',
+          },
+          cardinality: {
+            type: 'string',
+            description: 'update_join: defaults to "CN_N".',
+          },
+          label: {
+            type: 'string',
+            description: 'update_settings: new description.',
+          },
+          stackable: {
+            type: 'boolean',
+            description: 'update_settings.',
+          },
+          default_node: {
+            type: 'string',
+            description: 'update_settings: path reference to the default view node (e.g. "#///U1").',
+          },
+          aggregation_behaviour: {
+            type: 'string',
+            description: 'update_settings.',
           },
           transport: {
             type: 'string',
             description: 'Optional transport request (e.g. DEVK900123). Omit for local objects.',
           },
         },
-        required: ['composite_provider_name', 'info_object_name'],
+        required: ['composite_provider_name'],
+      },
+    },
+    {
+      name: 'bw_create_composite_provider',
+      description:
+        'Create a CompositeProvider (HCPR). Without copy_from it creates a view node of the given type with the listed source providers attached — entity only, so give them their mappings afterwards with bw_update_composite_provider action "update_mapping". ' +
+        'A Union node may be created empty; a JOIN node must be created WITH its sources, since a join node without inputs makes the server dump. ' +
+        'With copy_from the server copies view node, inputs and mappings from an existing CompositeProvider. ' +
+        'The result is inactive — activate it with bw_activate (object type hcpr).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          composite_provider_name: {
+            type: 'string',
+            description: 'Name for the new CompositeProvider (e.g. "HCPR_NAME").',
+          },
+          label: { type: 'string', description: 'Description.' },
+          info_area: { type: 'string', description: 'InfoArea to create it in (e.g. "AREA_NAME").' },
+          view_type: {
+            type: 'string',
+            enum: ['Join', 'Union'],
+            description: 'View node type. Defaults to "Join".',
+          },
+          inputs: {
+            type: 'array',
+            description: 'Source InfoProviders to attach right away. Required in practice for a Join node.',
+            items: {
+              type: 'object',
+              properties: {
+                provider_name: { type: 'string' },
+                provider_type: { type: 'string', description: 'TLOGO-style suffix, e.g. "ADSO". Defaults to "ADSO".' },
+              },
+              required: ['provider_name'],
+            },
+          },
+          copy_from: {
+            type: 'string',
+            description:
+              'Copy the structure of this existing CompositeProvider. view_type, inputs and stackable are then irrelevant — they come from the template.',
+          },
+          stackable: { type: 'boolean', description: 'Defaults to false.' },
+          package: { type: 'string', description: 'Development package (default "$TMP").' },
+        },
+        required: ['composite_provider_name', 'label', 'info_area'],
       },
     },
     {
@@ -2937,6 +3078,102 @@ const TOOL_DEFINITIONS = [
           },
         },
         required: ['aggregation_level_name'],
+      },
+    },
+    {
+      name: 'bw_create_aggregation_level',
+      description:
+        'Create a new Aggregation Level (TLOGO ALVL) on top of a planning-enabled InfoProvider ' +
+        '(aDSO or CompositeProvider), for Integrated Planning / embedded BPC. ' +
+        'Sequence: lock → POST the shell → unlock → lock → PUT the field list → unlock. ' +
+        'The Aggregation Level is created inactive — activate it with bw_activate using ' +
+        'object_type "alvl" and lock_handle "". ' +
+        'By default every characteristic and key figure of the InfoProvider is exposed; pass ' +
+        'fields to restrict the selection. A selection needs at least one characteristic and one ' +
+        'key figure, and it must contain every key field of the underlying provider, otherwise ' +
+        'activation reports the missing ones. ' +
+        'The InfoProvider must be planning-enabled, otherwise the create fails with a message ' +
+        'saying it cannot serve as the basis of an aggregation level.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          aggregation_level_name: {
+            type: 'string',
+            description: 'Technical name of the new Aggregation Level (e.g. "OBJECT_NAME").',
+          },
+          label: {
+            type: 'string',
+            description: 'Description of the Aggregation Level.',
+          },
+          info_area: {
+            type: 'string',
+            description: 'InfoArea the Aggregation Level is created in (e.g. "AREA_NAME").',
+          },
+          info_provider: {
+            type: 'string',
+            description:
+              'Technical name of the underlying planning-enabled InfoProvider — an aDSO or a ' +
+              'CompositeProvider (e.g. "OBJECT_NAME").',
+          },
+          fields: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'Characteristics and key figures to expose, by their name on the InfoProvider ' +
+              '(e.g. ["FIELD_NAME", "IOBJ_NAME"]). Omit to expose every field of the provider. ' +
+              'Read the provider with bw_get_adso or bw_get_composite_provider to see the names. ' +
+              'On a CompositeProvider the fields carry a generated prefix ("<prefix>-FIELD_NAME"); ' +
+              'both that form and the bare name are accepted.',
+          },
+          package: {
+            type: 'string',
+            description: 'Development package. Defaults to "$TMP" (local, not transported).',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number. Required on systems with transport obligation.',
+          },
+        },
+        required: ['aggregation_level_name', 'label', 'info_area', 'info_provider'],
+      },
+    },
+    {
+      name: 'bw_update_aggregation_level',
+      description:
+        'Add fields to or remove fields from an existing Aggregation Level (TLOGO ALVL). ' +
+        'action "add_fields" exposes further characteristics or key figures of the underlying ' +
+        'InfoProvider; action "remove_fields" drops them from the Aggregation Level. ' +
+        'Fields already exposed (add) or not exposed at all (remove) are reported as skipped, ' +
+        'not treated as errors. ' +
+        'The Aggregation Level becomes inactive — activate it with bw_activate using ' +
+        'object_type "alvl" and lock_handle "". ' +
+        'A removal that would leave no characteristic or no key figure is refused before writing. ' +
+        'On a CompositeProvider both the prefixed field name and the bare name are accepted.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          aggregation_level_name: {
+            type: 'string',
+            description: 'Technical name of the Aggregation Level (e.g. "OBJECT_NAME").',
+          },
+          action: {
+            type: 'string',
+            enum: ['add_fields', 'remove_fields'],
+            description: 'Defaults to "add_fields".',
+          },
+          fields: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'Fields to add or remove (e.g. ["FIELD_NAME", "IOBJ_NAME"]). Names are resolved ' +
+              'against the underlying InfoProvider.',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number. Required on systems with transport obligation.',
+          },
+        },
+        required: ['aggregation_level_name', 'fields'],
       },
     },
     {
@@ -4300,15 +4537,105 @@ async function handleToolCall(
         text = await bwGetCompositeProvider(client, args?.composite_provider_name as string);
         break;
 
-      case 'bw_update_composite_provider':
-        text = await bwUpdateCompositeProvider(
-          client,
-          args?.composite_provider_name as string,
-          args?.info_object_name as string,
-          (args?.action as CompositeProviderFieldAction | undefined) ?? 'add_field',
-          args?.source_providers as string | undefined,
-          args?.transport as string | undefined,
-        );
+      case 'bw_update_composite_provider': {
+        const cpName = args?.composite_provider_name as string;
+        const cpAction = (args?.action as string | undefined) ?? 'add_field';
+        const cpTransport = args?.transport as string | undefined;
+        const cpMappings = ((args?.mappings as Array<Record<string, string>> | undefined) ?? []).map((m) => ({
+          target: m.target,
+          source: m.source,
+          constantValue: m.constant_value,
+          infoObjectName: m.info_object_name,
+        }));
+
+        switch (cpAction) {
+          case 'add_field':
+          case 'remove_field':
+            text = await bwUpdateCompositeProvider(
+              client,
+              cpName,
+              args?.info_object_name as string,
+              cpAction as CompositeProviderFieldAction,
+              args?.source_providers as string | undefined,
+              cpTransport,
+            );
+            break;
+          case 'add_input':
+            text = await bwUpdateCompositeProviderInput(client, cpName, 'add_input', {
+              input: {
+                providerName: args?.provider_name as string,
+                providerType: (args?.provider_type as string | undefined) ?? 'ADSO',
+                mappings: cpMappings,
+              },
+              transport: cpTransport,
+            });
+            break;
+          case 'remove_input':
+            text = await bwUpdateCompositeProviderInput(client, cpName, 'remove_input', {
+              inputAlias: args?.input_alias as string,
+              transport: cpTransport,
+            });
+            break;
+          case 'update_mapping':
+            text = await bwUpdateCompositeProviderMapping(
+              client,
+              cpName,
+              args?.input_alias as string,
+              cpMappings,
+              cpTransport,
+            );
+            break;
+          case 'update_join':
+            text = await bwUpdateCompositeProviderJoin(
+              client,
+              cpName,
+              args?.left_alias as string,
+              args?.right_alias as string,
+              (args?.key_pairs as Array<{ left: string; right: string }> | undefined) ?? [],
+              {
+                joinType: args?.join_type as string | undefined,
+                cardinality: args?.cardinality as string | undefined,
+                transport: cpTransport,
+              },
+            );
+            break;
+          case 'remove_join':
+            text = await bwRemoveCompositeProviderJoin(
+              client,
+              cpName,
+              args?.left_alias as string,
+              args?.right_alias as string,
+              cpTransport,
+            );
+            break;
+          case 'update_settings':
+            text = await bwUpdateCompositeProviderSettings(client, cpName, {
+              label: args?.label as string | undefined,
+              stackable: args?.stackable as boolean | undefined,
+              defaultNode: args?.default_node as string | undefined,
+              aggregationBehaviour: args?.aggregation_behaviour as string | undefined,
+              transport: cpTransport,
+            });
+            break;
+          default:
+            throw new Error(`Unknown action '${cpAction}' for bw_update_composite_provider.`);
+        }
+        break;
+      }
+
+      case 'bw_create_composite_provider':
+        text = await bwCreateCompositeProvider(client, args?.composite_provider_name as string, {
+          label: args?.label as string,
+          infoArea: args?.info_area as string,
+          viewType: args?.view_type as 'Join' | 'Union' | undefined,
+          package: args?.package as string | undefined,
+          stackable: args?.stackable as boolean | undefined,
+          copyFrom: args?.copy_from as string | undefined,
+          inputs: ((args?.inputs as Array<Record<string, string>> | undefined) ?? []).map((i) => ({
+            providerName: i.provider_name,
+            providerType: i.provider_type ?? 'ADSO',
+          })),
+        });
         break;
 
       case 'bw_get_ckf':
@@ -4429,6 +4756,27 @@ async function handleToolCall(
 
       case 'bw_get_open_hub':
         text = await bwGetOpenHub(client, args?.open_hub_name as string);
+        break;
+
+      case 'bw_create_aggregation_level':
+        text = await bwCreateAggregationLevel(client, args?.aggregation_level_name as string, {
+          label: args?.label as string,
+          infoArea: args?.info_area as string,
+          infoProvider: args?.info_provider as string,
+          fields: args?.fields as string[] | undefined,
+          package: args?.package as string | undefined,
+          transport: args?.transport as string | undefined,
+        });
+        break;
+
+      case 'bw_update_aggregation_level':
+        text = await bwUpdateAggregationLevelFields(
+          client,
+          args?.aggregation_level_name as string,
+          (args?.action as AggregationLevelFieldAction) ?? 'add_fields',
+          args?.fields as string[],
+          { transport: args?.transport as string | undefined }
+        );
         break;
 
       case 'bw_get_aggregation_level':

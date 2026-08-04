@@ -236,6 +236,11 @@ export interface CompositeProviderCreateOptions {
   stackable?: boolean;
   /** Source InfoProviders to attach right away. A Union without inputs was never observed. */
   inputs?: InitialInputRef[];
+  /**
+   * Copy the structure of an existing CompositeProvider. The server does the copying, so
+   * `viewType`, `inputs` and `stackable` are then irrelevant — they come from the template.
+   */
+  copyFrom?: string;
 }
 
 /**
@@ -250,10 +255,10 @@ export interface CompositeProviderCreateOptions {
  * is a path reference, and stackable is omitted unless set. Fields and mappings are not
  * part of the create call — they are added afterwards through a full-object PUT.
  *
- * Creating from a template is deliberately absent: a `<template objectName=… tlogo="HCPR"/>`
- * element modelled on the aDSO flow is rejected with HTTP 500 and an empty message, both
- * before and after tlogoProperties. That path needs a captured request before it can be
- * offered as a parameter.
+ * Copying from a template goes through the URL (`copyFrom`), not the body: unlike aDSO,
+ * HCPR has no `<template>` element, and sending one is rejected with HTTP 500 and an empty
+ * message. The server then builds the whole structure — view node, inputs and mappings —
+ * from the template, and the body stays the minimal shell.
  */
 export async function bwCreateCompositeProvider(
   client: BwClient,
@@ -267,6 +272,7 @@ export async function bwCreateCompositeProvider(
     package: pkg = '$TMP',
     stackable = false,
     inputs = [],
+    copyFrom,
   } = options;
 
   const nameUpper = compositeProviderName.toUpperCase();
@@ -326,9 +332,16 @@ export async function bwCreateCompositeProvider(
     `</Composite:compositeView>`;
 
   try {
-    await client.create('hcpr', compositeProviderName, lockHandle, body, {
-      'Development-Class': pkg,
-    });
+    await client.create(
+      'hcpr',
+      compositeProviderName,
+      lockHandle,
+      body,
+      { 'Development-Class': pkg },
+      // The template is named in the URL, not in the body. A <template> element like the
+      // one aDSO uses is rejected here with HTTP 500 and an empty message.
+      copyFrom ? { copyFromObjectName: copyFrom.toUpperCase(), copyFromObjectType: 'HCPR' } : undefined
+    );
   } catch (err) {
     await client.unlock('hcpr', compositeProviderName).catch(() => {/* ignore */});
     throw err;
@@ -641,13 +654,28 @@ function resolveMappings(
   return { mappingsXml, newElementsXml };
 }
 
+/**
+ * Element names are limited to 12 characters. A longer one saves without complaint and then
+ * fails activation, so auto-mapping shortens it here — keeping the tail, which carries the
+ * distinguishing part of names like a long identifier suffix, and leaving room for the
+ * collision counter that dedupeTargetName may append.
+ */
+const MAX_ELEMENT_NAME_LENGTH = 12;
+
+function shortenTargetName(name: string): string {
+  return name.length <= MAX_ELEMENT_NAME_LENGTH
+    ? name
+    : name.slice(name.length - MAX_ELEMENT_NAME_LENGTH).replace(/^_+/, '');
+}
+
 function dedupeTargetName(desired: string, existingXml: string, usedInBatch: Set<string>): string {
   const exists = (name: string) =>
     usedInBatch.has(name) || new RegExp(`<element\\b[^>]*\\bname="${escapeRegex(name)}"`).test(existingXml);
   if (!exists(desired)) return desired;
+  const stem = desired.slice(0, MAX_ELEMENT_NAME_LENGTH - 2);
   let n = 0;
-  while (exists(`${desired}_${n}`)) n++;
-  return `${desired}_${n}`;
+  while (exists(`${stem}_${n}`)) n++;
+  return `${stem}_${n}`;
 }
 
 /**
@@ -664,10 +692,11 @@ function buildAutoMappings(
 ): FieldMapping[] {
   const usedInBatch = new Set<string>();
   return fields.filter((f) => !AUTO_MAP_EXCLUDED.has(f.defaultTargetName)).map((f) => {
+    const desired = shortenTargetName(f.defaultTargetName);
     const target =
       viewNodeType === 'Union'
-        ? dedupeTargetName(f.defaultTargetName, '', usedInBatch)
-        : dedupeTargetName(f.defaultTargetName, existingXml, usedInBatch);
+        ? dedupeTargetName(desired, '', usedInBatch)
+        : dedupeTargetName(desired, existingXml, usedInBatch);
     usedInBatch.add(target);
     return { target, source: f.defaultTargetName };
   });
@@ -794,6 +823,139 @@ export async function bwUpdateCompositeProviderInput(
     composite_provider_name: cpUpper,
     object_type: 'hcpr',
     ...(resultAlias ? { input_alias: resultAlias } : {}),
+  });
+}
+
+// ── bw_update_composite_provider: mappings and root settings ─────────────────
+
+/**
+ * bw_update_composite_provider action "update_mapping" — replace the complete mapping list
+ * of one input, addressed by its alias.
+ *
+ * Pass an empty list to map every field of that input's source one to one. That is the way
+ * to populate an input which was attached at creation time through `inputs`, since those
+ * arrive entity-only, without mappings.
+ */
+export async function bwUpdateCompositeProviderMapping(
+  client: BwClient,
+  compositeProviderName: string,
+  inputAlias: string,
+  mappings: FieldMapping[],
+  transport?: string
+): Promise<string> {
+  const cpUpper = compositeProviderName.toUpperCase();
+  const alias = inputAlias.trim();
+  const cpResult = await freshRead(HCPR_PATH(compositeProviderName), HCPR_ACCEPT);
+  const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
+  let xml = cpResult.body;
+
+  const inputMatch = new RegExp(
+    `<input\\b[^>]*\\balias="${escapeRegex(alias)}"[^>]*>[\\s\\S]*?<\\/input>`
+  ).exec(xml);
+  if (!inputMatch) {
+    return JSON.stringify({
+      success: false,
+      message: `Input ${alias} not found in CompositeProvider ${cpUpper}. No changes made.`,
+    });
+  }
+
+  const providerName = extractProviderNameFromInput(inputMatch[0]);
+  if (!providerName) {
+    throw new Error(`Could not determine the source InfoProvider for input ${alias}.`);
+  }
+  const nodeName = getViewNodeName(xml);
+  const { fields } = await fetchCompositeSourceFields(providerName);
+
+  const effective = mappings.length > 0 ? mappings : buildAutoMappings(fields, xml, getViewNodeType(xml));
+  const { mappingsXml, newElementsXml } = resolveMappings(effective, fields, providerName, nodeName, xml);
+
+  if (newElementsXml.length > 0) {
+    xml = injectBeforeAnchor(openViewNode(xml), newElementsXml.join('\n'), ['<input', '<join'], '</viewNode>');
+  }
+  xml = ensureNamespace(xml, 'BwCore', 'http://www.sap.com/bw/modeling/BwCore.ecore');
+  xml = ensureNamespace(xml, 'Type', 'http://www.sap.com/ndb/DataModelType.ecore');
+
+  // Keep the input's opening tag and entity reference, replace only the mapping list.
+  xml = xml.replace(
+    new RegExp(
+      `(<input\\b[^>]*\\balias="${escapeRegex(alias)}"[^>]*>\\s*<entity>[^<]*<\\/entity>)[\\s\\S]*?(<\\/input>)`
+    ),
+    `$1\n${mappingsXml.join('\n')}\n  $2`
+  );
+
+  const lockHandle = await client.lock('hcpr', compositeProviderName);
+  try {
+    await client.put('hcpr', compositeProviderName, lockHandle, xml, timestamp, transport);
+  } catch (err) {
+    await client.unlock('hcpr', compositeProviderName).catch(() => {/* ignore */});
+    throw err;
+  }
+
+  return JSON.stringify({
+    success: true,
+    message:
+      `Mappings for input ${alias} in CompositeProvider ${cpUpper} replaced ` +
+      `(${mappingsXml.length} mapping(s)). Call bw_activate to activate.`,
+    lock_handle: lockHandle,
+    composite_provider_name: cpUpper,
+    object_type: 'hcpr',
+    input_alias: alias,
+  });
+}
+
+export interface CompositeProviderSettings {
+  label?: string;
+  stackable?: boolean;
+  defaultNode?: string;
+  aggregationBehaviour?: string;
+  transport?: string;
+}
+
+/** bw_update_composite_provider action "update_settings" — edit root-level attributes. */
+export async function bwUpdateCompositeProviderSettings(
+  client: BwClient,
+  compositeProviderName: string,
+  settings: CompositeProviderSettings
+): Promise<string> {
+  const cpUpper = compositeProviderName.toUpperCase();
+  const cpResult = await freshRead(HCPR_PATH(compositeProviderName), HCPR_ACCEPT);
+  const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
+  let xml = cpResult.body;
+
+  const setRootAttr = (source: string, name: string, value: string): string => {
+    const existing = new RegExp(`\\b${name}="[^"]*"`);
+    return existing.test(source)
+      ? source.replace(existing, `${name}="${value}"`)
+      : source.replace(/(<Composite:compositeView\b(?:[^>]|\n)*?)(\s*>)/, `$1 ${name}="${value}"$2`);
+  };
+
+  if (settings.stackable !== undefined) xml = setRootAttr(xml, 'stackable', String(settings.stackable));
+  if (settings.defaultNode !== undefined) xml = setRootAttr(xml, 'defaultNode', settings.defaultNode);
+  if (settings.aggregationBehaviour !== undefined) {
+    xml = setRootAttr(xml, 'aggregationBehaviour', settings.aggregationBehaviour);
+  }
+  if (settings.label !== undefined) {
+    const tag = `<endUserTexts label="${escapeXmlAttr(settings.label)}"/>`;
+    xml = /<endUserTexts[^>]*\/>/.test(xml)
+      ? xml.replace(/<endUserTexts[^>]*\/>/, tag)
+      : xml.replace(/(<tlogoProperties)/, `${tag}\n  $1`);
+  }
+
+  const lockHandle = await client.lock('hcpr', compositeProviderName);
+  try {
+    await client.put('hcpr', compositeProviderName, lockHandle, xml, timestamp, settings.transport);
+  } catch (err) {
+    await client.unlock('hcpr', compositeProviderName).catch(() => {/* ignore */});
+    throw err;
+  }
+
+  return JSON.stringify({
+    success: true,
+    message: `CompositeProvider ${cpUpper} settings updated. Call bw_activate to activate.`,
+    lock_handle: lockHandle,
+    composite_provider_name: cpUpper,
+    object_type: 'hcpr',
+    applied: settings,
   });
 }
 
