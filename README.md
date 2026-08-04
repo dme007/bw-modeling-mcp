@@ -15,11 +15,10 @@ OAuth in front and a BTP destination behind — either a shared technical user
 (`BasicAuthentication`) or **principal propagation**, where each caller reaches BW as
 themselves and BW applies their own authorizations.
 
-Two role collections decide what a user is offered: **BW MCP Reader** (read-only tools)
-and **BW MCP Developer** (all tools). Setup: [docs/CENTRAL-HOSTING-SETUP.md](docs/CENTRAL-HOSTING-SETUP.md)
-(step-by-step) and [docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md) (reference).
-
-stdio is unchanged — `npm start` behaves exactly as before.
+Two role collections decide what a user is offered: **BW MCP Reader** and **BW MCP Developer**.
+stdio is unchanged — `npm start` behaves exactly as before. Setup:
+[docs/CENTRAL-HOSTING-SETUP.md](docs/CENTRAL-HOSTING-SETUP.md) (step-by-step) and
+[docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md) (reference).
 
 ### What central hosting changes
 
@@ -31,18 +30,10 @@ stdio is unchanged — `npm start` behaves exactly as before.
 | **BW authorizations** | enforced through the user's own credentials | unchanged, still fully enforced — with principal propagation each caller acts as themselves, never as a shared identity |
 | **Audit trail** | limited | XSUAA logs every login; with principal propagation the BW session log shows the real user |
 
-Scope enforcement lives in `src/scopes.ts` and is deliberately asymmetric: the read tools are
-listed explicitly, everything else requires `write`. A tool added later without touching that
-file is therefore unavailable to read-only callers rather than silently offered to them.
-`write` implies `read`, never the other way round. The two shipped role collections are a
-starting point — `xs-security.json` can be extended with finer scopes such as `query`,
-`monitor`, `metadata`, `data_push` or `admin`.
-
-Deployment is described by `manifest.yml` (Cloud Foundry app, BW destination, client and
-language) and `xs-security.json` (XSUAA). Principal propagation additionally needs a
-certificate rule and ICM trust on the BW side, see
-[docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md) §3. The HTTP transport starts with
-`npm run start:http`, stdio with `node dist/stdio.js`.
+A new tool stays unavailable to read-only callers until it is explicitly classified as a
+read, so the surface never widens by accident; `write` implies `read`, never the reverse.
+The two role collections are a starting point and can be split further in `xs-security.json`.
+Principal propagation additionally needs a certificate rule and ICM trust on the BW side.
 
 ---
 
