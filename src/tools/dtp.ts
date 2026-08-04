@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead, resolveMasterSystem } from '../bw-client.js';
 import { bwActivate } from './activation.js';
 
 interface XrefEntry {
@@ -450,7 +450,7 @@ export async function bwCreateDtp(
   }
 
   const language     = process.env.BW_LANGUAGE ?? 'DE';
-  const masterSystem = new URL(process.env.BW_URL ?? 'http://localhost').hostname.split('.')[0].toUpperCase();
+  const masterSystem = await resolveMasterSystem(client);
   const responsible  = (process.env.BW_USER ?? '').toUpperCase();
 
   // Step 1: Generate DTP name via POST generateDtpId — DTP name is in Location header

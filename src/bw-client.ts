@@ -1157,6 +1157,32 @@ function clientFromEnvironment(): BwClient {
  * Decode the XML entities the modeling API returns in labels and titles. `&amp;` goes
  * last, so a literally escaped entity in the text survives instead of being decoded twice.
  */
+let masterSystemCache: string | null = null;
+
+/**
+ * The `adtcore:masterSystem` value to send when creating an object.
+ *
+ * Taken from the system's own logical system name rather than derived from the URL host:
+ * behind a destination or a proxy the host says nothing about the system, and with
+ * BW_URL unset the old derivation produced "LOCALHOST", which the backend rejects. Cached
+ * for the process — it cannot change while the server points at one system. Falls back to
+ * the host derivation if the read fails, so a broken systeminfo cannot block a create.
+ */
+export async function resolveMasterSystem(client: BwClient): Promise<string> {
+  if (masterSystemCache) return masterSystemCache;
+  try {
+    const { body } = await client.get('/sap/bw/modeling/repo/is/systeminfo', 'application/xml');
+    const logsys = body.match(/name="system\.logsys"\s+value="([^"]*)"/)?.[1];
+    if (logsys && /^[A-Z0-9]{3}/.test(logsys)) {
+      masterSystemCache = logsys.slice(0, 3);
+      return masterSystemCache;
+    }
+  } catch {
+    // Fall through to the host derivation below.
+  }
+  return new URL(process.env.BW_URL ?? 'http://localhost').hostname.split('.')[0].toUpperCase();
+}
+
 export function decodeXmlEntities(value: string): string {
   return value
     .replace(/&quot;/g, '"')

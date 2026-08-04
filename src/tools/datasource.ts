@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, resolveMasterSystem } from '../bw-client.js';
 
 const BASE = '/sap/bw/modeling/repo/datasourcestructure';
 const BASE_PREFIX = `${BASE}/`;
@@ -678,7 +678,7 @@ export async function bwCreateDatasource(
   const desc = description ?? externalObject;
 
   const language = process.env.BW_LANGUAGE ?? 'DE';
-  const masterSystem = new URL(process.env.BW_URL ?? 'http://localhost').hostname.split('.')[0].toUpperCase();
+  const masterSystem = await resolveMasterSystem(client);
   const responsible = (process.env.BW_USER ?? '').toUpperCase();
 
   const lockUrl   = `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}?action=lock`;
