@@ -70,22 +70,15 @@ This began as a contribution — the traced payloads come from [#20](https://git
 **🎛️ Query variables**
 
 - **`bw_create_variable`** covers all four processing types — user entry, **customer exit**, authorization and replacement path — for characteristic values, hierarchies and hierarchy nodes, with the usual selection and entry-requirement options
-- Replacement path is limited to the current-member variant; replacement from a query result is not supported
 
-**🧰 Also new**
+**🔧 Minor changes and fixes**
 
-- `bw_unlock` now accepts `hcpr` and `alvl`, which previously left those locks with no way to release them through the MCP
-
-**🔒 Locks that actually get released**
-
-A BW enqueue belongs to the ABAP session that took it. `?action=unlock` from any other session answers HTTP 200 and releases nothing, so an object stayed locked until the ADT session timed out or someone cleared it in SM12. The client now remembers which session holds a lock and routes the release through it — and hands back the handle it already holds when the same caller locks again, instead of failing. Reported in [#13](https://github.com/dnic-dev/bw-modeling-mcp/issues/13).
-
-**🐛 Fixed**
-
-- `adtcore:masterSystem` was derived from the URL host, which says nothing about the system behind a destination or a proxy — and with `BW_URL` unset it produced `LOCALHOST`. It now comes from the system's own logical system name ([#13](https://github.com/dnic-dev/bw-modeling-mcp/issues/13))
-- The CompositeProvider read went through the writing client and served that session's pinned model buffer, losing attributes the write had just set
-- Labels were written into XML unescaped, so an `&` failed the request with HTTP 500, and entities were not decoded on the way back — the same applied to `bw_list_contents` and the aggregation level read
-- Key figures are identified from the element body now, since a plain Union node carries no dimension to read them from
+- Locks are released by the session that holds them — previously `?action=unlock` from another session answered HTTP 200 without releasing anything, leaving objects locked until the session timed out or SM12 was used ([#13](https://github.com/dnic-dev/bw-modeling-mcp/issues/13))
+- `bw_unlock` accepts `hcpr` and `alvl`
+- `adtcore:masterSystem` comes from the system's logical system name instead of the URL host, which produced `LOCALHOST` behind a destination ([#13](https://github.com/dnic-dev/bw-modeling-mcp/issues/13))
+- The CompositeProvider read uses a fresh session, so it no longer serves a stale model buffer right after a write
+- Labels are XML-escaped on write and decoded on read — an `&` used to fail the request with HTTP 500
+- Key figures are detected in Union nodes, which carry no dimension to read them from
 
 ---
 
