@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.3.0] — 2026-08-04
+
+### Added
+
+- **CompositeProvider authoring** — `bw_create_composite_provider` creates a Union or Join node with its source providers attached, or copies an existing CompositeProvider (the template is named in the URL, not in the body, unlike aDSO). `bw_update_composite_provider` grew from two actions to eight: `add_input`, `remove_input`, `update_mapping`, `update_join`, `remove_join` and `update_settings` next to the existing `add_field` / `remove_field`. Field mappings resolve against each source's own metadata, so field-based and InfoObject-based providers both work; join conditions are set per input pair, which is how BW models an N-way join. Verified against a BW/4HANA system up to an activated CompositeProvider. Based on the traced payloads contributed in #20 by @JosephManu12, ported onto the current code base and extended.
+- **Aggregation levels** — `bw_create_aggregation_level` and `bw_update_aggregation_level`, the first objects from the planning side the server can create, optionally with a subset of the provider's fields.
+- **`bw_create_variable`** — BW variables for query authoring.
+
+### Improved
+
+- **Locks are released by the session that holds them** (#13) — a BW enqueue belongs to the ABAP session that took it, so `?action=unlock` from any other session answered HTTP 200 and released nothing, leaving objects locked until the ADT session timed out or SM12 was used. The client now tracks which session holds a lock, routes the release through it, and hands back the handle it already holds when the same caller locks again.
+- **`bw_unlock` accepts `hcpr` and `alvl`** — previously there was no way to release those locks through the MCP.
+
+### Fixed
+
+- **`adtcore:masterSystem` no longer guessed from the URL host** (#13) — the host says nothing about the system behind a destination or a proxy, and with `BW_URL` unset the fallback produced `LOCALHOST`, which the backend rejects. It is read from the system's own logical system name now, once per process, with the old derivation as fallback. Affects transformation, DTP, query and DataSource creates.
+- **CompositeProvider read served a stale model buffer** — it went through the calling client, so a read right after a write returned that session's pinned state and lost attributes the write had set. It uses a fresh session now, like the aDSO and transformation tools.
+- **XML entity handling in labels** — labels were interpolated unescaped, so an `&` failed the request with HTTP 500, and entities were not decoded when reading. Decoding is shared in the client now and also applies to `bw_list_contents` and the aggregation level read.
+- **Key figure detection in CompositeProviders** — derived from the element body instead of a `__KEYFIGURES` dimension, which a plain Union node does not have.
+
+### Notes
+
+- On the four remaining findings reported in #13: the transformation create buffer does not apply here, because lock and create already run on separate sessions; the stateless lock path is unreachable code; and the DTP `stateful_enqueue` behaviour could not be reproduced — on this landscape the enqueue survives the request, which points at the server's session configuration rather than the connector.
+
 ## [1.2.1] — 2026-08-03
 
 ### Fixed

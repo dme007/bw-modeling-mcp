@@ -21,6 +21,29 @@ and **BW MCP Developer** (all tools). Setup: [docs/CENTRAL-HOSTING-SETUP.md](doc
 
 stdio is unchanged — `npm start` behaves exactly as before.
 
+### What central hosting changes
+
+| Scenario | stdio only | Hosted on BTP |
+|---|---|---|
+| **One analyst, one BW system** | runs on the analyst's machine | server-side, the analyst logs in with their own identity |
+| **Several analysts, one server** | not possible, no central auth | all log in via BTP, each caller's identity reaches BW |
+| **Tool permissions** | none — whoever runs it can call every tool | granted per role, **independent of BW authorizations**: a BW developer can be read-only in the MCP, or the querying tools can be withheld from someone who may otherwise view data |
+| **BW authorizations** | enforced through the user's own credentials | unchanged, still fully enforced — with principal propagation each caller acts as themselves, never as a shared identity |
+| **Audit trail** | limited | XSUAA logs every login; with principal propagation the BW session log shows the real user |
+
+Scope enforcement lives in `src/scopes.ts` and is deliberately asymmetric: the read tools are
+listed explicitly, everything else requires `write`. A tool added later without touching that
+file is therefore unavailable to read-only callers rather than silently offered to them.
+`write` implies `read`, never the other way round. The two shipped role collections are a
+starting point — `xs-security.json` can be extended with finer scopes such as `query`,
+`monitor`, `metadata`, `data_push` or `admin`.
+
+Deployment is described by `manifest.yml` (Cloud Foundry app, BW destination, client and
+language) and `xs-security.json` (XSUAA). Principal propagation additionally needs a
+certificate rule and ICM trust on the BW side, see
+[docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md) §3. The HTTP transport starts with
+`npm run start:http`, stdio with `node dist/stdio.js`.
+
 ---
 
 ## 📖 Featured Blog Posts
@@ -35,53 +58,44 @@ A two-part blog series about this project (both available in German and English)
 
 ---
 
-## 🆕 What's New — v1.2.0
+## 🆕 What's New — v1.3.0
 
-**Central hosting on SAP BTP Cloud Foundry with XSUAA OAuth and role-based access control. Game-changer for enterprise deployments.**
+**The server can now build a data model on the provider level instead of only reading it — and it reaches the planning side for the first time.**
 
-> **Backwards compatible — local use is unchanged.** Existing stdio setups (`npm start`, Claude Desktop, etc.) keep working exactly as before: no auth, no BTP, no config changes. Upgrading to v1.2.0 is non-breaking — central hosting is purely additive.
+**🚀 CompositeProvider authoring**
 
-**🚀 The Big Picture**
+- **`bw_create_composite_provider`** — a Union or Join node with its source providers attached, or a copy of an existing CompositeProvider
+- **`bw_update_composite_provider`** grew from two actions to eight: `add_input`, `remove_input`, `update_mapping`, `update_join`, `remove_join` and `update_settings` alongside the existing `add_field` / `remove_field`
+- Field mappings are resolved from each source's own metadata, so field-based and InfoObject-based providers both work as sources
+- Join conditions are set per input pair — which is how BW models an N-way join: one condition per pair
 
-- **BTP Cloud Foundry HTTP Server** — the MCP can now run as a central service on enterprise infrastructure (not just locally). `npm run start:http` launches an Express server bound to XSUAA, destination, and connectivity services
-- **XSUAA OAuth Authentication** — **same [@arc-mcp/xsuaa-auth](https://github.com/arc-mcp/xsuaa-auth) module as [ARC-1](https://github.com/arc-mcp/arc-1)** for ecosystem consistency. Stateless Dynamic Client Registration (DCR) + callback proxy. Users log in via BTP identity, the server respects their identity for analytics and auditing (principal propagation ready)
-- **Role-Based Access Control (RBAC)** — `xs-security.json` defines two scopes and **suggested default role collections** that can be customized to your needs:
-  - **`BW MCP Reader`** — read-only metadata and query tools (`read` scope). Ideal for analysts and report consumers
-  - **`BW MCP Developer`** — full access: create/update/delete/activate/push (`write` scope, implies `read`). For modelers and data engineers
-  - Scope enforcement in `src/scopes.ts` is explicit on reads (safe by default), automatic on writes (new write tools require admin to whitelist for read-only)
-  - **Customize for your org:** Extend with `query`, `monitor`, `metadata`, `data_push`, `admin` scopes for finer granularity
-- **Cloud Connector Integration** — on-premise BW systems route through BTP destinations + Cloud Connector
+Verified against a BW/4HANA system all the way to an **activated** CompositeProvider. That distinction matters here: the backend accepts a model it will later refuse to activate, so a successful save proves nothing.
 
-**📋 What This Enables**
+This began as a contribution — the traced payloads come from [#20](https://github.com/dnic-dev/bw-modeling-mcp/pull/20) by [@JosephManu12](https://github.com/JosephManu12), ported onto the current code base and extended.
 
-| Scenario | Before | Now |
-|----------|--------|-----|
-| **One analyst, one BW system** | stdio on analyst's machine | BTP server, analyst logs in with their own identity |
-| **Many analysts, shared server** | impossible (no central auth) | all log in via BTP, each user's identity flows to BW |
-| **MCP tool permissions** | none — whoever runs it can call every tool | grant tools per role, **independent of BW authorizations**: e.g. a BW developer restricted to read-only in the MCP, or the querying tools withheld from someone who may otherwise view data |
-| **BW authorizations** | always enforced via the user's own credentials | unchanged — still fully enforced; principal propagation means each caller acts as themselves, never a shared identity |
-| **Enterprise audit trail** | limited | XSUAA logs all logins; with principal propagation BW session logs show the true user |
+**📊 Planning objects — a first**
 
-**⚙️ Configuration**
+- **`bw_create_aggregation_level`** and **`bw_update_aggregation_level`** — the first objects from the planning side the server can create, optionally with a subset of the provider's fields rather than all of them
 
-- `manifest.yml` — Cloud Foundry app manifest (512 MB, 1 GB disk, BW destination + client + language)
-- `xs-security.json` — XSUAA config; extend with `query`, `monitor`, `metadata`, `data_push`, `admin` scopes if finer granularity is needed
-- Transport: stdio via `node dist/stdio.js` (default), HTTP+OAuth via `npm run start:http` (= `node dist/http.js`, as used by `manifest.yml`)
+**🧰 Also new**
 
-**📖 Documentation**
+- **`bw_create_variable`** — BW variables for query authoring
+- `bw_unlock` now accepts `hcpr` and `alvl`, which previously left those locks with no way to release them through the MCP
 
-See [docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md) for the full setup: services, destinations, XSUAA, Cloud Connector, and principal propagation (Stage 2).
+**🔒 Locks that actually get released**
 
-**🔐 Security Notes**
+A BW enqueue belongs to the ABAP session that took it. `?action=unlock` from any other session answers HTTP 200 and releases nothing, so an object stayed locked until the ADT session timed out or someone cleared it in SM12. The client now remembers which session holds a lock and routes the release through it — and hands back the handle it already holds when the same caller locks again, instead of failing. Reported in [#13](https://github.com/dnic-dev/bw-modeling-mcp/issues/13).
 
-- Write scope implicitly grants read (one-way: read tools do not grant write)
-- New write tools default to requiring `write`; old read tools explicitly whitelist for `read`
-- Principal propagation requires CERTRULE + ICM trust on BW side (see docs/CLOUD-FOUNDRY.md §3)
-- stdio mode is unchanged and auth-free
+**🐛 Fixed**
+
+- `adtcore:masterSystem` was derived from the URL host, which says nothing about the system behind a destination or a proxy — and with `BW_URL` unset it produced `LOCALHOST`. It now comes from the system's own logical system name ([#13](https://github.com/dnic-dev/bw-modeling-mcp/issues/13))
+- The CompositeProvider read went through the writing client and served that session's pinned model buffer, losing attributes the write had just set
+- Labels were written into XML unescaped, so an `&` failed the request with HTTP 500, and entities were not decoded on the way back — the same applied to `bw_list_contents` and the aggregation level read
+- Key figures are identified from the element body now, since a plain Union node carries no dimension to read them from
 
 ---
 
-**Earlier releases** — the "What's New" notes for v1.1.0 and older are archived in [WHATS_NEW.md](WHATS_NEW.md); the full structured history is in [CHANGELOG.md](CHANGELOG.md).
+**Earlier releases** — the "What's New" notes for v1.2.0 and older are archived in [WHATS_NEW.md](WHATS_NEW.md); the full structured history is in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -163,8 +177,17 @@ See [docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md) for the full setup: services,
 - Drill into hierarchy nodes and structure members (expand / collapse by tuple index)
 - Look up valid characteristic values before setting filters or variables — returns both internal and external key formats
 
-### CompositeProvider (Read)
+### CompositeProvider (Read & Authoring)
 - Read CompositeProvider structure — view node type (Union/Join), source providers (inputs) with mapping count, all fields with dimension classification, join conditions, and temporal join details
+- Create a CompositeProvider — Union or Join node with its source providers attached, or as a copy of an existing one
+- Attach and detach source providers, with their target elements created as needed
+- Replace the field mappings of an input, either explicitly or mapped one to one from the source
+- Set and remove join conditions per input pair, with join type and cardinality
+- Add and remove fields, edit root settings (description, stackable, default node, aggregation behaviour)
+
+### Planning
+- Read aggregation levels, planning functions, planning sequences and planning properties
+- Create and change aggregation levels — over all fields of the provider or a chosen subset
 
 ### Global CP Components (Read & Authoring)
 - Read global Calculated Key Figure (CKF) — formula recursively resolved to a human-readable string, full dependency graph of all referenced sub-components
@@ -536,6 +559,23 @@ Publish or remove a BW Query from a role or folder. Parameters: `query_name`, `a
 
 ### `bw_get_composite_provider` _(Read only)_
 Read a CompositeProvider (HCPR) — view node type (Union/Join), source providers with input mapping counts, all fields with dimension classification, join conditions, and temporal join details.
+
+### `bw_create_composite_provider`
+Create a CompositeProvider. Without `copy_from`, a view node of the given type with the listed source providers attached — entity only, so give them their mappings afterwards with `bw_update_composite_provider` action `update_mapping`. A Union node may be created empty; a Join node must be created with its sources, since a join node without inputs makes the server dump. With `copy_from`, the server copies view node, inputs and mappings from an existing CompositeProvider. The result is inactive.
+
+### `bw_update_composite_provider`
+Change a CompositeProvider. Eight actions: `add_field` / `remove_field` for fields, `add_input` / `remove_input` for source providers, `update_mapping` for one input's complete mapping list (omit the mappings to map every source field one to one), `update_join` / `remove_join` per input pair, and `update_settings` for description, stackable, default node and aggregation behaviour. Every action returns a `lock_handle` that `bw_activate` needs — an HCPR cannot be activated without it.
+
+Two things to know: both sides of a join key must be mapped onto the **same** target field, otherwise activation fails with "join fields need at least one common target field" — auto-mapping deliberately does not do this, so map the second side's key fields explicitly. And `remove_input` leaves the removed input's elements and any join referencing it behind; those have to be cleaned up separately.
+
+### `bw_create_aggregation_level`
+Create an aggregation level (ALVL) over a planning-enabled provider, either over all its fields or a chosen subset. Needs at least one characteristic and one key figure. Activate with `bw_activate`, object type `alvl` and an empty `lock_handle`.
+
+### `bw_update_aggregation_level`
+Change the field selection of an existing aggregation level.
+
+### `bw_create_variable`
+Create a BW variable for use in query authoring.
 
 ### `bw_get_ckf` _(Read only)_
 Read a global Calculated Key Figure — formula recursively resolved to a human-readable string, metadata (package, InfoArea, author), and full dependency graph of all referenced sub-components.
