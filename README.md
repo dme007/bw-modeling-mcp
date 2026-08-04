@@ -51,7 +51,7 @@ A two-part blog series about this project (both available in German and English)
 
 ## 🆕 What's New — v1.3.0
 
-**The server can now build a data model on the provider level instead of only reading it — and it reaches the planning side for the first time.**
+**CompositeProviders can now be created and changed, not just read — and with aggregation levels the server reaches the planning side for the first time.**
 
 **🚀 CompositeProvider authoring**
 
