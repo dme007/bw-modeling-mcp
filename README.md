@@ -67,12 +67,10 @@ This began as a contribution — the traced payloads come from [#20](https://git
 - **`bw_create_aggregation_level`** and **`bw_update_aggregation_level`** — built on an aDSO or on a CompositeProvider, over all fields of the provider or a chosen subset
 - Reading planning objects was already possible; the aggregation level is the first one the server can create
 
-**🎛️ Query variables — the full range**
+**🎛️ Query variables**
 
-- **`bw_create_variable`** covers all four processing types: user entry, **customer exit**, authorization and replacement path
-- A variable can represent a characteristic value, a whole hierarchy or hierarchy nodes — and select as an interval, a single value, several single values, or with the full set of comparison operators
-- Entry requirement (optional, mandatory with or without an initial value), ready-for-input and reusability are all settable, so a variable that only the customer exit fills stays off the selection screen
-- One limit worth knowing: replacement path covers the current-member variant, which needs no donor object. Replacement from a query result is not supported
+- **`bw_create_variable`** covers all four processing types — user entry, **customer exit**, authorization and replacement path — for characteristic values, hierarchies and hierarchy nodes, with the usual selection and entry-requirement options
+- Replacement path is limited to the current-member variant; replacement from a query result is not supported
 
 **🧰 Also new**
 
