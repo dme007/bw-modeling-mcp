@@ -683,6 +683,11 @@ function nextInputAlias(xml: string, nodeName: string, providerType: string): st
   return `${nodeName}.${type}.${max + 1}`;
 }
 
+/** Extracts the source provider name from an input's entity reference. */
+function extractProviderNameFromInput(inputBlock: string): string | undefined {
+  return inputBlock.match(/(?:infoprov_dt\/a\/)?([A-Za-z0-9_]+)\.composite#\/\//)?.[1];
+}
+
 export interface InputProviderDef {
   providerName: string;
   /** TLOGO-style suffix used in the generated alias, e.g. "ADSO". */
@@ -789,5 +794,185 @@ export async function bwUpdateCompositeProviderInput(
     composite_provider_name: cpUpper,
     object_type: 'hcpr',
     ...(resultAlias ? { input_alias: resultAlias } : {}),
+  });
+}
+
+// ── bw_update_composite_provider: join conditions ────────────────────────────
+
+export interface JoinKeyPair {
+  /** Bare field name on the left input's own source provider. */
+  left: string;
+  /** Bare field name on the right input's own source provider. */
+  right: string;
+}
+
+/** The join element between exactly this alias pair, self-closing or with a body. */
+function findJoinBetween(xml: string, viewNodeName: string, left: string, right: string): RegExpMatchArray | null {
+  const leftRef = escapeRegex(`#///${viewNodeName}/${left}`);
+  const rightRef = escapeRegex(`#///${viewNodeName}/${right}`);
+  return xml.match(new RegExp(
+    `[ \\t]*<join\\b(?=[^>]*\\bleftInput="${leftRef}")(?=[^>]*\\brightInput="${rightRef}")` +
+    `[^>]*(?:\\/>|>[\\s\\S]*?<\\/join>)\\n?`
+  ));
+}
+
+async function resolveInputProviderMeta(
+  xml: string,
+  alias: string,
+  cpUpper: string
+): Promise<{ providerName: string; fields: SourceFieldMeta[] }> {
+  const inputMatch = xml.match(
+    new RegExp(`<input\\b[^>]*\\balias="${escapeRegex(alias)}"[^>]*>[\\s\\S]*?<\\/input>`)
+  );
+  if (!inputMatch) throw new Error(`Could not find input ${alias} in CompositeProvider ${cpUpper}.`);
+  const providerName = extractProviderNameFromInput(inputMatch[0]);
+  if (!providerName) throw new Error(`Could not determine the source InfoProvider for input ${alias}.`);
+  const { fields } = await fetchCompositeSourceFields(providerName);
+  return { providerName, fields };
+}
+
+/**
+ * The name a join key has to be addressed by on its own source.
+ *
+ * Resolved from the source's field metadata rather than assembled from the prefix: only a
+ * field-based provider names its fields "<prefix>-<FIELD>", an InfoObject-based one uses the
+ * InfoObject name, and a concatenated guess silently produces a key that does not exist.
+ */
+function resolveSourceFieldName(
+  fields: SourceFieldMeta[],
+  bareName: string,
+  providerName: string
+): string {
+  const wanted = bareName.trim().toUpperCase();
+  const field = fields.find((f) => f.defaultTargetName.toUpperCase() === wanted);
+  if (!field) {
+    throw new Error(
+      `Join key ${wanted} not found on InfoProvider ${providerName.toUpperCase()} ` +
+      `(available: ${fields.map((f) => f.defaultTargetName).join(', ')}).`
+    );
+  }
+  return field.sourceName;
+}
+
+/**
+ * bw_update_composite_provider action "update_join" — set or replace the join condition
+ * between one pair of inputs on a join node. Call once per pair to build an N-way join.
+ *
+ * From a captured trace: joinType is lowercase, the default cardinality is "CN_N", and each
+ * side's element name is the field name on its own source, not the CompositeProvider's
+ * target element name.
+ */
+export async function bwUpdateCompositeProviderJoin(
+  client: BwClient,
+  compositeProviderName: string,
+  leftAlias: string,
+  rightAlias: string,
+  keyPairs: JoinKeyPair[],
+  opts: { joinType?: string; cardinality?: string; transport?: string } = {}
+): Promise<string> {
+  const { joinType = 'inner', cardinality = 'CN_N', transport } = opts;
+  const cpUpper = compositeProviderName.toUpperCase();
+  const cpResult = await freshRead(HCPR_PATH(compositeProviderName), HCPR_ACCEPT);
+  const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
+  let xml = cpResult.body;
+
+  const viewNodeName = getViewNodeName(xml);
+  const left = leftAlias.trim();
+  const right = rightAlias.trim();
+
+  const [leftMeta, rightMeta] = await Promise.all([
+    resolveInputProviderMeta(xml, left, cpUpper),
+    resolveInputProviderMeta(xml, right, cpUpper),
+  ]);
+
+  // Grouped, not interleaved: SAP writes every leftElementName first and then every
+  // rightElementName, pairing them by position. Interleaving them per pair is accepted for
+  // a single key and rejected with HTTP 500 and an empty message for two or more.
+  const keyLines = [
+    ...keyPairs.map(
+      (k) => `    <leftElementName>` +
+        `${resolveSourceFieldName(leftMeta.fields, k.left, leftMeta.providerName)}` +
+        `</leftElementName>`
+    ),
+    ...keyPairs.map(
+      (k) => `    <rightElementName>` +
+        `${resolveSourceFieldName(rightMeta.fields, k.right, rightMeta.providerName)}` +
+        `</rightElementName>`
+    ),
+  ].join('\n');
+
+  const joinXml =
+    `  <join leftInput="#///${viewNodeName}/${left}" rightInput="#///${viewNodeName}/${right}"` +
+    ` joinType="${joinType}" cardinality="${cardinality}">\n` +
+    `${keyLines}\n` +
+    `  </join>`;
+
+  // Replace only this pair's join — whether the create-time stub or a saved full form.
+  const existing = findJoinBetween(xml, viewNodeName, left, right);
+  xml = existing
+    ? xml.replace(existing[0], joinXml + '\n')
+    : injectBeforeAnchor(openViewNode(xml), joinXml, ['</viewNode>'], '</viewNode>');
+
+  const lockHandle = await client.lock('hcpr', compositeProviderName);
+  try {
+    await client.put('hcpr', compositeProviderName, lockHandle, xml, timestamp, transport);
+  } catch (err) {
+    await client.unlock('hcpr', compositeProviderName).catch(() => {/* ignore */});
+    throw err;
+  }
+
+  return JSON.stringify({
+    success: true,
+    message:
+      `Join condition set in CompositeProvider ${cpUpper} (${left} / ${right}, ` +
+      `${keyPairs.length} key pair(s)). Call bw_activate to activate.`,
+    lock_handle: lockHandle,
+    composite_provider_name: cpUpper,
+    object_type: 'hcpr',
+    join_type: joinType,
+    cardinality,
+  });
+}
+
+/** bw_update_composite_provider action "remove_join" — drop one pair's join condition. */
+export async function bwRemoveCompositeProviderJoin(
+  client: BwClient,
+  compositeProviderName: string,
+  leftAlias: string,
+  rightAlias: string,
+  transport?: string
+): Promise<string> {
+  const cpUpper = compositeProviderName.toUpperCase();
+  const cpResult = await freshRead(HCPR_PATH(compositeProviderName), HCPR_ACCEPT);
+  const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
+  let xml = cpResult.body;
+
+  const viewNodeName = getViewNodeName(xml);
+  const left = leftAlias.trim();
+  const right = rightAlias.trim();
+
+  const existing = findJoinBetween(xml, viewNodeName, left, right);
+  if (!existing) {
+    return JSON.stringify({
+      success: false,
+      message: `No join found between ${left} and ${right} in CompositeProvider ${cpUpper}. No changes made.`,
+    });
+  }
+  xml = xml.replace(existing[0], '');
+
+  const lockHandle = await client.lock('hcpr', compositeProviderName);
+  try {
+    await client.put('hcpr', compositeProviderName, lockHandle, xml, timestamp, transport);
+  } catch (err) {
+    await client.unlock('hcpr', compositeProviderName).catch(() => {/* ignore */});
+    throw err;
+  }
+
+  return JSON.stringify({
+    success: true,
+    message: `Join between ${left} and ${right} removed from CompositeProvider ${cpUpper}. Call bw_activate to activate.`,
+    lock_handle: lockHandle,
+    composite_provider_name: cpUpper,
+    object_type: 'hcpr',
   });
 }
