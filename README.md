@@ -67,9 +67,15 @@ This began as a contribution — the traced payloads come from [#20](https://git
 - **`bw_create_aggregation_level`** and **`bw_update_aggregation_level`** — built on an aDSO or on a CompositeProvider, over all fields of the provider or a chosen subset
 - Reading planning objects was already possible; the aggregation level is the first one the server can create
 
+**🎛️ Query variables — the full range**
+
+- **`bw_create_variable`** covers all four processing types: user entry, **customer exit**, authorization and replacement path
+- A variable can represent a characteristic value, a whole hierarchy or hierarchy nodes — and select as an interval, a single value, several single values, or with the full set of comparison operators
+- Entry requirement (optional, mandatory with or without an initial value), ready-for-input and reusability are all settable, so a variable that only the customer exit fills stays off the selection screen
+- One limit worth knowing: replacement path covers the current-member variant, which needs no donor object. Replacement from a query result is not supported
+
 **🧰 Also new**
 
-- **`bw_create_variable`** — BW variables for query authoring
 - `bw_unlock` now accepts `hcpr` and `alvl`, which previously left those locks with no way to release them through the MCP
 
 **🔒 Locks that actually get released**
@@ -160,6 +166,7 @@ A BW enqueue belongs to the ABAP session that took it. `?action=unlock` from any
 - Update query settings (properties)
 - Record query edits on a transport request for queries on a transportable package
 - Delete a query
+- Create characteristic variables — user entry, customer exit, authorization or replacement path; as characteristic value, hierarchy or hierarchy nodes; interval, single value, several single values or comparison operators
 
 ### Live Data Querying
 - Execute a BEx Query or preview data from any InfoProvider (aDSO, CompositeProvider) — returns a formatted result table
@@ -565,7 +572,7 @@ Create an aggregation level (ALVL) on a planning-enabled aDSO or CompositeProvid
 Change the field selection of an existing aggregation level.
 
 ### `bw_create_variable`
-Create a BW variable for use in query authoring.
+Create a characteristic variable. Processing type: `UserEntry`, `CustomerExit`, `Authorization` or `ReplacementPath`. Represents a characteristic value, a hierarchy or hierarchy nodes; selection as `Interval`, `SingleValue`, `SeveralSingleValues` or `SelectionOption`. Entry requirement, ready-for-input and reusability are parameters, so a variable filled only by the exit can be kept off the selection screen. Replacement path is limited to the current-member variant — replacement from a query result is not supported.
 
 ### `bw_get_ckf` _(Read only)_
 Read a global Calculated Key Figure — formula recursively resolved to a human-readable string, metadata (package, InfoArea, author), and full dependency graph of all referenced sub-components.
