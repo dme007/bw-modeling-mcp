@@ -137,7 +137,7 @@ This began as a contribution — the traced payloads come from [#20](https://git
 - Set value filters on fields
 - Set routine filters (ABAP code)
 
-### BW Query (Read)
+### BW Query
 - Read a BW Query — metadata, variables, filter, layout, measures, exceptions, and settings
 - Variables: type, processing type (UserEntry, Authorization, CustomerExit), input behavior
 - Filter: fixed values and variable references fully resolved, including mixed selections
@@ -147,8 +147,6 @@ This began as a contribution — the traced payloads come from [#20](https://git
 - Inline local measures inside structures: both formulas and selections
 - Exceptions with alert levels and thresholds, cell definitions for grid layout queries
 - Active version with automatic fallback to inactive
-
-### BW Query (Authoring)
 - Create a new, consistent Query (ELEM) on an InfoProvider — empty, or as a full copy of an existing query (layout, filter, variables, key figures) via `copy_from`
 - Update the layout — rows, columns, structures, and free characteristics
 - Update the filter — fixed values and restrictions
@@ -165,7 +163,7 @@ This began as a contribution — the traced payloads come from [#20](https://git
 - Drill into hierarchy nodes and structure members (expand / collapse by tuple index)
 - Look up valid characteristic values before setting filters or variables — returns both internal and external key formats
 
-### CompositeProvider (Read & Authoring)
+### CompositeProvider
 - Read CompositeProvider structure — view node type (Union/Join), source providers (inputs) with mapping count, all fields with dimension classification, join conditions, and temporal join details
 - Create a CompositeProvider — Union or Join node with its source providers attached, or as a copy of an existing one
 - Attach and detach source providers, with their target elements created as needed
@@ -173,11 +171,7 @@ This began as a contribution — the traced payloads come from [#20](https://git
 - Set and remove join conditions per input pair, with join type and cardinality
 - Add and remove fields, edit root settings (description, stackable, default node, aggregation behaviour)
 
-### Planning
-- Read aggregation levels, planning functions, planning sequences and planning properties
-- Create and change aggregation levels on an aDSO or a CompositeProvider — over all fields of the provider or a chosen subset
-
-### Global CP Components (Read & Authoring)
+### Global CP Components
 - Read global Calculated Key Figure (CKF) — formula recursively resolved to a human-readable string, full dependency graph of all referenced sub-components
 - Read global Restricted Key Figure (RKF) — base measure, all characteristic restriction groups with field and value details
 - Read global Structure — all members with Formula/Selection breakdown, referenced components, characteristic filters, optional child members
@@ -228,12 +222,13 @@ This began as a contribution — the traced payloads come from [#20](https://git
 - Field names resolved automatically from the DataSource structure; configurable record count (default 20)
 - Rendered as a padded plain-text table with column alignment
 
-### Open Hub Destination (Read)
+### Open Hub Destination
 - Read an Open Hub Destination (DEST): destination type, source object, DB table, InfoArea, package, and status
 - Complete output field list with types, InfoObject binding, conversion routine, compounding, and key flag
 - File properties for FILE-type destinations
 
-### Integrated Planning (Read)
+### Integrated Planning
+- Create and change Aggregation Levels on an aDSO or a CompositeProvider — over all fields of the provider or a chosen subset
 - Read Aggregation Levels (ALVL) — the planning-enabled view on top of an InfoProvider; characteristics and key figures with full type and semantic detail
 - Read Planning Functions (PLSE) — function type, characteristic usage roles, and parameter tree; FOX code surfaced for FORMULA functions
 - Read Planning Sequences (PLSQ) — ordered step list with aggregation level, planning function, and filter references
