@@ -118,7 +118,9 @@ src/
 └── tools/
     ├── activation.ts     # bw_activate, bw_unlock
     ├── adso.ts           # bw_get_adso, bw_create_adso, bw_update_adso
-    ├── composite_provider.ts # bw_get_composite_provider
+    ├── composite_provider.ts # bw_get_composite_provider, bw_create_composite_provider,
+    │                     # bw_update_composite_provider — inputs, mappings, joins, settings
+    ├── composite_provider_update.ts # bw_update_composite_provider — add_field, remove_field
     ├── cp_components.ts  # bw_get_ckf, bw_get_rkf, bw_get_structure
     ├── cto.ts            # bw_change_package — package reassignment via /sap/bw/modeling/cto/write;
     │                     # bw_list_changeable_transports — transport state via cto/check
@@ -133,7 +135,8 @@ src/
     ├── infoobject.ts     # bw_get_infoobject, bw_create_infoobject, bw_update_infoobject
     ├── infosource.ts     # bw_get_infosource, bw_create_infosource, bw_update_infosource
     ├── openhub.ts        # bw_get_open_hub
-    ├── planning.ts       # bw_get_aggregation_level, bw_get_planning_properties,
+    ├── planning.ts       # bw_get_aggregation_level, bw_create_aggregation_level,
+    │                     # bw_update_aggregation_level, bw_get_planning_properties,
     │                     # bw_get_planning_sequence, bw_get_planning_function
     ├── process_chain_monitor.ts # bw_list_process_chain_runs, bw_get_process_chain_run_detail,
     │                            # bw_list_process_chain_last_status — OData-based monitoring
@@ -169,6 +172,10 @@ src/
 
 Full endpoint list from BW/4HANA discovery — **47 workspaces, 130+ endpoints**.
 
+The media types below are the compiled-in fallbacks. At runtime the values advertised by
+the connected system's `/sap/bw/modeling/discovery` replace them, including when that
+system serves a lower resource version than the fallback.
+
 ### Core Modeling Objects
 
 | BW Object | Endpoint | Media Type |
@@ -176,6 +183,8 @@ Full endpoint list from BW/4HANA discovery — **47 workspaces, 130+ endpoints**
 | aDSO | `/sap/bw/modeling/adso/{adsonm}` | `adso-v1_7_0+xml` |
 | InfoObject | `/sap/bw/modeling/iobj/{infoobject}` | `infoobject-v2_2_0+json` |
 | CompositeProvider | `/sap/bw/modeling/hcpr/{hcprnm}` | `hcpr-v1_15_0+xml` |
+| CompositeProvider from template | `/sap/bw/modeling/hcpr/{hcprnm}?copyFromObjectName={template}&copyFromObjectType=HCPR` | `hcpr-v1_15_0+xml` |
+| InfoProvider as composite input | `/sap/bw/modeling/infoprov/{name}/a?view=dt` | `iprov-v1_14_0+xml` |
 | Open ODS View | `/sap/bw/modeling/fbp/{fbpnm}` | `fbp-v1_0_0+xml` |
 | InfoSource | `/sap/bw/modeling/trcs/{trcsnm}` | `trcs-v1_0_0+xml` |
 | Transformation | `/sap/bw/modeling/trfn/{trfnnm}` | `trfn-v1_0_0+xml` |

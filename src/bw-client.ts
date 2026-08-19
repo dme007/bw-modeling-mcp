@@ -76,6 +76,46 @@ export interface BwClientOptions {
   client?: string;
   language?: string;
   proxy?: BwProxyConfig;
+  /**
+   * Stable identity of the caller, used to scope the lock registry below. Set it wherever
+   * the credential itself is not stable per user — principal propagation hands out a fresh
+   * connectivity token per request, so without this every request would look like a
+   * different identity and no lock could ever be matched to its session.
+   */
+  identity?: string;
+}
+
+/**
+ * Sessions that hold a BW enqueue, keyed by identity and object.
+ *
+ * A BW lock belongs to the ABAP session that took it: `?action=unlock` from any other
+ * session answers HTTP 200 and releases nothing. Every MCP call builds its own client,
+ * so the session that locked in `bw_update_*` is already gone when `bw_activate` tries to
+ * unlock. The lock then survives until the ADT session times out, and the next write
+ * fails with "object is locked by <user>" until someone clears it in SM12.
+ *
+ * Remembering which client took the lock closes that gap: `unlock()` routes through that
+ * session, and `lock()` hands back the handle we already hold instead of failing. Entries
+ * are dropped once the lock is released.
+ */
+const lockSessions = new Map<string, { client: BwClient; handle: string }>();
+
+function lockKey(identity: string, type: string, name: string): string {
+  return `${identity}|${type.toLowerCase()}/${name.toLowerCase()}`;
+}
+
+/**
+ * Types whose lock this client does not release: DTPs go through the DTP framework's own
+ * unlock endpoint, so `unlock()` returns early for them. Registering them would leave an
+ * entry that nothing ever deletes, and a later 403 would then hand back a dead handle.
+ *
+ * The registry also cannot help when the registered session has died server-side: the
+ * unlock then opens a new session and BW answers 200 without releasing anything, exactly
+ * as before this registry existed. In practice a dying session releases its own enqueues,
+ * which is why the case that used to block agents is the live-but-unreachable session.
+ */
+function tracksLock(type: string): boolean {
+  return !NO_UNLOCK_TYPES.has(type.toLowerCase());
 }
 
 export class BwClient {
@@ -113,13 +153,9 @@ export class BwClient {
       // be http:// — an https:// target makes axios tunnel with CONNECT, which drops the
       // Proxy-Authorization and SAP-Connectivity-Authentication headers, and the
       // connectivity proxy answers 405.
-      //
-      // Without an explicit Cloud Connector hop the field stays unset, so axios keeps
-      // honouring HTTP_PROXY/http_proxy. It must not be `false`: that disables the
-      // environment proxy and cuts off every deployment that reaches BW through a local
-      // one. SAP Business Application Studio is the case in point — a
-      // `<destination>.dest` host has no DNS entry there and is resolved solely by the
-      // BAS proxy, which also performs the destination lookup and principal propagation.
+      // `undefined`, never `false`: false would also disable the HTTP_PROXY/http_proxy
+      // environment variables, and some hosts are reachable only through that proxy —
+      // it resolves the host and performs the destination lookup itself.
       proxy: opts.proxy
         ? { host: opts.proxy.host, port: opts.proxy.port, protocol: 'http' }
         : undefined,
@@ -171,6 +207,26 @@ export class BwClient {
    */
   freshSession(): BwClient {
     return new BwClient(this.opts);
+  }
+
+  /**
+   * Who this client acts as. Two clients sharing it reach BW as the same user, which is
+   * what makes it safe to hand one client's lock to the other — and what keeps a
+   * multi-user deployment from ever touching someone else's session.
+   */
+  private identityKey(): string {
+    if (this.opts.identity) return `${this.opts.identity}@${this.opts.url}/${this.opts.client ?? ''}`;
+    const auth = this.opts.auth;
+    const who =
+      auth.kind === 'basic' ? `basic:${auth.user}`
+      : auth.kind === 'cookies' ? 'cookies'
+      : `pp:${auth.connectivityAuth}`;
+    return `${who}@${this.opts.url}/${this.opts.client ?? ''}`;
+  }
+
+  /** Same caller, so this client may act on the other one's lock. */
+  private sameIdentityAs(other: BwClient): boolean {
+    return other.identityKey() === this.identityKey();
   }
 
   /**
@@ -371,7 +427,13 @@ export class BwClient {
       }
     );
     this.updateCookies(response);
+    const key = lockKey(this.identityKey(), type, name);
     if (response.status >= 400) {
+      // 403 also means "you already hold this lock, in another session" — BW refuses even
+      // the same user from a new session. Reuse the handle we still know instead of making
+      // the caller wait for the ADT session to time out.
+      const held = tracksLock(type) ? lockSessions.get(key) : undefined;
+      if (response.status === 403 && held) return held.handle;
       throw new Error(`Lock ${type}/${name} → HTTP ${response.status}\n${response.data}`);
     }
     const body = response.data as string;
@@ -380,6 +442,7 @@ export class BwClient {
     if (!match) {
       throw new Error(`No <LOCK_HANDLE> in lock response body:\n${body}`);
     }
+    if (tracksLock(type)) lockSessions.set(key, { client: this, handle: match[1] });
     return match[1];
   }
 
@@ -391,16 +454,25 @@ export class BwClient {
    *
    * extraHeaders: e.g. { 'Development-Class': '$TMP' }
    */
+  /**
+   * `extraQuery` carries create options that live in the URL rather than in the body — a
+   * CompositeProvider copies its structure from a template that way, for instance.
+   */
   async create(
     type: string,
     name: string,
     lockHandle: string,
     body: string,
-    extraHeaders?: Record<string, string>
+    extraHeaders?: Record<string, string>,
+    extraQuery?: Record<string, string>
   ): Promise<string> {
     await this.ensureCsrf();
     const mediaType = resolveMediaType(type);
-    const path = `/sap/bw/modeling/${type.toLowerCase()}/${name.toLowerCase()}?lockHandle=${lockHandle}`;
+    const query = Object.entries(extraQuery ?? {})
+      .map(([k, v]) => `&${k}=${encodeURIComponent(v)}`)
+      .join('');
+    const path =
+      `/sap/bw/modeling/${type.toLowerCase()}/${name.toLowerCase()}?lockHandle=${lockHandle}${query}`;
     const response = await this.http.post(path, body, {
       headers: {
         'Content-Type': `application/xml, ${mediaType}`,
@@ -477,7 +549,10 @@ export class BwClient {
       }
     );
     this.updateCookies(response);
+    const key = lockKey(this.identityKey(), type, name);
     if (response.status >= 400) {
+      const held = tracksLock(type) ? lockSessions.get(key) : undefined;
+      if (response.status === 403 && held) return held.handle;
       throw new Error(`Delete-lock ${type}/${name} → HTTP ${response.status}\n${response.data}`);
     }
     const body = response.data as string;
@@ -485,6 +560,7 @@ export class BwClient {
     if (!match) {
       throw new Error(`No <LOCK_HANDLE> in delete-lock response:\n${body}`);
     }
+    if (tracksLock(type)) lockSessions.set(key, { client: this, handle: match[1] });
     return match[1];
   }
 
@@ -804,6 +880,12 @@ export class BwClient {
       return m ? parseInt(m[1]) * 10000 + parseInt(m[2]) * 100 + parseInt(m[3]) : 0;
     };
     const segments = xml.split(/(?=<app:collection\s)/);
+    // Keys already written by THIS run. Discovery is authoritative for the backend that
+    // answered, so its value must replace the hardcoded fallback even when it is lower —
+    // a backend serving an older resource version rejects the higher one with HTTP 415.
+    // Within one document, several collections can still map to the same key, so among
+    // those the highest version wins rather than whichever comes last.
+    const discovered = new Set<string>();
     for (const segment of segments) {
       const hrefMatch = segment.match(/^<app:collection\b[^>]*?\shref="([^"]+)"/);
       if (!hrefMatch) continue;
@@ -817,13 +899,11 @@ export class BwClient {
         .filter((mt) => extractVersion(mt) > 0);
       if (versioned.length === 0) continue;
       const best = versioned.reduce((a, b) => (extractVersion(b) >= extractVersion(a) ? b : a));
-      // Discovery is authoritative: it states what THIS backend accepts, so it always wins.
-      // The previous "never downgrade" guard kept the hardcoded fallback whenever it
-      // outranked the advertised version, which broke every backend running an older
-      // resource version than the fallback. Concrete case: adso is hardcoded to v1_7_0,
-      // but a BW/4HANA system advertising only adso-v1_6_0+xml then received v1_7_0 on
-      // every GET and lock, and answered HTTP 415 "Unsupported Media Type".
-      MEDIA_TYPES[key] = best;
+      const existing = discovered.has(key) ? MEDIA_TYPES[key] : undefined;
+      if (!existing || extractVersion(best) >= extractVersion(existing)) {
+        MEDIA_TYPES[key] = best;
+        discovered.add(key);
+      }
     }
     process.stderr.write(`[bw-modeling-mcp] Loaded media types from discovery: ${JSON.stringify(MEDIA_TYPES)}\n`);
   }
@@ -975,13 +1055,20 @@ export class BwClient {
    * A PUT in between does not affect this — measured: lock → PUT → unlock releases the
    * enqueue as long as it all happens in one session.
    *
-   * Therefore: never route an unlock through a different client than its lock, always
-   * release within the call that locked (each tool call builds its own client under stdio),
-   * and declare the session type explicitly (the axios default is absent in cookie mode).
+   * Therefore: never route an unlock through a different client than its lock — the lock
+   * registry below re-routes it through the holding client — and declare the session type
+   * explicitly (the axios default is absent in cookie mode).
    */
   async unlock(type: string, name: string): Promise<void> {
     if (NO_UNLOCK_TYPES.has(type.toLowerCase())) return;
-
+    const key = lockKey(this.identityKey(), type, name);
+    // Release through the session that took the lock. From any other session BW answers
+    // 200 and keeps the enqueue, which is what used to leave objects locked until SM12.
+    const held = lockSessions.get(key);
+    if (held && held.client !== this) {
+      await held.client.unlock(type, name);
+      return;
+    }
     await this.ensureCsrf();
     const mediaType = resolveMediaType(type);
     const response = await this.http.post(
@@ -1003,6 +1090,7 @@ export class BwClient {
     if (response.status >= 400) {
       throw new Error(`UNLOCK ${type.toUpperCase()} ${name} → HTTP ${response.status}\n${response.data}`);
     }
+    lockSessions.delete(key);
   }
 }
 
@@ -1093,46 +1181,47 @@ function clientFromEnvironment(): BwClient {
  * pre-lock model read and for verification reads; post-lock reads in the
  * locking session are refreshed by the lock itself and may stay as they are.
  */
+/**
+ * Decode the XML entities the modeling API returns in labels and titles. `&amp;` goes
+ * last, so a literally escaped entity in the text survives instead of being decoded twice.
+ */
+let masterSystemCache: string | null = null;
+
+/**
+ * The `adtcore:masterSystem` value to send when creating an object.
+ *
+ * Taken from the system's own logical system name rather than derived from the URL host:
+ * behind a destination or a proxy the host says nothing about the system, and with
+ * BW_URL unset the old derivation produced "LOCALHOST", which the backend rejects. Cached
+ * for the process — it cannot change while the server points at one system. Falls back to
+ * the host derivation if the read fails, so a broken systeminfo cannot block a create.
+ */
+export async function resolveMasterSystem(client: BwClient): Promise<string> {
+  if (masterSystemCache) return masterSystemCache;
+  try {
+    const { body } = await client.get('/sap/bw/modeling/repo/is/systeminfo', 'application/xml');
+    const logsys = body.match(/name="system\.logsys"\s+value="([^"]*)"/)?.[1];
+    if (logsys && /^[A-Z0-9]{3}/.test(logsys)) {
+      masterSystemCache = logsys.slice(0, 3);
+      return masterSystemCache;
+    }
+  } catch {
+    // Fall through to the host derivation below.
+  }
+  return new URL(process.env.BW_URL ?? 'http://localhost').hostname.split('.')[0].toUpperCase();
+}
+
+export function decodeXmlEntities(value: string): string {
+  return value
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
 export async function freshRead(path: string, accept: string): Promise<GetResult> {
   const sep = path.includes('?') ? '&' : '?';
   return createClientFromEnv().get(`${path}${sep}forceCacheUpdate=true`, accept);
 }
 
-/** Resolved once per process; the SID cannot change under a running connector. */
-let masterSystemCache: string | null = null;
-
-/**
- * The backend's system ID, for `adtcore:masterSystem` in creation payloads.
- *
- * Deriving it from the BW_URL hostname — as the create tools used to do — only works when the
- * host happens to be named after the system. Behind a BTP destination or any reverse proxy it
- * yields the gateway name (e.g. `<DESTINATION-HOST>`), and the backend answers the POST with
- * `BW-Modell-Deserialisierung ist fehlgeschlagen`.
- *
- * The systeminfo resource has no SID property, only `system.logsys` (the logical system, e.g.
- * `<SID><CLNT>` or `<SID>CLNT<CLNT>`). A SAP system ID is always exactly three characters, so the SID is
- * the first three of a logical system that follows the usual <SID>[CLNT]<client> shape. That
- * pattern is checked rather than assumed: logical systems can be named freely, and for anything
- * that does not match we fall back to the old derivation instead of sending a wrong SID.
- */
-export async function resolveMasterSystem(client: BwClient): Promise<string> {
-  if (masterSystemCache) return masterSystemCache;
-
-  try {
-    const { body } = await client.rawGet('/sap/bw/modeling/repo/is/systeminfo', {
-      Accept: 'application/xml',
-    });
-    const logsys = body
-      .match(/name="system\.logsys"\s+value="([^"]*)"/)?.[1]
-      ?.trim()
-      .toUpperCase();
-    if (logsys && /^[A-Z0-9]{3}(CLNT)?[0-9]{3}$/.test(logsys)) {
-      masterSystemCache = logsys.slice(0, 3);
-      return masterSystemCache;
-    }
-  } catch {
-    // systeminfo unreachable — fall through to the hostname derivation below.
-  }
-
-  return new URL(process.env.BW_URL ?? 'http://localhost').hostname.split('.')[0].toUpperCase();
-}

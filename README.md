@@ -8,76 +8,81 @@ A Model Context Protocol (MCP) server that enables AI assistants like Claude to 
 
 ## ☁️ Running on SAP BTP Cloud Foundry
 
+![Central MCP server for AI-assisted SAP BW/4HANA modeling: MCP-capable AI clients connect via OAuth to bw-modeling-mcp with role-based access control, which reaches on-premise, private cloud and BW Bridge systems via principal propagation](docs/btp-hosting.png)
+
 Besides stdio, the server can run as an HTTP service on SAP BTP Cloud Foundry with XSUAA
 OAuth in front and a BTP destination behind — either a shared technical user
 (`BasicAuthentication`) or **principal propagation**, where each caller reaches BW as
 themselves and BW applies their own authorizations.
 
-Two role collections decide what a user is offered: **BW MCP Reader** (read-only tools)
-and **BW MCP Developer** (all tools). Setup: [docs/CENTRAL-HOSTING-SETUP.md](docs/CENTRAL-HOSTING-SETUP.md)
-(step-by-step) and [docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md) (reference).
+Two role collections decide what a user is offered: **BW MCP Reader** and **BW MCP Developer**.
+stdio is unchanged — `npm start` behaves exactly as before. Setup:
+[docs/CENTRAL-HOSTING-SETUP.md](docs/CENTRAL-HOSTING-SETUP.md) (step-by-step) and
+[docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md) (reference).
 
-stdio is unchanged — `npm start` behaves exactly as before.
+### What central hosting changes
 
----
+| Scenario | stdio only | Hosted on BTP |
+|---|---|---|
+| **One analyst, one BW system** | runs on the analyst's machine | server-side, the analyst logs in with their own identity |
+| **Several analysts, one server** | not possible, no central auth | all log in via BTP, each caller's identity reaches BW |
+| **Tool permissions** | none — whoever runs it can call every tool | granted per role, **independent of BW authorizations**: a BW developer can be read-only in the MCP, or the querying tools can be withheld from someone who may otherwise view data |
+| **BW authorizations** | enforced through the user's own credentials | unchanged, still fully enforced — with principal propagation each caller acts as themselves, never as a shared identity |
+| **Audit trail** | limited | XSUAA logs every login; with principal propagation the BW session log shows the real user |
 
-## 📖 Featured Blog Post
-
-**Agentic AI meets SAP BW** — the full story behind this project: why I built it, what's inside, what happens when Claude walks through a complete BW data lineage on its own.
-
-Read the blog (DE + EN): https://www.nextlytics.com/blog/agentic-ai-meets-sap-bw
-
-![Agentic AI meets SAP BW](docs/blog-cover.png)
-
----
-
-## 🆕 What's New — v1.2.0
-
-**Central hosting on SAP BTP Cloud Foundry with XSUAA OAuth and role-based access control. Game-changer for enterprise deployments.**
-
-> **Backwards compatible — local use is unchanged.** Existing stdio setups (`npm start`, Claude Desktop, etc.) keep working exactly as before: no auth, no BTP, no config changes. Upgrading to v1.2.0 is non-breaking — central hosting is purely additive.
-
-**🚀 The Big Picture**
-
-- **BTP Cloud Foundry HTTP Server** — the MCP can now run as a central service on enterprise infrastructure (not just locally). `npm run start:http` launches an Express server bound to XSUAA, destination, and connectivity services
-- **XSUAA OAuth Authentication** — **same [@arc-mcp/xsuaa-auth](https://github.com/arc-mcp/xsuaa-auth) module as [ARC-1](https://github.com/arc-mcp/arc-1)** for ecosystem consistency. Stateless Dynamic Client Registration (DCR) + callback proxy. Users log in via BTP identity, the server respects their identity for analytics and auditing (principal propagation ready)
-- **Role-Based Access Control (RBAC)** — `xs-security.json` defines two scopes and **suggested default role collections** that can be customized to your needs:
-  - **`BW MCP Reader`** — read-only metadata and query tools (`read` scope). Ideal for analysts and report consumers
-  - **`BW MCP Developer`** — full access: create/update/delete/activate/push (`write` scope, implies `read`). For modelers and data engineers
-  - Scope enforcement in `src/scopes.ts` is explicit on reads (safe by default), automatic on writes (new write tools require admin to whitelist for read-only)
-  - **Customize for your org:** Extend with `query`, `monitor`, `metadata`, `data_push`, `admin` scopes for finer granularity
-- **Cloud Connector Integration** — on-premise BW systems route through BTP destinations + Cloud Connector
-
-**📋 What This Enables**
-
-| Scenario | Before | Now |
-|----------|--------|-----|
-| **One analyst, one BW system** | stdio on analyst's machine | BTP server, analyst logs in with their own identity |
-| **Many analysts, shared server** | impossible (no central auth) | all log in via BTP, each user's identity flows to BW |
-| **MCP tool permissions** | none — whoever runs it can call every tool | grant tools per role, **independent of BW authorizations**: e.g. a BW developer restricted to read-only in the MCP, or the querying tools withheld from someone who may otherwise view data |
-| **BW authorizations** | always enforced via the user's own credentials | unchanged — still fully enforced; principal propagation means each caller acts as themselves, never a shared identity |
-| **Enterprise audit trail** | limited | XSUAA logs all logins; with principal propagation BW session logs show the true user |
-
-**⚙️ Configuration**
-
-- `manifest.yml` — Cloud Foundry app manifest (512 MB, 1 GB disk, BW destination + client + language)
-- `xs-security.json` — XSUAA config; extend with `query`, `monitor`, `metadata`, `data_push`, `admin` scopes if finer granularity is needed
-- Transport: stdio via `node dist/stdio.js` (default), HTTP+OAuth via `npm run start:http` (= `node dist/http.js`, as used by `manifest.yml`)
-
-**📖 Documentation**
-
-See [docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md) for the full setup: services, destinations, XSUAA, Cloud Connector, and principal propagation (Stage 2).
-
-**🔐 Security Notes**
-
-- Write scope implicitly grants read (one-way: read tools do not grant write)
-- New write tools default to requiring `write`; old read tools explicitly whitelist for `read`
-- Principal propagation requires CERTRULE + ICM trust on BW side (see docs/CLOUD-FOUNDRY.md §3)
-- stdio mode is unchanged and auth-free
+A new tool stays unavailable to read-only callers until it is explicitly classified as a
+read, so the surface never widens by accident; `write` implies `read`, never the reverse.
+The two role collections are a starting point and can be split further in `xs-security.json`.
+Principal propagation additionally needs a certificate rule and ICM trust on the BW side.
 
 ---
 
-**Earlier releases** — the "What's New" notes for v1.1.0 and older are archived in [WHATS_NEW.md](WHATS_NEW.md); the full structured history is in [CHANGELOG.md](CHANGELOG.md).
+## 📖 Featured Blog Posts
+
+A two-part blog series about this project (both available in German and English):
+
+1. **Agentic AI meets SAP BW** — the full story behind this project: why I built it, what's inside, what happens when Claude walks through a complete BW data lineage on its own.
+   https://www.nextlytics.com/blog/agentic-ai-meets-sap-bw
+
+2. **Agentic AI in practice: MCP server for SAP BW/4HANA** — how the server is operated company-wide on SAP BTP Cloud Foundry with role-based access and per-user identity, plus two real customer projects.
+   https://www.nextlytics.com/blog/agentic-ai-in-practice-mcp-server-for-sap-bw/4hana
+
+---
+
+## 🆕 What's New — v1.3.0
+
+**🚀 CompositeProvider authoring**
+
+- **`bw_create_composite_provider`** — a Union or Join node with its source providers attached, or a copy of an existing CompositeProvider
+- **`bw_update_composite_provider`** grew from two actions to eight: `add_input`, `remove_input`, `update_mapping`, `update_join`, `remove_join` and `update_settings` alongside the existing `add_field` / `remove_field`
+- Field mappings are resolved from each source's own metadata, so field-based and InfoObject-based providers both work as sources
+- Join conditions are set per input pair — which is how BW models an N-way join: one condition per pair
+
+Verified against a BW/4HANA system all the way to an **activated** CompositeProvider. That distinction matters here: the backend accepts a model it will later refuse to activate, so a successful save proves nothing.
+
+This began as a contribution — the traced payloads come from [#20](https://github.com/dnic-dev/bw-modeling-mcp/pull/20) by [@JosephManu12](https://github.com/JosephManu12), ported onto the current code base and extended.
+
+**📊 Aggregation levels**
+
+- **`bw_create_aggregation_level`** and **`bw_update_aggregation_level`** — built on an aDSO or on a CompositeProvider, over all fields of the provider or a chosen subset
+- Reading planning objects was already possible; the aggregation level is the first one the server can create
+
+**🎛️ Query variables**
+
+- **`bw_create_variable`** covers all four processing types — user entry, **customer exit**, authorization and replacement path — for characteristic values, hierarchies and hierarchy nodes, with the usual selection and entry-requirement options
+
+**🔧 Minor changes and fixes**
+
+- Locks are released by the session that holds them — previously `?action=unlock` from another session answered HTTP 200 without releasing anything, leaving objects locked until the session timed out or SM12 was used ([#13](https://github.com/dnic-dev/bw-modeling-mcp/issues/13))
+- `bw_unlock` accepts `hcpr` and `alvl`
+- `adtcore:masterSystem` comes from the system's logical system name instead of the URL host, which produced `LOCALHOST` behind a destination ([#13](https://github.com/dnic-dev/bw-modeling-mcp/issues/13))
+- The CompositeProvider read uses a fresh session, so it no longer serves a stale model buffer right after a write
+- Labels are XML-escaped on write and decoded on read — an `&` used to fail the request with HTTP 500
+- Key figures are detected in Union nodes, which carry no dimension to read them from
+
+---
+
+**Earlier releases** — the "What's New" notes for v1.2.0 and older are archived in [WHATS_NEW.md](WHATS_NEW.md); the full structured history is in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -132,7 +137,7 @@ See [docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md) for the full setup: services,
 - Set value filters on fields
 - Set routine filters (ABAP code)
 
-### BW Query (Read)
+### BW Query
 - Read a BW Query — metadata, variables, filter, layout, measures, exceptions, and settings
 - Variables: type, processing type (UserEntry, Authorization, CustomerExit), input behavior
 - Filter: fixed values and variable references fully resolved, including mixed selections
@@ -142,8 +147,6 @@ See [docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md) for the full setup: services,
 - Inline local measures inside structures: both formulas and selections
 - Exceptions with alert levels and thresholds, cell definitions for grid layout queries
 - Active version with automatic fallback to inactive
-
-### BW Query (Authoring)
 - Create a new, consistent Query (ELEM) on an InfoProvider — empty, or as a full copy of an existing query (layout, filter, variables, key figures) via `copy_from`
 - Update the layout — rows, columns, structures, and free characteristics
 - Update the filter — fixed values and restrictions
@@ -152,6 +155,7 @@ See [docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md) for the full setup: services,
 - Update query settings (properties)
 - Record query edits on a transport request for queries on a transportable package
 - Delete a query
+- Create characteristic variables — user entry, customer exit, authorization or replacement path; as characteristic value, hierarchy or hierarchy nodes; interval, single value, several single values or comparison operators
 
 ### Live Data Querying
 - Execute a BEx Query or preview data from any InfoProvider (aDSO, CompositeProvider) — returns a formatted result table
@@ -159,10 +163,15 @@ See [docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md) for the full setup: services,
 - Drill into hierarchy nodes and structure members (expand / collapse by tuple index)
 - Look up valid characteristic values before setting filters or variables — returns both internal and external key formats
 
-### CompositeProvider (Read)
+### CompositeProvider
 - Read CompositeProvider structure — view node type (Union/Join), source providers (inputs) with mapping count, all fields with dimension classification, join conditions, and temporal join details
+- Create a CompositeProvider — Union or Join node with its source providers attached, or as a copy of an existing one
+- Attach and detach source providers, with their target elements created as needed
+- Replace the field mappings of an input, either explicitly or mapped one to one from the source
+- Set and remove join conditions per input pair, with join type and cardinality
+- Add and remove fields, edit root settings (description, stackable, default node, aggregation behaviour)
 
-### Global CP Components (Read & Authoring)
+### Global CP Components
 - Read global Calculated Key Figure (CKF) — formula recursively resolved to a human-readable string, full dependency graph of all referenced sub-components
 - Read global Restricted Key Figure (RKF) — base measure, all characteristic restriction groups with field and value details
 - Read global Structure — all members with Formula/Selection breakdown, referenced components, characteristic filters, optional child members
@@ -213,12 +222,13 @@ See [docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md) for the full setup: services,
 - Field names resolved automatically from the DataSource structure; configurable record count (default 20)
 - Rendered as a padded plain-text table with column alignment
 
-### Open Hub Destination (Read)
+### Open Hub Destination
 - Read an Open Hub Destination (DEST): destination type, source object, DB table, InfoArea, package, and status
 - Complete output field list with types, InfoObject binding, conversion routine, compounding, and key flag
 - File properties for FILE-type destinations
 
-### Integrated Planning (Read)
+### Integrated Planning
+- Create and change Aggregation Levels on an aDSO or a CompositeProvider — over all fields of the provider or a chosen subset
 - Read Aggregation Levels (ALVL) — the planning-enabled view on top of an InfoProvider; characteristics and key figures with full type and semantic detail
 - Read Planning Functions (PLSE) — function type, characteristic usage roles, and parameter tree; FOX code surfaced for FORMULA functions
 - Read Planning Sequences (PLSQ) — ordered step list with aggregation level, planning function, and filter references
@@ -533,6 +543,23 @@ Publish or remove a BW Query from a role or folder. Parameters: `query_name`, `a
 ### `bw_get_composite_provider` _(Read only)_
 Read a CompositeProvider (HCPR) — view node type (Union/Join), source providers with input mapping counts, all fields with dimension classification, join conditions, and temporal join details.
 
+### `bw_create_composite_provider`
+Create a CompositeProvider. Without `copy_from`, a view node of the given type with the listed source providers attached — entity only, so give them their mappings afterwards with `bw_update_composite_provider` action `update_mapping`. A Union node may be created empty; a Join node must be created with its sources, since a join node without inputs makes the server dump. With `copy_from`, the server copies view node, inputs and mappings from an existing CompositeProvider. The result is inactive.
+
+### `bw_update_composite_provider`
+Change a CompositeProvider. Eight actions: `add_field` / `remove_field` for fields, `add_input` / `remove_input` for source providers, `update_mapping` for one input's complete mapping list (omit the mappings to map every source field one to one), `update_join` / `remove_join` per input pair, and `update_settings` for description, stackable, default node and aggregation behaviour. Every action returns a `lock_handle` that `bw_activate` needs — an HCPR cannot be activated without it.
+
+Two things to know: both sides of a join key must be mapped onto the **same** target field, otherwise activation fails with "join fields need at least one common target field" — auto-mapping deliberately does not do this, so map the second side's key fields explicitly. And `remove_input` leaves the removed input's elements and any join referencing it behind; those have to be cleaned up separately.
+
+### `bw_create_aggregation_level`
+Create an aggregation level (ALVL) on a planning-enabled aDSO or CompositeProvider, either over all its fields or a chosen subset. Needs at least one characteristic and one key figure. Activate with `bw_activate`, object type `alvl` and an empty `lock_handle`.
+
+### `bw_update_aggregation_level`
+Change the field selection of an existing aggregation level.
+
+### `bw_create_variable`
+Create a characteristic variable. Processing type: `UserEntry`, `CustomerExit`, `Authorization` or `ReplacementPath`. Represents a characteristic value, a hierarchy or hierarchy nodes; selection as `Interval`, `SingleValue`, `SeveralSingleValues` or `SelectionOption`. Entry requirement, ready-for-input and reusability are parameters, so a variable filled only by the exit can be kept off the selection screen. Replacement path is limited to the current-member variant — replacement from a query result is not supported.
+
 ### `bw_get_ckf` _(Read only)_
 Read a global Calculated Key Figure — formula recursively resolved to a human-readable string, metadata (package, InfoArea, author), and full dependency graph of all referenced sub-components.
 
@@ -586,66 +613,6 @@ Release a lock on a BW object without activating (discard changes).
 
 ### `bw_delete`
 Delete a BW object. Works for aDSO, InfoObject, InfoArea, and other types.
-
----
-
-## Example Prompts
-
-> **Fun starter** — this one was actually run by a colleague :-)
-```
-Create a write-interface aDSO to store all match results of the Bundesliga 2024/2025 season.
-Include all relevant fields: matchday, home team, away team, home goals, away goals, match date.
-Suggest a technical name that fits the existing objects in InfoArea MCPBW.
-Then load the aDSO with real data from the completed 2024/2025 season using the Push API.
-```
-
-### Modify — working in the BW system
-
-**Setting up a new BW area for a CRM integration:**
-```
-We are setting up a new BW area for our CRM integration project.
-Create the InfoArea "ZCRM" with description "CRM Integration" below InfoArea "ZSALES".
-Inside it, create a field-based aDSO to store sales order data loaded from the OpenCRX REST API.
-The aDSO should contain the following fields: order_id (key, CHAR 20), customer_id (CHAR 10),
-order_date (DATS), amount (DEC 15,2), currency (CUKY 5), status (CHAR 4).
-Name the aDSO starting with "Z".
-```
-
-**Building a full data flow from field-based to InfoObject-based:**
-```
-Create a second aDSO in InfoArea "ZCRM" — this time InfoObject-based, same business content
-as ZCRM_ORDERS. Create all required InfoObjects for this aDSO. Decide independently on type
-(Characteristic/Key Figure), master data, and texts based on the field semantics.
-Then create a Transformation from ZCRM_ORDERS to the new aDSO and map all fields 1:1.
-Activate the Transformation. Finally, create a DTP on the Transformation and activate it.
-```
-
-**Adding derived logic with an AMDP routine and DTP filter:** — In Combination with an ADT MCP Server
-```
-Create a new InfoObject to flag high-value orders above $10,000.
-Choose an appropriate technical name and description.
-Add the InfoObject to aDSO ZCRM_ORDERS.
-Create an AMDP field routine for this field in the Transformation and derive the logic
-in SQLScript: set the flag if the calculated order total (quantity × unit price) exceeds 10,000.
-Adjust the DTP filter: load only orders with status "CONFIRMED" (value filter)
-and only orders from the current calendar year (routine filter).
-```
-
----
-
-### Read-Only — understanding existing models
-
-**Full data lineage analysis:**
-```
-Analyze the complete data lineage of aDSO ZSLS_ORDSUM down to all connected DataSources
-from source system OCRXCLNT100.
-Include all intermediate objects: aDSOs, Transformations, InfoSources, and DataSources.
-Also trace any objects referenced inside transformation routines (e.g. via AMDP or ABAP logic)
-and follow their lineage as well.
-Present the result as a structured table with columns:
-Level (1 = closest to ZSLS_ORDSUM), Object Type, Technical Name, Description, Source System.
-Use full object type names — no abbreviations.
-```
 
 ---
 

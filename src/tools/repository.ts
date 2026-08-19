@@ -1,4 +1,4 @@
-import { BwClient } from '../bw-client.js';
+import { BwClient, decodeXmlEntities } from '../bw-client.js';
 
 const BASE = '/sap/bw/modeling/repo/infoproviderstructure';
 const CHILDREN_PREFIX = `${BASE}/`;
@@ -35,7 +35,7 @@ function parseAtomFeed(xml: string): RepoEntry[] {
     const objectSubtype = objectSubtypeRaw !== undefined ? objectSubtypeRaw : null;
 
     // atom:title
-    const title = body.match(/<atom:title[^>]*>([^<]*)<\/atom:title>/)?.[1] ?? '';
+    const title = decodeXmlEntities(body.match(/<atom:title[^>]*>([^<]*)<\/atom:title>/)?.[1] ?? '');
 
     // atom:link elements
     let selfHref: string | null = null;

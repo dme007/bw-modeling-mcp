@@ -569,8 +569,11 @@ export async function bwGetSourceSystem(client: BwClient, sourceSystem: string):
   return JSON.stringify(result, null, 2);
 }
 
-// Full Accept header for the remote-entity value help (multiple supported versions).
-const VALUEHELP_ACCEPT = [
+/**
+ * Full Accept header for the remote-entity value help (multiple supported versions).
+ * Built per call, not once at import — see the note on adsoAccept() in adso.ts.
+ */
+const valuehelpAccept = (): string => [
   'application/vnd.sap-bw-modeling.valuehelp2-v1_0_0+xml',
   MEDIA_TYPES['valuehelp'],
   'application/vnd.sap-bw-modeling.isvaluehelp-v1_0_0+xml',
@@ -602,7 +605,7 @@ export async function bwListRemoteEntities(
     `&sourcesystem=${encodeURIComponent(ssUpper)}` +
     `&resultSize=${resultSize}`;
 
-  const { body } = await client.rawGet(url, { Accept: VALUEHELP_ACCEPT });
+  const { body } = await client.rawGet(url, { Accept: valuehelpAccept() });
 
   // Root <vh:valueHelp size="..." resultComplete="..."> — surface truncation info.
   const rootAttrs = body.match(/<vh:valueHelp\b([^>]*)>/)?.[1] ?? '';

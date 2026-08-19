@@ -2,14 +2,7 @@ import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead, resolveMasterSys
 import { parseInfoObjectProps } from './infoobject.js';
 import { parseActivationMessages, parseDtpsDeactivated, bwActivate } from './activation.js';
 
-/**
- * Accept header for Transformation requests, resolved at CALL time.
- *
- * See adsoAccept() in adso.ts: a module-level constant is evaluated at import time, before
- * ensureMediaTypes() runs, and would pin the hardcoded fallback for the whole process. The
- * trfn fallback happens to match what this backend advertises, so nothing breaks today —
- * but any system on a different trfn resource version would get HTTP 415.
- */
+/** Resolved per call, not once at import — see the note on adsoAccept() in adso.ts. */
 const trfnAccept = (): string => MEDIA_TYPES['trfn'];
 
 /**
@@ -1239,10 +1232,6 @@ export async function bwUpdateTransformation(
       await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
       throw err;
     }
-    // Release inside this call. Every tool call runs in its own session (stdio builds a
-    // fresh client per call), and an enqueue can only be released by the session holding
-    // it — a later bw_unlock or bw_activate could never clear this one.
-    await client.unlock('trfn', transformationName).catch(() => {/* best effort */});
 
     return JSON.stringify({
       success: true,
@@ -1254,7 +1243,7 @@ export async function bwUpdateTransformation(
         'AMDP SQLSCRIPT methods only allow ASCII 7-bit characters. ' +
         'Do NOT use non-ASCII characters (e.g. German umlauts like ä/ö/ü or symbols like <=) ' +
         'in SQLSCRIPT code or comments — they will cause a syntax error.',
-      lock_handle: '',
+      lock_handle: lockHandle,
       transformation_name: transformationName.toUpperCase(),
       object_type: 'trfn',
       converted_from: ruleInfo.stepType,
@@ -1325,10 +1314,6 @@ export async function bwUpdateTransformation(
       await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
       throw err;
     }
-    // Release inside this call. Every tool call runs in its own session (stdio builds a
-    // fresh client per call), and an enqueue can only be released by the session holding
-    // it — a later bw_unlock or bw_activate could never clear this one.
-    await client.unlock('trfn', transformationName).catch(() => {/* best effort */});
 
     return JSON.stringify({
       success: true,
@@ -1336,7 +1321,7 @@ export async function bwUpdateTransformation(
         `InfoObject ${tgtUpper} in transformation ${transformationName.toUpperCase()} ` +
         `converted to StepFormula. Call bw_activate to activate.`,
       formula,
-      lock_handle: '',
+      lock_handle: lockHandle,
       transformation_name: transformationName.toUpperCase(),
       object_type: 'trfn',
       converted_from: ruleInfo.stepType,
@@ -1378,10 +1363,6 @@ export async function bwUpdateTransformation(
       await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
       throw err;
     }
-    // Release inside this call. Every tool call runs in its own session (stdio builds a
-    // fresh client per call), and an enqueue can only be released by the session holding
-    // it — a later bw_unlock or bw_activate could never clear this one.
-    await client.unlock('trfn', transformationName).catch(() => {/* best effort */});
 
     return JSON.stringify({
       success: true,
@@ -1389,7 +1370,7 @@ export async function bwUpdateTransformation(
         `InfoObject ${tgtUpper} in transformation ${transformationName.toUpperCase()} ` +
         `converted to StepConstant with value "${writtenValue}". Call bw_activate to activate.`,
       constant_value: writtenValue,
-      lock_handle: '',
+      lock_handle: lockHandle,
       transformation_name: transformationName.toUpperCase(),
       object_type: 'trfn',
       converted_from: ruleInfo.stepType,
@@ -1444,10 +1425,6 @@ export async function bwUpdateTransformation(
       await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
       throw err;
     }
-    // Release inside this call. Every tool call runs in its own session (stdio builds a
-    // fresh client per call), and an enqueue can only be released by the session holding
-    // it — a later bw_unlock or bw_activate could never clear this one.
-    await client.unlock('trfn', transformationName).catch(() => {/* best effort */});
 
     return JSON.stringify({
       success: true,
@@ -1456,7 +1433,7 @@ export async function bwUpdateTransformation(
         `converted to StepRead (Lookup) from ${lookupObjectType.toUpperCase()} ${lookupObject.toUpperCase()}. Call bw_activate to activate.`,
       lookup_object: lookupObject.toUpperCase(),
       lookup_object_type: lookupObjectType.toUpperCase(),
-      lock_handle: '',
+      lock_handle: lockHandle,
       transformation_name: transformationName.toUpperCase(),
       object_type: 'trfn',
       converted_from: ruleInfo.stepType,
@@ -1495,16 +1472,12 @@ export async function bwUpdateTransformation(
       await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
       throw err;
     }
-    // Release inside this call. Every tool call runs in its own session (stdio builds a
-    // fresh client per call), and an enqueue can only be released by the session holding
-    // it — a later bw_unlock or bw_activate could never clear this one.
-    await client.unlock('trfn', transformationName).catch(() => {/* best effort */});
     return JSON.stringify({
       success: true,
       message:
         `InfoObject ${tgtUpper} in transformation ${transformationName.toUpperCase()} ` +
         `reverted to StepNoUpdate (no mapping). Call bw_activate to activate.`,
-      lock_handle: '',
+      lock_handle: lockHandle,
       transformation_name: transformationName.toUpperCase(),
       object_type: 'trfn',
       converted_from: ruleInfo.stepType,
@@ -1586,10 +1559,6 @@ export async function bwUpdateTransformation(
       await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
       throw err;
     }
-    // Release inside this call. Every tool call runs in its own session (stdio builds a
-    // fresh client per call), and an enqueue can only be released by the session holding
-    // it — a later bw_unlock or bw_activate could never clear this one.
-    await client.unlock('trfn', transformationName).catch(() => {/* best effort */});
 
     return JSON.stringify({
       success: true,
@@ -1599,7 +1568,7 @@ export async function bwUpdateTransformation(
         `transformation ${transformationName.toUpperCase()}. Call bw_activate to activate.`,
       key_figure: tgtUpper,
       unit_currency_field: unitTgtField,
-      lock_handle: '',
+      lock_handle: lockHandle,
       transformation_name: transformationName.toUpperCase(),
       object_type: 'trfn',
     });
@@ -1683,15 +1652,13 @@ export async function bwUpdateTransformation(
     await client.unlock('trfn', transformationName).catch(() => {/* ignore unlock error */});
     throw err;
   }
-  // Release inside this call — see the identical note on the other update paths.
-  await client.unlock('trfn', transformationName).catch(() => {/* best effort */});
 
   return JSON.stringify({
     success: true,
     message:
       `Source field ${srcUpper} mapped to target ${tgtUpper} in ` +
       `transformation ${transformationName.toUpperCase()}. Call bw_activate to activate.`,
-    lock_handle: '',
+    lock_handle: lockHandle,
     transformation_name: transformationName.toUpperCase(),
     object_type: 'trfn',
   });
@@ -1916,9 +1883,6 @@ export async function bwSetTransformationRoutine(
     await client.unlock('trfn', trfnLower).catch(() => {/* ignore */});
     throw err;
   }
-  // Release inside this call: every tool call runs in its own session and an enqueue
-  // can only be released by the session holding it (see BwClient.unlock).
-  await client.unlock('trfn', trfnLower).catch(() => {/* best effort */});
 
   // ADT class write flow — activate the generated _M class and inject a proper skeleton.
   // For ABAP: BW generates the class only after activation — skip if 404.
@@ -1965,7 +1929,7 @@ export async function bwSetTransformationRoutine(
     routine_type: routineTypeUpper,
     class_name: classNameM,
     method_name: methodName,
-    lock_handle: '',
+    lock_handle: lockHandle,
     transformation_name: trfnUpper,
     object_type: 'trfn',
   });
@@ -2283,9 +2247,6 @@ export async function bwSetTransformationRoutineFields(
     await client.unlock('trfn', trfnLower).catch(() => {/* ignore */});
     throw err;
   }
-  // Release inside this call: every tool call runs in its own session and an enqueue
-  // can only be released by the session holding it (see BwClient.unlock).
-  await client.unlock('trfn', trfnLower).catch(() => {/* best effort */});
 
   return JSON.stringify({
     success: true,
@@ -2296,7 +2257,7 @@ export async function bwSetTransformationRoutineFields(
     selected_fields: selectedFields,
     selected_count: selectedFields.length,
     total_target_fields: allTargetFields.length,
-    lock_handle: '',
+    lock_handle: lockHandle,
     transformation_name: trfnUpper,
     object_type: 'trfn',
   });
@@ -2368,9 +2329,6 @@ export async function bwDeleteTransformationRoutine(
     await client.unlock('trfn', trfnLower).catch(() => {/* ignore */});
     throw err;
   }
-  // Release inside this call: every tool call runs in its own session and an enqueue
-  // can only be released by the session holding it (see BwClient.unlock).
-  await client.unlock('trfn', trfnLower).catch(() => {/* best effort */});
 
   return JSON.stringify({
     success: true,
@@ -2380,7 +2338,7 @@ export async function bwDeleteTransformationRoutine(
       ' Call bw_activate to activate.',
     routine_type: routineTypeUpper,
     group_removed: !hasRemainingRules,
-    lock_handle: '',
+    lock_handle: lockHandle,
     transformation_name: trfnUpper,
     object_type: 'trfn',
   });

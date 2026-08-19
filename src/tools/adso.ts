@@ -65,14 +65,10 @@ function setRootAttr(xml: string, attr: string, value: string): string {
 }
 
 /**
- * Accept header for aDSO requests, resolved at CALL time.
- *
- * Must not be captured into a module-level constant: such a snapshot is evaluated when this
- * module is imported, which happens before ensureMediaTypes() has ever run. It therefore
- * froze the hardcoded fallback for the life of the process and discovery could never take
- * effect. Concrete case: the fallback is adso-v1_7_0+xml, so a system advertising only
- * adso-v1_6_0+xml answered every GET and lock with HTTP 415 — even though discovery had
- * correctly written v1_6_0 into MEDIA_TYPES.
+ * Resolved per call, not once at import: discovery runs lazily on the first tool call and
+ * rewrites MEDIA_TYPES, which a module-level constant would never see. Binding it early
+ * pins the hardcoded fallback for the whole process, so a backend on a lower resource
+ * version answers every aDSO request with HTTP 415.
  */
 const adsoAccept = (): string => MEDIA_TYPES['adso'];
 
@@ -150,14 +146,11 @@ export async function bwUpdateAdsoSettings(
     await client.unlock('adso', adsoName).catch(() => {/* ignore */});
     throw err;
   }
-  // Release inside this call: every tool call runs in its own session and an enqueue
-  // can only be released by the session holding it (see BwClient.unlock).
-  await client.unlock('adso', adsoName).catch(() => {/* best effort */});
 
   return JSON.stringify({
     success: true,
     message: `aDSO ${adsoUpper} settings updated. Call bw_activate to activate.`,
-    lock_handle: '',
+    lock_handle: lockHandle,
     adso_name: adsoUpper,
     object_type: 'adso',
     applied: settings,
@@ -486,14 +479,11 @@ export async function bwUpdateAdsoManageKeys(
     await client.unlock('adso', adsoName).catch(() => {/* ignore */});
     throw err;
   }
-  // Release inside this call: every tool call runs in its own session and an enqueue
-  // can only be released by the session holding it (see BwClient.unlock).
-  await client.unlock('adso', adsoName).catch(() => {/* best effort */});
 
   return JSON.stringify({
     success: true,
     message: `aDSO ${adsoUpper} key fields updated. Call bw_activate to activate.`,
-    lock_handle: '',
+    lock_handle: lockHandle,
     adso_name: adsoUpper,
     object_type: 'adso',
     key_fields: normalized,
@@ -645,14 +635,11 @@ export async function bwUpdateAdsoFieldProperties(
     await client.unlock('adso', adsoName).catch(() => {/* ignore */});
     throw err;
   }
-  // Release inside this call: every tool call runs in its own session and an enqueue
-  // can only be released by the session holding it (see BwClient.unlock).
-  await client.unlock('adso', adsoName).catch(() => {/* best effort */});
 
   return JSON.stringify({
     success: true,
     message: `Field ${nameUpper} in aDSO ${adsoUpper} updated. Call bw_activate to activate.`,
-    lock_handle: '',
+    lock_handle: lockHandle,
     adso_name: adsoUpper,
     object_type: 'adso',
     field_name: nameUpper,
@@ -979,14 +966,11 @@ export async function bwUpdateAdsoAddPureField(
     await client.unlock('adso', adsoName).catch(() => {/* ignore */});
     throw err;
   }
-  // Release inside this call: every tool call runs in its own session and an enqueue
-  // can only be released by the session holding it (see BwClient.unlock).
-  await client.unlock('adso', adsoName).catch(() => {/* best effort */});
 
   const result: Record<string, unknown> = {
     success: true,
     message: `${processed.length} pure field(s) added to aDSO ${adsoUpper}. Call bw_activate to activate.`,
-    lock_handle: '',
+    lock_handle: lockHandle,
     adso_name: adsoUpper,
     object_type: 'adso',
     processed,
@@ -1088,15 +1072,12 @@ export async function bwUpdateAdso(
     await client.unlock('adso', adsoName).catch(() => {/* ignore unlock error */});
     throw err;
   }
-  // Release inside this call: every tool call runs in its own session and an enqueue
-  // can only be released by the session holding it (see BwClient.unlock).
-  await client.unlock('adso', adsoName).catch(() => {/* best effort */});
 
   const verb = action === 'remove_field' ? 'removed from' : 'added to';
   const result: Record<string, unknown> = {
     success: true,
     message: `${processed.join(', ')} ${verb} aDSO ${adsoUpper}. Call bw_activate to activate.`,
-    lock_handle: '',
+    lock_handle: lockHandle,
     adso_name: adsoUpper,
     object_type: 'adso',
     processed,

@@ -1,5 +1,43 @@
 # Changelog
 
+## [1.3.0] — 2026-08-04
+
+### Added
+
+- **CompositeProvider authoring** — `bw_create_composite_provider` creates a Union or Join node with its source providers attached, or copies an existing CompositeProvider (the template is named in the URL, not in the body, unlike aDSO). `bw_update_composite_provider` grew from two actions to eight: `add_input`, `remove_input`, `update_mapping`, `update_join`, `remove_join` and `update_settings` next to the existing `add_field` / `remove_field`. Field mappings resolve against each source's own metadata, so field-based and InfoObject-based providers both work; join conditions are set per input pair, which is how BW models an N-way join. Verified against a BW/4HANA system up to an activated CompositeProvider. Based on the traced payloads contributed in #20 by @JosephManu12, ported onto the current code base and extended.
+- **Aggregation levels** — `bw_create_aggregation_level` and `bw_update_aggregation_level`, the first objects from the planning side the server can create, optionally with a subset of the provider's fields.
+- **`bw_create_variable`** — BW variables for query authoring.
+
+### Improved
+
+- **Locks are released by the session that holds them** (#13) — a BW enqueue belongs to the ABAP session that took it, so `?action=unlock` from any other session answered HTTP 200 and released nothing, leaving objects locked until the ADT session timed out or SM12 was used. The client now tracks which session holds a lock, routes the release through it, and hands back the handle it already holds when the same caller locks again.
+- **`bw_unlock` accepts `hcpr` and `alvl`** — previously there was no way to release those locks through the MCP.
+
+### Fixed
+
+- **`adtcore:masterSystem` no longer guessed from the URL host** (#13) — the host says nothing about the system behind a destination or a proxy, and with `BW_URL` unset the fallback produced `LOCALHOST`, which the backend rejects. It is read from the system's own logical system name now, once per process, with the old derivation as fallback. Affects transformation, DTP, query and DataSource creates.
+- **CompositeProvider read served a stale model buffer** — it went through the calling client, so a read right after a write returned that session's pinned state and lost attributes the write had set. It uses a fresh session now, like the aDSO and transformation tools.
+- **XML entity handling in labels** — labels were interpolated unescaped, so an `&` failed the request with HTTP 500, and entities were not decoded when reading. Decoding is shared in the client now and also applies to `bw_list_contents` and the aggregation level read.
+- **Key figure detection in CompositeProviders** — derived from the element body instead of a `__KEYFIGURES` dimension, which a plain Union node does not have.
+
+### Notes
+
+- On the four remaining findings reported in #13: the transformation create buffer does not apply here, because lock and create already run on separate sessions; the stateless lock path is unreachable code; and the DTP `stateful_enqueue` behaviour could not be reproduced — on this landscape the enqueue survives the request, which points at the server's session configuration rather than the connector.
+
+## [1.2.1] — 2026-08-03
+
+### Fixed
+
+- **Environment proxies are no longer disabled** (#22) — the HTTP client passed `proxy: false` whenever no explicit Cloud Connector hop was configured. In axios that does not mean "no proxy", it means "ignore proxy settings", which also switches off the `HTTP_PROXY` / `http_proxy` environment variables. Deployments whose only route to the BW host is a local or corporate proxy lost that route and failed with `ENOTFOUND`. An explicit Cloud Connector hop still takes precedence.
+- **Media type discovery now reaches the wire** (#23) — two independent defects made every aDSO call fail with HTTP 415 on systems advertising a lower `adso` resource version than the compiled-in fallback:
+  - `loadMediaTypes()` kept the fallback whenever it outranked the advertised version. Discovery states what the connected backend accepts, so it is now authoritative; where one document maps several collections to the same key, the highest version still wins.
+  - `Accept` headers for aDSO, transformation and value-help requests were bound to module-level constants, evaluated at import time — before discovery had ever run. They are resolved per call now, so a discovered media type actually reaches the request.
+
+### Notes
+
+- Because environment proxies apply again, a globally set `HTTP_PROXY` now also covers BW hosts that were previously contacted directly. Use `NO_PROXY` to exclude them. This restores the behaviour of versions before v1.2.0.
+- Regression tests cover both fixes against a local fake backend and a local proxy, so neither needs a BW system to reproduce: `npm test`.
+
 ## [1.2.0] — 2026-07-29
 
 ### Added
