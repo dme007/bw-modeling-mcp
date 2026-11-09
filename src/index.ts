@@ -1387,8 +1387,9 @@ const TOOL_DEFINITIONS = [
         'Sequence: lock (with /m) → DELETE → unlock. No activation needed — deletion is immediate. ' +
         'Queries (object_type "query", alias "elem") use a dedicated delete sequence; deleting a query ' +
         'does NOT delete the reusable components (variables, CKFs, RKFs) it references — only the query itself. ' +
-        'Planning sequences ("plsq"), planning filters ("filter") and conversion types ("ctrt", "uomt") are ' +
-        'deleted on their active path; a filter still used by a sequence is refused with the sequence named. ' +
+        'Planning sequences ("plsq"), planning filters ("filter"), planning functions ("plse") and conversion ' +
+        'types ("ctrt", "uomt") are deleted on their active path; a filter still used by a sequence is refused ' +
+        'with the sequence named. ' +
         'Dependency note: delete aDSOs before their InfoObjects, not the other way around.',
       inputSchema: {
         type: 'object',
