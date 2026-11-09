@@ -1390,6 +1390,8 @@ const TOOL_DEFINITIONS = [
         'Planning sequences ("plsq"), planning filters ("filter"), planning functions ("plse") and conversion ' +
         'types ("ctrt", "uomt") are deleted on their active path; a filter still used by a sequence is refused ' +
         'with the sequence named. ' +
+        'A DataSource ("rsds") is identified by name plus source system: pass source_system, or give ' +
+        'object_name as a transport request lists it (the name, blanks, the source system). ' +
         'Dependency note: delete aDSOs before their InfoObjects, not the other way around.',
       inputSchema: {
         type: 'object',
@@ -1401,6 +1403,12 @@ const TOOL_DEFINITIONS = [
           object_name: {
             type: 'string',
             description: 'Technical object name (e.g. "OBJECT_NAME").',
+          },
+          source_system: {
+            type: 'string',
+            description:
+              'Source system of the DataSource (e.g. "LSYS_NAME"). Only for object_type "rsds", and not ' +
+              'needed when object_name already carries it.',
           },
         },
         required: ['object_type', 'object_name'],
@@ -6855,7 +6863,8 @@ async function handleToolCall(
         text = await bwDelete(
           client,
           args?.object_type as string,
-          args?.object_name as string
+          args?.object_name as string,
+          args?.source_system as string | undefined
         );
         break;
 

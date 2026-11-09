@@ -154,12 +154,83 @@ async function deleteOnActivePath(client: BwClient, type: 'plsq' | 'filter' | 'p
   });
 }
 
+const RSDS_ACCEPT =
+  'application/vnd.sap.bw.modeling.rsds-v1_0_0+xml, application/vnd.sap.bw.modeling.rsds-v1_1_0+xml';
+
+/**
+ * The two parts that identify a DataSource: its name and its source system.
+ *
+ * Both may be given as they are, or as the compound key under which TADIR and a transport
+ * request list a DataSource — the name padded to 30 characters, followed by the source system.
+ * Neither part can contain a blank, so the key is split at the blanks rather than at a column.
+ */
+export function datasourceKey(objectName: string, sourceSystem?: string): { name: string; sourceSystem: string } {
+  const [name, fromKey, ...rest] = objectName.trim().split(/\s+/);
+  const given = sourceSystem?.trim();
+  if (rest.length > 0) {
+    throw new Error(`"${objectName}" is not a DataSource name: expected the name, optionally followed by the source system.`);
+  }
+  if (given && fromKey && given.toUpperCase() !== fromKey.toUpperCase()) {
+    throw new Error(`object_name names the source system ${fromKey.toUpperCase()}, source_system says ${given.toUpperCase()}.`);
+  }
+  const system = given || fromKey;
+  if (!name || !system) {
+    throw new Error(
+      'object_type "rsds" requires source_system (a DataSource is identified by DataSource name plus source system). ' +
+        'Alternatively pass object_name as a transport request lists it: the name, blanks, the source system.',
+    );
+  }
+  return { name: name.toUpperCase(), sourceSystem: system.toUpperCase() };
+}
+
+/**
+ * Delete a DataSource: lock and DELETE on /rsds/{name}/{source system}/m, unlock on the path
+ * without the version segment. The lock is released also when the delete is refused.
+ */
+async function bwDeleteDatasource(client: BwClient, objectName: string, sourceSystem?: string): Promise<string> {
+  const key = datasourceKey(objectName, sourceSystem);
+  const base = `/sap/bw/modeling/rsds/${bwSeg(key.name)}/${encodeURIComponent(key.sourceSystem)}`;
+  const mediaType = MEDIA_TYPES['rsds'] ?? RSDS_ACCEPT.split(',').pop()!.trim();
+  const lock = await client.rawPost(`${base}/m?action=lock`, '', {
+    Accept: RSDS_ACCEPT,
+    'bwmt-level': '50',
+    'x-csrf-token': await client.getCsrfToken(),
+    ...lockSessionHeader(),
+  });
+  const handle = lock.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1];
+  if (!handle) throw new Error(`No <LOCK_HANDLE> in delete lock response:\n${lock.body}`);
+  let body: string;
+  try {
+    body = (await client.rawDelete(`${base}/m?lockHandle=${handle}`, {
+      'Content-Type': `application/xml, ${mediaType}`,
+      Accept: RSDS_ACCEPT,
+    })).body;
+  } finally {
+    await client
+      .rawPost(`${base}?action=unlock`, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': await client.getCsrfToken() })
+      .catch(() => {/* ignore */});
+  }
+  return JSON.stringify({
+    success: true,
+    object_type: 'RSDS',
+    object_name: key.name,
+    source_system: key.sourceSystem,
+    messages: parseAtomTitles(body),
+  });
+}
+
 export async function bwDelete(
   client: BwClient,
   objectType: string,
-  objectName: string
+  objectName: string,
+  sourceSystem?: string
 ): Promise<string> {
   const typeLower = objectType.toLowerCase();
+
+  // A DataSource is addressed by name and source system, which the generic path has no place for.
+  if (typeLower === 'rsds') {
+    return bwDeleteDatasource(client, objectName, sourceSystem);
+  }
 
   // Queries (TLOGO ELEM) need a dedicated delete sequence.
   if (typeLower === 'query' || typeLower === 'elem') {
