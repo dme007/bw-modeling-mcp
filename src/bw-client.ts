@@ -432,6 +432,12 @@ const RAW_LOCK_SESSION_REQUEST =
 /** Marker on axios request configs used by the proxy-contextid guard. */
 type GuardedRequestConfig = InternalAxiosRequestConfig & { __bwGuard?: 'heal' | 'retried'; __bwStateful?: boolean };
 
+/** Per-call options for BwClient.get(). */
+export interface GetOptions {
+  /** Session type declared on this one request; unset keeps the instance default. */
+  sessionType?: 'stateful' | 'stateless';
+}
+
 export class BwClient {
   private http: AxiosInstance;
   private csrfToken: string | null = null;
@@ -924,7 +930,7 @@ export class BwClient {
 
   // ── Public HTTP helpers ────────────────────────────────────────────────────
 
-  async get(path: string, accept: string): Promise<GetResult> {
+  async get(path: string, accept: string, options?: GetOptions): Promise<GetResult> {
     await this.ensureCsrf();
     const resolvedAccept = `application/xml, ${expandAccept(accept)}`;
     const send = () =>
@@ -933,6 +939,7 @@ export class BwClient {
           Accept: resolvedAccept,
           'bwmt-level': '50',
           'X-CSRF-Token': this.csrfToken!,
+          ...(options?.sessionType ? { 'X-sap-adt-sessiontype': options.sessionType } : {}),
           ...this.cookieHeaders(),
         },
         responseType: 'text',
@@ -1863,7 +1870,18 @@ export function decodeXmlEntities(value: string): string {
     .replace(/&amp;/g, '&');
 }
 
+/**
+ * The read is declared stateless on purpose. The modeling handlers keep the object
+ * instance in the stateful ABAP session and build some derived lists by appending to
+ * it: the DTP `/m` document, for one, carries the children of <semanticGroup>,
+ * <temporaryStorage> and <programFlow> n-fold on the n-th read of the same DTP within
+ * one context (forceCacheUpdate does not help — the instance is the buffer). A fresh
+ * client does not escape that behind a proxy that injects the sap-contextid it holds
+ * into every request, because every stateful request of the process then shares that
+ * one context. A stateless request gets a context of its own that ends with the
+ * request: it returns the database state exactly once and leaves no session behind.
+ */
 export async function freshRead(path: string, accept: string): Promise<GetResult> {
   const sep = path.includes('?') ? '&' : '?';
-  return createClientFromEnv().get(`${path}${sep}forceCacheUpdate=true`, accept);
+  return createClientFromEnv().get(`${path}${sep}forceCacheUpdate=true`, accept, { sessionType: 'stateless' });
 }
