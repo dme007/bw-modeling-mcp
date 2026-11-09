@@ -369,7 +369,7 @@ const sessionScope = new AsyncLocalStorage<Set<BwClient>>();
 const openScopes = new Set<Set<BwClient>>();
 const SESSION_CLOSE_TIMEOUT_MS = 5000;
 
-/** `BW_SESSION_CLOSE=off` keeps sessions open, for a proxy that holds the session itself. */
+/** `BW_SESSION_CLOSE=off` keeps sessions open, and with them the context a proxy holds. */
 function sessionCloseEnabled(): boolean {
   return !/^(off|false|0|no)$/i.test(process.env.BW_SESSION_CLOSE ?? '');
 }
@@ -400,7 +400,10 @@ export async function withSessionScope<T>(fn: () => Promise<T>): Promise<T> {
     return await sessionScope.run(scope, fn);
   } finally {
     openScopes.delete(scope);
-    if (sessionCloseEnabled()) logoffInBackground([...scope].filter((c) => !holdsLock(c)));
+    if (sessionCloseEnabled()) {
+      logoffInBackground([...scope].filter((c) => !holdsLock(c)));
+      releaseProxyContexts();
+    }
   }
 }
 
@@ -429,8 +432,66 @@ export async function closeAllSessions(): Promise<void> {
 const RAW_LOCK_SESSION_REQUEST =
   /^\/sap\/bw\/modeling\/(?:[^?]*[?&]action=(?:lock|unlock)\b|dtpa\/generateDtpId\b|dtpa\/[^?]*\/generateRoutineProgram\b)/;
 
+/**
+ * The stateful context a session-holding proxy keeps on the modeling API for one caller (see
+ * BwClientOptions.proxyContextIdGuard).
+ *
+ * Every client of that caller runs its stateful requests in it, and it outlives all of them,
+ * so whatever a request leaves behind in the session stays: an activation hands out the
+ * message log of the earlier ones along with its own, and one that generated a program keeps
+ * the enqueue on it. The context is therefore ended once a tool call has written in it and no
+ * lock lives in it any more; the next stateful request opens a new one through the
+ * ICMENOSESSION heal.
+ *
+ * A call that only read leaves the context alone: other processes behind the same proxy share
+ * it, and one of them may hold a lock there.
+ */
+interface ProxyContext {
+  /** Locks taken in the context and not released yet, by the object they name. */
+  locks: Set<string>;
+  /** A stateful write has run in the context since it was opened. */
+  written: boolean;
+  /** The client that wrote last; it sends the request that ends the context. */
+  client: BwClient | null;
+  /** The release under way. Stateful requests wait for it instead of running into its end. */
+  releasing: Promise<void> | null;
+}
+
+const proxyContexts = new Map<string, ProxyContext>();
+const PROXY_CONTEXT_PATH = '/sap/bw/modeling/';
+const PROXY_CONTEXT_RELEASE_PATH = '/sap/bw/modeling/repo/is/systeminfo';
+
+/**
+ * The object a lock, unlock or delete request names, so that the three can be matched. The
+ * version segment is dropped, and the enqueue path of a query is read as the query: its
+ * delete locks on the one and unlocks on the other.
+ */
+function lockedObject(url: string): string {
+  return url.split('?')[0].toLowerCase().replace(/\/[am]$/, '').replace('/comp/enq/', '/query/');
+}
+
+/**
+ * End every proxy context that was written in and holds no lock. Only once no tool call is
+ * running: the context is shared, and a request of another call must not lose it halfway.
+ */
+function releaseProxyContexts(): void {
+  if (openScopes.size > 0) return;
+  for (const context of proxyContexts.values()) {
+    if (!context.written || context.locks.size > 0 || context.releasing || !context.client) continue;
+    const done = context.client.releaseProxyContext().finally(() => {
+      context.releasing = null;
+      pendingLogoffs.delete(done);
+    });
+    context.releasing = done;
+    pendingLogoffs.add(done);
+  }
+}
+
 /** Marker on axios request configs used by the proxy-contextid guard. */
-type GuardedRequestConfig = InternalAxiosRequestConfig & { __bwGuard?: 'heal' | 'retried'; __bwStateful?: boolean };
+type GuardedRequestConfig = InternalAxiosRequestConfig & {
+  __bwGuard?: 'heal' | 'retried' | 'release';
+  __bwStateful?: boolean;
+};
 
 /** Per-call options for BwClient.get(). */
 export interface GetOptions {
@@ -744,21 +805,28 @@ export class BwClient {
    */
   private installProxyContextIdGuard(instance: AxiosInstance): void {
     if (!this.proxyContextIdGuard) return;
-    instance.interceptors.request.use((config) => {
+    instance.interceptors.request.use(async (config) => {
       const cfg = config as GuardedRequestConfig;
-      if (cfg.__bwGuard === 'heal') return config;
+      if (cfg.__bwGuard === 'heal' || cfg.__bwGuard === 'release') return config;
       if (this.cookies.size > 0) return config; // the jar manages the session
       if (cfg.headers.get('Cookie')) return config; // caller-provided cookie
       const st = String(cfg.headers.get('X-sap-adt-sessiontype') ?? '').toLowerCase();
       cfg.__bwStateful = st === 'stateful';
-      if (cfg.__bwStateful) return config; // proxy must inject its live context
+      if (cfg.__bwStateful) {
+        // The proxy must inject its live context — not one that is just being ended.
+        await this.proxyContext().releasing;
+        return config;
+      }
       cfg.headers.set('Cookie', 'sap-contextid=');
       return config;
     });
     instance.interceptors.response.use(async (response) => {
-      if (!this.isIcmNoSession(response)) return response;
       const cfg = response.config as GuardedRequestConfig;
-      if (cfg.__bwGuard) return response; // heal request itself, or already retried once
+      if (!this.isIcmNoSession(response)) {
+        this.trackProxyContext(cfg, response.status);
+        return response;
+      }
+      if (cfg.__bwGuard) return response; // heal or release request, or already retried once
       await this.healProxyContext(instance, cfg);
       cfg.__bwGuard = 'retried';
       // Re-running through axios re-merges the instance defaults; a request whose
@@ -809,6 +877,75 @@ export class BwClient {
     if (token && token.toLowerCase() !== 'fetch') {
       this.csrfToken = token;
       this.csrfTokenFetchedAt = Date.now();
+    }
+    if (url.startsWith(PROXY_CONTEXT_PATH)) {
+      // The context that ended took its locks along, and the new one has seen no write.
+      const context = this.proxyContext();
+      context.locks.clear();
+      context.written = false;
+    }
+  }
+
+  private proxyContext(): ProxyContext {
+    const key = this.identityKey();
+    let context = proxyContexts.get(key);
+    if (!context) {
+      context = { locks: new Set(), written: false, client: null, releasing: null };
+      proxyContexts.set(key, context);
+    }
+    return context;
+  }
+
+  /**
+   * Note what a modeling request did to the context the proxy holds: a stateful write marks
+   * it as written, a lock or unlock that succeeded changes the locks living in it. A delete
+   * that succeeded takes the lock on its object off the list from whatever session it came —
+   * the unlock that follows names an object that is gone, and may be refused for it.
+   */
+  private trackProxyContext(cfg: GuardedRequestConfig, status: number): void {
+    const url = String(cfg.url ?? '');
+    if (!this.sessionHeldByProxy() || !url.startsWith(PROXY_CONTEXT_PATH)) return;
+    const method = String(cfg.method ?? 'get').toLowerCase();
+    const context = this.proxyContext();
+    if (method === 'delete' && status < 400) context.locks.delete(lockedObject(url));
+    if (!cfg.__bwStateful || method === 'get' || method === 'head') return;
+    context.written = true;
+    context.client = this;
+    if (status >= 400) return;
+    const action = url.match(/[?&]action=(lock|unlock)\b/)?.[1];
+    if (action === 'lock') context.locks.add(lockedObject(url));
+    else if (action === 'unlock') context.locks.delete(lockedObject(url));
+    if (action && this.sessionDebug) {
+      console.error(`[bw-session] proxy context: ${action} ${lockedObject(url)} — locks held: ${[...context.locks].join(', ') || 'none'}`);
+    }
+  }
+
+  /**
+   * End the context the proxy holds on the modeling API: a stateless request that goes out
+   * without the guard's empty cookie, so the proxy injects the context and the server ends
+   * it. A HEAD is enough — the handler refuses it, the context is gone all the same. Best
+   * effort and bounded; a request that got no answer leaves the context marked, and the end
+   * of the next tool call tries again.
+   */
+  async releaseProxyContext(): Promise<void> {
+    const context = this.proxyContext();
+    if (this.sessionDebug) console.error('[bw-session] proxy context: released after a write, no lock held');
+    try {
+      await this.http.request({
+        method: 'HEAD',
+        url: PROXY_CONTEXT_RELEASE_PATH,
+        headers: {
+          ...this.authHeaders(),
+          ...this.proxyHeaders(),
+          Accept: '*/*',
+          'X-sap-adt-sessiontype': 'stateless',
+        },
+        timeout: SESSION_CLOSE_TIMEOUT_MS,
+        __bwGuard: 'release',
+      } as unknown as GuardedRequestConfig);
+      context.written = false;
+    } catch {
+      /* the context stays marked as written */
     }
   }
 
